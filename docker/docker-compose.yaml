@@ -73,6 +73,10 @@ services:
     environment:
       CC_AWS_ENDPOINT: http://minio:9000
       FFRD_AWS_ENDPOINT: http://minio:9000
+    ports:
+      # Live progress viewer at http://localhost:8080 (see plugin/web.py).
+      # Override the container-side port via CC_PROGRESS_PORT; set to 0 to disable.
+      - "8080:8080"
     # Bound container shutdown so a hung run doesn't block compose down.
     stop_grace_period: 10s
     init: true

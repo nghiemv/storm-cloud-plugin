@@ -111,7 +111,10 @@ def cmd_run(payload_file: str) -> None:
         [*COMPOSE, "run", "--rm", "seed"],
         env={"PAYLOAD_FILE": container_path},
     )
-    run_cmd([*COMPOSE, "run", "--rm", "storm-cloud-plugin"])
+    # --service-ports: `docker compose run` ignores compose-file `ports:`
+    # by default, so without this the progress viewer on 8080 isn't
+    # reachable from the host.
+    run_cmd([*COMPOSE, "run", "--rm", "--service-ports", "storm-cloud-plugin"])
 
 
 TASK_COMMANDS = {

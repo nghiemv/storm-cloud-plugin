@@ -30,6 +30,7 @@ from plugin.actions import (
     process_storms,
     upload_outputs,
 )
+from plugin import web
 from plugin.context import RunContext
 from plugin.payload import validate_payload
 from plugin.progress import format_duration
@@ -110,6 +111,7 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
     n_actions = len(payload.actions)
     action_names = [a.name for a in payload.actions]
     log.info("[plan] pipeline: %s", " → ".join(action_names))
+    web.STATE.set_plan(action_names)
     durations: list[float] = []
 
     try:
@@ -126,6 +128,7 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
                 )
 
             log.info("[step %d/%d] start %s", i, n_actions, action.name)
+            web.STATE.step_start(i, n_actions, action.name)
             t0 = time.monotonic()
             handler(ctx)
             elapsed = time.monotonic() - t0
@@ -137,16 +140,19 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
                 action.name,
                 format_duration(elapsed),
             )
+            web.STATE.step_done(i, n_actions, action.name, elapsed)
 
         succeeded = True
+        total_elapsed = time.monotonic() - start_time
         log.info(
             "[summary] all %d actions completed in %s (%s)",
             n_actions,
-            format_duration(time.monotonic() - start_time),
+            format_duration(total_elapsed),
             ", ".join(
                 f"{n}={format_duration(d)}" for n, d in zip(action_names, durations)
             ),
         )
+        web.STATE.set_summary(n_actions, total_elapsed)
     finally:
         if succeeded:
             shutil.rmtree(local_root, ignore_errors=True)
@@ -158,6 +164,7 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
 
 
 def main() -> None:
+    web.start_if_enabled()
     pm = PluginManager()
     payload = pm.get_payload()
     validate_payload(payload)

@@ -22,6 +22,8 @@ import re
 import threading
 import time
 
+from plugin.web import STATE as _WEB_STATE
+
 log = logging.getLogger(__name__)
 
 
@@ -93,6 +95,9 @@ class Progress:
             pct,
             rate,
             format_duration(eta_s),
+        )
+        _WEB_STATE.set_progress(
+            self.label, done=self.done, total=self.total, rate=rate, eta_s=eta_s
         )
 
 
@@ -182,6 +187,9 @@ class StormhubProgressTracker:
             pct,
             rate,
             format_duration(eta_s),
+        )
+        _WEB_STATE.set_progress(
+            self.label, done=processed, total=start_rem, rate=rate, eta_s=eta_s
         )
 
     def _emit_final(self) -> None:

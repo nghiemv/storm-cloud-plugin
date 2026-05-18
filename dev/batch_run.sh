@@ -77,6 +77,7 @@ for entry in "${RUNS[@]}"; do
   mkdir -p "$LOCAL_OUTPUTS/$name"
 
   docker run --rm \
+    -p 8080:8080 \
     -v "$LOCAL_OUTPUTS/$name:/usr/src/app/Local" \
     -e CC_MANIFEST_ID="$uuid" \
     -e CC_PAYLOAD_ID="$uuid" \

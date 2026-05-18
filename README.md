@@ -14,7 +14,12 @@ Requires **Python 3** and **Docker**.
 python dev/tasks.py          # Builds image, starts MinIO, runs plugin (~2 min first run)
 ```
 
-Results at http://localhost:9001 (ccuser/ccpassword).
+While it runs:
+- **Progress + ETA**: http://localhost:8080 — live pipeline view, auto-refreshes every 2s.
+- **Storage browser**: http://localhost:9001 (ccuser/ccpassword) — output files in MinIO.
+
+Disable the progress viewer with `CC_PROGRESS_PORT=0` (e.g. in `dev/local.env`)
+if port 8080 is taken or you don't want it exposed.
 
 > Local dev runs serialize storm-search by default (1 worker) because
 > no container memory limit is enforced. For a faster loop, set
