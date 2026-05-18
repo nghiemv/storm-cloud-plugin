@@ -4,3 +4,4 @@
 Local/
 __pycache__/
 *.pyc
+outputs/
