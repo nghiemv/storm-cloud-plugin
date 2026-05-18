@@ -11,6 +11,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_PAYLOAD = "test/examples/payload.json"
+COMPOSE = ["docker", "compose", "-f", "docker/docker-compose.yaml"]
 
 
 def run_cmd(args: list[str], env: dict[str, str] | None = None, **kwargs) -> None:
@@ -27,7 +28,7 @@ def run_quiet(args: list[str]) -> None:
 def cmd_build() -> None:
     """Init submodule + build Docker image."""
     run_cmd(["git", "submodule", "update", "--init"])
-    run_cmd(["docker", "compose", "build", "storm-cloud-plugin"])
+    run_cmd([*COMPOSE, "build", "storm-cloud-plugin"])
 
 
 def cmd_package() -> None:
@@ -56,7 +57,7 @@ def cmd_freeze() -> None:
     cmd_build()
     result = subprocess.run(
         [
-            "docker", "compose", "run", "--rm",
+            *COMPOSE, "run", "--rm",
             "--entrypoint", "python3.12 -m pip freeze",
             "storm-cloud-plugin",
         ],
@@ -81,14 +82,14 @@ def cmd_freeze() -> None:
 
 def cmd_down() -> None:
     """Stop containers."""
-    run_quiet(["docker", "compose", "down", "--remove-orphans"])
+    run_quiet([*COMPOSE, "down", "--remove-orphans"])
 
 
 def cmd_clean() -> None:
     """Remove containers, volumes, Local/."""
     cmd_down()
     shutil.rmtree(SCRIPT_DIR / "Local", ignore_errors=True)
-    run_quiet(["docker", "compose", "down", "-v", "--remove-orphans"])
+    run_quiet([*COMPOSE, "down", "-v", "--remove-orphans"])
     print("Cleaned.")
 
 
@@ -101,10 +102,10 @@ def cmd_run(payload_file: str) -> None:
 
     print(f"Running: {payload_file}\n")
     run_cmd(
-        ["docker", "compose", "run", "--rm", "seed"],
+        [*COMPOSE, "run", "--rm", "seed"],
         env={"PAYLOAD_FILE": container_path},
     )
-    run_cmd(["docker", "compose", "run", "--rm", "storm-cloud-plugin"])
+    run_cmd([*COMPOSE, "run", "--rm", "storm-cloud-plugin"])
 
 
 TASK_COMMANDS = {

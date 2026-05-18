@@ -9,6 +9,6 @@ __pycache__/
 *.so
 *.dll
 *.md
-docker-compose.yaml
+docker/
 manifest.example.json
 run.py

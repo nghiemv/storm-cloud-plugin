@@ -5,3 +5,5 @@ Local/
 __pycache__/
 *.pyc
 outputs/
+.pytest_cache/
+.ruff_cache/

@@ -67,9 +67,9 @@ container's memory ceiling. To reproduce the original failure under a
 3 GB cap:
 
 ```bash
-docker compose -f docker-compose.yaml -f docker-compose.mem-limit.yaml build
-docker compose -f docker-compose.yaml -f docker-compose.mem-limit.yaml run --rm seed
-docker compose -f docker-compose.yaml -f docker-compose.mem-limit.yaml run --rm storm-cloud-plugin
+docker compose -f docker/docker-compose.yaml -f docker/docker-compose.mem-limit.yaml build
+docker compose -f docker/docker-compose.yaml -f docker/docker-compose.mem-limit.yaml run --rm seed
+docker compose -f docker/docker-compose.yaml -f docker/docker-compose.mem-limit.yaml run --rm storm-cloud-plugin
 ```
 
 With the fix, the resolver reads the cgroup limit and picks a safe worker
