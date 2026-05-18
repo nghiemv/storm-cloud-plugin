@@ -79,6 +79,16 @@ def process_storms(ctx: dict[str, Any], action: Any) -> None:
         str(local_root), catalog_id, storm_params["storm_duration"]
     )
 
+    if ctx.get("_checkpoint_restore"):
+        # Called only to repopulate context — don't redo expensive work.
+        if collection is None:
+            raise RuntimeError(
+                f"Context restore failed: no saved catalog found under {local_root / catalog_id}"
+            )
+        ctx["collection"] = collection
+        ctx["storm_params"] = storm_params
+        return
+
     if collection is None:
         catalog = new_catalog(
             catalog_id,

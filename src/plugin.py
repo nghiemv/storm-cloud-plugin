@@ -219,6 +219,19 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
                     len(payload.actions),
                     action.name,
                 )
+                # Still call the handler in restore mode so it can repopulate
+                # any context keys that downstream actions depend on.
+                ctx["_checkpoint_restore"] = True
+                try:
+                    handler(ctx, action)
+                except Exception as e:
+                    log.warning(
+                        "Context restore for '%s' raised %s — continuing",
+                        action.name,
+                        e,
+                    )
+                finally:
+                    ctx.pop("_checkpoint_restore", None)
                 continue
 
             log.info(
