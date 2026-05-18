@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
@@ -15,12 +16,22 @@ log = logging.getLogger(__name__)
 MAX_FAILURE_RATIO = float(os.environ.get("DSS_MAX_FAILURE_RATIO", "0.5"))
 DSS_WORKERS = int(os.environ.get("DSS_WORKERS", "0"))  # 0 = auto (cpu_count)
 
+# Spawn, not fork: stormhub workers open s3fs, whose async event-loop
+# thread doesn't survive fork() and deadlocks child Event.wait() on first
+# S3 read. Same fix landed in stormhub's own pools on v0.5.0.
+_SPAWN_CTX = multiprocessing.get_context("spawn")
+
 
 def _parse_storm_datetime(item: Any) -> Optional[datetime]:
     try:
-        return datetime.strptime(item.id, "%Y-%m-%dT%H")
+        dt = datetime.strptime(item.id, "%Y-%m-%dT%H")
     except ValueError:
-        return item.datetime if item.datetime else None
+        dt = item.datetime if item.datetime else None
+    # AORC zarr time coord is tz-naive (numpy datetime64); strip any tz
+    # so ds.sel(time=slice(...)) doesn't raise tz-aware/naive compare.
+    if dt is not None and dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt
 
 
 def _convert_single_storm(
@@ -47,6 +58,7 @@ def _convert_single_storm(
                 NOAADataVariable.APCP: storm_duration,
                 NOAADataVariable.TMP: storm_duration,
             },
+            output_resolution_km=4,
         )
         return None
     except Exception as e:
@@ -112,7 +124,7 @@ def convert_to_dss(ctx: dict[str, Any], action: Any) -> None:
         )
         log.info("Running %d conversions with %d workers", len(work), workers)
 
-        with ProcessPoolExecutor(max_workers=workers) as pool:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=_SPAWN_CTX) as pool:
             futures = {
                 pool.submit(
                     _convert_single_storm,

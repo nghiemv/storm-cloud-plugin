@@ -1,4 +1,4 @@
 [submodule "lib/stormhub"]
 	path = lib/stormhub
 	url = https://github.com/nghiemv/stormhub.git
-	branch = feat/usace-aorc-cache
+	branch = feat/usace-aorc-cache-v0.5.0
