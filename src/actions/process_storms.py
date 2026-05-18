@@ -1,67 +1,53 @@
-"""Action: process-storms — Create STAC catalog and storm collection from NOAA AORC data."""
+"""Action: process-storms — Build a STAC catalog/collection from NOAA AORC data."""
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Any
 
 from stormhub.met.storm_catalog import StormCatalog, new_catalog, new_collection
 
+from context import RunContext, StormState
 from worker_sizing import resolve_num_workers
 
 log = logging.getLogger(__name__)
 
 
-def _try_reload_collection(
-    catalog_dir: str, catalog_id: str, storm_duration: int
+def _load_existing_collection(
+    catalog_dir: Path, catalog_id: str, storm_duration: int
 ) -> Any | None:
-    """Attempt to reload a previously saved catalog + collection from disk."""
-    catalog_file = os.path.join(catalog_dir, catalog_id, "catalog.json")
-    if not os.path.exists(catalog_file):
-        return None
+    """Return a previously-saved collection if present and non-empty, else None.
 
+    Enables fast resumes on local re-runs: if a prior invocation left a saved
+    catalog under ``catalog_dir / catalog_id``, reuse it instead of rebuilding.
+    """
+    catalog_file = catalog_dir / catalog_id / "catalog.json"
+    if not catalog_file.exists():
+        return None
     try:
-        catalog = StormCatalog.from_file(catalog_file)
+        catalog = StormCatalog.from_file(str(catalog_file))
         collection_id = catalog.spm.storm_collection_id(storm_duration)
         collection = catalog.get_child(collection_id)
-        if collection is None:
+        if collection is None or not list(collection.get_all_items()):
             return None
-        # Verify it has items
-        items = list(collection.get_all_items())
-        if not items:
-            return None
-        log.info(
-            "Reloaded existing collection %s with %d items from disk",
-            collection_id,
-            len(items),
-        )
-        return collection
     except Exception as e:
-        log.warning("Could not reload collection from disk, will re-create: %s", e)
+        log.warning("Could not reload collection — will rebuild: %s", e)
         return None
+    log.info("Reloaded existing collection %s from disk", collection_id)
+    return collection
 
 
-def process_storms(ctx: dict[str, Any], action: Any) -> None:
-    payload = ctx["payload"]
-    local_root: Path = ctx["local_root"]
-    config_path: Path = ctx.get("config_path", local_root / "config.json")
-
-    attrs = payload.attributes
-    catalog_id = attrs["catalog_id"]
-
-    end_date = attrs.get("end_date", "")
-    if not end_date:
-        end_date = attrs["start_date"]
+def _storm_params(attrs: dict[str, str]) -> dict[str, Any]:
+    end_date = attrs.get("end_date") or attrs["start_date"]
+    if not attrs.get("end_date"):
         log.info(
             "No end_date specified — defaulting to start_date (%s) for single-day scan",
             end_date,
         )
-
-    storm_params = {
+    return {
         "start_date": attrs["start_date"],
         "end_date": end_date,
         "storm_duration": int(attrs.get("storm_duration", "72")),
@@ -69,47 +55,41 @@ def process_storms(ctx: dict[str, Any], action: Any) -> None:
         "top_n_events": int(attrs.get("top_n_events", "10")),
         "check_every_n_hours": int(attrs.get("check_every_n_hours", "24")),
         "num_workers": resolve_num_workers(attrs),
-        "specific_dates": json.loads(attrs["specific_dates"])
-        if attrs.get("specific_dates")
-        else [],
+        "specific_dates": (
+            json.loads(attrs["specific_dates"]) if attrs.get("specific_dates") else []
+        ),
     }
 
-    # Try to resume from a previous run's saved catalog/collection
-    collection = _try_reload_collection(
-        str(local_root), catalog_id, storm_params["storm_duration"]
-    )
 
-    if ctx.get("_checkpoint_restore"):
-        # Called only to repopulate context — don't redo expensive work.
-        if collection is None:
-            raise RuntimeError(
-                f"Context restore failed: no saved catalog found under {local_root / catalog_id}"
-            )
-        ctx["collection"] = collection
-        ctx["storm_params"] = storm_params
-        return
+def process_storms(ctx: RunContext) -> None:
+    if ctx.inputs is None:
+        raise RuntimeError("process-storms requires download-inputs to run first")
+
+    attrs = ctx.payload.attributes
+    catalog_id = attrs["catalog_id"]
+    params = _storm_params(attrs)
+
+    collection = _load_existing_collection(
+        ctx.local_root, catalog_id, params["storm_duration"]
+    )
 
     if collection is None:
         catalog = new_catalog(
             catalog_id,
-            str(config_path),
-            local_directory=str(local_root),
+            str(ctx.inputs.config_path),
+            local_directory=str(ctx.local_root),
             catalog_description=attrs["catalog_description"],
         )
-
         try:
-            collection = new_collection(catalog, **storm_params)
+            collection = new_collection(catalog, **params)
         except BrokenProcessPool as e:
             raise RuntimeError(
-                f"Storm processing pool died with num_workers="
-                f"{storm_params['num_workers']} (likely OOM). Lower via "
-                "'num_workers' payload attribute or CC_NUM_WORKERS env."
+                f"Storm processing pool died with num_workers={params['num_workers']} "
+                "(likely OOM). Lower via 'num_workers' payload attribute or "
+                "CC_NUM_WORKERS env."
             ) from e
         if collection is None:
             raise RuntimeError("no storms found matching criteria")
 
     log.info("Catalog and collection ready")
-
-    # Store collection in context for downstream actions
-    ctx["collection"] = collection
-    ctx["storm_params"] = storm_params
+    ctx.storms = StormState(collection=collection, params=params)
