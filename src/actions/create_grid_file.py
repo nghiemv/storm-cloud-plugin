@@ -52,11 +52,15 @@ _ALBERS_CRS_WKT = (
 
 
 def _parse_storm_datetime(item: Any) -> datetime | None:
-    """Replicates convert_to_dss._parse_storm_datetime to pair items with DSS files."""
+    """Pair STAC items with their DSS files. Must match convert_to_dss
+    so the same item resolves to the same datetime in both passes."""
     try:
-        return datetime.strptime(item.id, "%Y-%m-%dT%H")
+        dt = datetime.strptime(item.id, "%Y-%m-%dT%H")
     except ValueError:
-        return item.datetime if getattr(item, "datetime", None) else None
+        dt = item.datetime if getattr(item, "datetime", None) else None
+    if dt is not None and dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt
 
 
 def _centroid_lonlat(item: Any) -> tuple[float, float] | None:

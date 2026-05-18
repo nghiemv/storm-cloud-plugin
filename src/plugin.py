@@ -86,24 +86,8 @@ ACTION_DISPATCH = {
     "upload-outputs": upload_outputs,
 }
 
-# Attribute type constraints: (validator_fn, human description)
-_POSITIVE_INT = (lambda v: v.isdigit() and int(v) > 0, "positive integer string")
-_NON_NEGATIVE_FLOAT = (
-    lambda v: _is_non_negative_float(v),
-    "non-negative numeric string",
-)
-_DATE_FMT = (lambda v: _is_iso_date(v), "YYYY-MM-DD date string")
-_JSON_LIST = (lambda v: _is_json_string_list(v), "JSON array of date strings")
-
-ATTR_VALIDATORS: dict[str, tuple] = {
-    "start_date": _DATE_FMT,
-    "end_date": _DATE_FMT,
-    "storm_duration": _POSITIVE_INT,
-    "top_n_events": _POSITIVE_INT,
-    "check_every_n_hours": _POSITIVE_INT,
-    "min_precip_threshold": _NON_NEGATIVE_FLOAT,
-    "specific_dates": _JSON_LIST,
-}
+def _is_positive_int(v: str) -> bool:
+    return v.isdigit() and int(v) > 0
 
 
 def _is_iso_date(v: str) -> bool:
@@ -127,6 +111,22 @@ def _is_json_string_list(v: str) -> bool:
         return isinstance(parsed, list) and all(isinstance(d, str) for d in parsed)
     except (json.JSONDecodeError, TypeError):
         return False
+
+
+_POSITIVE_INT = (_is_positive_int, "positive integer string")
+_NON_NEGATIVE_FLOAT = (_is_non_negative_float, "non-negative numeric string")
+_DATE_FMT = (_is_iso_date, "YYYY-MM-DD date string")
+_JSON_LIST = (_is_json_string_list, "JSON array of date strings")
+
+ATTR_VALIDATORS: dict[str, tuple] = {
+    "start_date": _DATE_FMT,
+    "end_date": _DATE_FMT,
+    "storm_duration": _POSITIVE_INT,
+    "top_n_events": _POSITIVE_INT,
+    "check_every_n_hours": _POSITIVE_INT,
+    "min_precip_threshold": _NON_NEGATIVE_FLOAT,
+    "specific_dates": _JSON_LIST,
+}
 
 
 def validate_payload(payload: Any) -> None:
