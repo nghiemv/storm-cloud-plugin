@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from plugin.cc_io import upload_from_local
-from plugin.context import RunContext
+from plugin.lib import RunContext, upload_from_local
 from plugin.progress import Progress
 
 log = logging.getLogger(__name__)

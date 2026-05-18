@@ -99,6 +99,11 @@ def cmd_clean() -> None:
     print("Cleaned.")
 
 
+def cmd_viewer() -> None:
+    """Serve the live progress viewer at http://localhost:8080."""
+    run_cmd([sys.executable, str(PROJECT_ROOT / "dev" / "viewer.py")])
+
+
 def cmd_run(payload_file: str) -> None:
     run_cmd(["git", "submodule", "update", "--init"])
     cmd_down()
@@ -106,15 +111,19 @@ def cmd_run(payload_file: str) -> None:
     # Container path: tests/ is mounted as /inputs/ in the seed service
     container_path = "/inputs/" + payload_file.replace("\\", "/").split("tests/", 1)[-1]
 
-    print(f"Running: {payload_file}\n")
+    # Local/ in the container is bind-mounted to outputs/quick-test/ on the
+    # host (see docker/docker-compose.yaml). Pre-create the host dir so the
+    # mount doesn't show up as root-owned and dev/viewer.py can read it.
+    (PROJECT_ROOT / "outputs" / "quick-test").mkdir(parents=True, exist_ok=True)
+
+    print(f"Running: {payload_file}")
+    print("Progress: http://localhost:8080  (start `python dev/tasks.py viewer` "
+          "in another terminal if not already running)\n")
     run_cmd(
         [*COMPOSE, "run", "--rm", "seed"],
         env={"PAYLOAD_FILE": container_path},
     )
-    # --service-ports: `docker compose run` ignores compose-file `ports:`
-    # by default, so without this the progress viewer on 8080 isn't
-    # reachable from the host.
-    run_cmd([*COMPOSE, "run", "--rm", "--service-ports", "storm-cloud-plugin"])
+    run_cmd([*COMPOSE, "run", "--rm", "storm-cloud-plugin"])
 
 
 TASK_COMMANDS = {
@@ -123,6 +132,7 @@ TASK_COMMANDS = {
     "lint": cmd_lint,
     "format": cmd_format,
     "freeze": cmd_freeze,
+    "viewer": cmd_viewer,
     "down": cmd_down,
     "clean": cmd_clean,
 }

@@ -11,7 +11,7 @@ from typing import Any
 
 from stormhub.met.storm_catalog import StormCatalog, new_catalog, new_collection
 
-from plugin.context import RunContext
+from plugin.lib import RunContext
 from plugin.progress import StormhubProgressTracker
 from plugin.workers import resolve_num_workers
 

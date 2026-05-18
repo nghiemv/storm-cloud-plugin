@@ -11,15 +11,13 @@ S3 payload  -->  download-inputs  -->  process-storms  -->  convert-to-dss  --> 
 Requires **Python 3** and **Docker**.
 
 ```bash
-python dev/tasks.py          # Builds image, starts MinIO, runs plugin (~2 min first run)
+python dev/tasks.py viewer   # one-time, in its own terminal — http://localhost:8080
+python dev/tasks.py          # in another terminal — builds image, starts MinIO, runs plugin
 ```
 
-While it runs:
-- **Progress + ETA**: http://localhost:8080 — live pipeline view, auto-refreshes every 2s.
-- **Storage browser**: http://localhost:9001 (ccuser/ccpassword) — output files in MinIO.
-
-Disable the progress viewer with `CC_PROGRESS_PORT=0` (e.g. in `dev/local.env`)
-if port 8080 is taken or you don't want it exposed.
+The viewer is a host-side process; it stays up across runs and shows a card per
+run found under `outputs/`. Plugin writes `Local/progress.json` on every tick;
+viewer polls. MinIO output files are at http://localhost:9001 (ccuser/ccpassword).
 
 > Local dev runs serialize storm-search by default (1 worker) because
 > no container memory limit is enforced. For a faster loop, set
@@ -56,9 +54,13 @@ Storm parameters are in `attributes`. All values are strings (CC SDK convention)
 
 ```
 plugin/         # plugin package (entry: python -m plugin)
-  actions/      # one module per pipeline step
+  __main__.py   #   entry: dispatches actions from the payload
+  actions/      #   one module per pipeline step (5 steps)
+  lib.py        #   shared plumbing: context, S3 I/O, DSS naming, validation
+  progress.py   #   [progress] log lines + progress.json for the viewer
+  workers.py    #   cgroup-aware worker count (OOM guard)
 docker/         # Dockerfile + compose
-dev/            # local dev: tasks.py, local.env, batch_run.sh, mirror_aorc.py
+dev/            # local dev: tasks.py, viewer.py, local.env, batch_run.sh, mirror_aorc.py
 fixtures/       # seeded into MinIO as production inputs (NOT test data)
 tests/          # pytest tests + example payloads
 lib/stormhub/   # vendored upstream library (git submodule)
@@ -72,6 +74,7 @@ python dev/tasks.py package   # Build image and save as storm-cloud-plugin.tar
 python dev/tasks.py lint      # Ruff linter + format check
 python dev/tasks.py format    # Auto-format with ruff
 python dev/tasks.py freeze    # Regenerate constraints.txt
+python dev/tasks.py viewer    # Serve progress viewer at http://localhost:8080
 python dev/tasks.py clean     # Remove containers, volumes, Local/
 python dev/tasks.py down      # Stop containers
 ```

@@ -30,9 +30,8 @@ from plugin.actions import (
     process_storms,
     upload_outputs,
 )
-from plugin import web
-from plugin.context import RunContext
-from plugin.payload import validate_payload
+from plugin import progress
+from plugin.lib import RunContext, validate_payload
 from plugin.progress import format_duration
 
 ACTION_DISPATCH: dict[str, Callable[[RunContext], None]] = {
@@ -111,7 +110,7 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
     n_actions = len(payload.actions)
     action_names = [a.name for a in payload.actions]
     log.info("[plan] pipeline: %s", " → ".join(action_names))
-    web.STATE.set_plan(action_names)
+    progress.set_plan(action_names)
     durations: list[float] = []
 
     try:
@@ -128,7 +127,7 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
                 )
 
             log.info("[step %d/%d] start %s", i, n_actions, action.name)
-            web.STATE.step_start(i, n_actions, action.name)
+            progress.step_start(i, n_actions, action.name)
             t0 = time.monotonic()
             handler(ctx)
             elapsed = time.monotonic() - t0
@@ -140,7 +139,7 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
                 action.name,
                 format_duration(elapsed),
             )
-            web.STATE.step_done(i, n_actions, action.name, elapsed)
+            progress.step_done(i, n_actions, action.name, elapsed)
 
         succeeded = True
         total_elapsed = time.monotonic() - start_time
@@ -152,7 +151,7 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
                 f"{n}={format_duration(d)}" for n, d in zip(action_names, durations)
             ),
         )
-        web.STATE.set_summary(n_actions, total_elapsed)
+        progress.set_summary(n_actions, total_elapsed)
     finally:
         if succeeded:
             shutil.rmtree(local_root, ignore_errors=True)
@@ -164,7 +163,11 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
 
 
 def main() -> None:
-    web.start_if_enabled()
+    # Surface progress at outputs/<run>/progress.json (read by dev/viewer.py).
+    # Local/ is bind-mounted to outputs/<name>/ on the host (see docker
+    # configs); writing here makes the snapshot visible without needing a
+    # port published from the container.
+    progress.configure_state_file(Path("Local") / "progress.json")
     pm = PluginManager()
     payload = pm.get_payload()
     validate_payload(payload)

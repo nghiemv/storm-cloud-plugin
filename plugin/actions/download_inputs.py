@@ -7,8 +7,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from plugin.cc_io import download_to_local
-from plugin.context import RunContext
+from plugin.lib import RunContext, download_to_local
 from plugin.progress import Progress
 
 log = logging.getLogger(__name__)
