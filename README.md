@@ -11,23 +11,23 @@ S3 payload  -->  download-inputs  -->  process-storms  -->  convert-to-dss  --> 
 Requires **Python 3** and **Docker**.
 
 ```bash
-python run.py          # Builds image, starts MinIO, runs plugin (~2 min first run)
+python dev/tasks.py          # Builds image, starts MinIO, runs plugin (~2 min first run)
 ```
 
 Results at http://localhost:9001 (ccuser/ccpassword).
 
 > Local dev runs serialize storm-search by default (1 worker) because
 > no container memory limit is enforced. For a faster loop, set
-> `CC_NUM_WORKERS=4` in `test/local.env` or pass `num_workers` in
+> `CC_NUM_WORKERS=4` in `dev/local.env` or pass `num_workers` in
 > the payload `attributes`.
 
 ## Custom Payloads
 
-Edit `test/examples/payload.json` or copy it and pass the path:
+Edit `tests/examples/payload.json` or copy it and pass the path:
 
 ```bash
-cp test/examples/payload.json test/examples/mine.json
-python run.py test/examples/mine.json
+cp tests/examples/payload.json tests/examples/mine.json
+python dev/tasks.py tests/examples/mine.json
 ```
 
 Storm parameters are in `attributes`. All values are strings (CC SDK convention).
@@ -47,16 +47,28 @@ Storm parameters are in `attributes`. All values are strings (CC SDK convention)
 | `input_path` | yes | | S3 path to watershed/transposition geometries |
 | `output_path` | yes | | S3 path for results |
 
+## Repo Layout
+
+```
+plugin/         # plugin package (entry: python -m plugin)
+  actions/      # one module per pipeline step
+docker/         # Dockerfile + compose
+dev/            # local dev: tasks.py, local.env, batch_run.sh, mirror_aorc.py
+fixtures/       # seeded into MinIO as production inputs (NOT test data)
+tests/          # pytest tests + example payloads
+lib/stormhub/   # vendored upstream library (git submodule)
+```
+
 ## Dev Tasks
 
 ```bash
-python run.py build     # Init submodule + build Docker image
-python run.py package   # Build image and save as storm-cloud-plugin.tar
-python run.py lint      # Ruff linter + format check
-python run.py format    # Auto-format with ruff
-python run.py freeze    # Regenerate constraints.txt
-python run.py clean     # Remove containers, volumes, Local/
-python run.py down      # Stop containers
+python dev/tasks.py build     # Init submodule + build Docker image
+python dev/tasks.py package   # Build image and save as storm-cloud-plugin.tar
+python dev/tasks.py lint      # Ruff linter + format check
+python dev/tasks.py format    # Auto-format with ruff
+python dev/tasks.py freeze    # Regenerate constraints.txt
+python dev/tasks.py clean     # Remove containers, volumes, Local/
+python dev/tasks.py down      # Stop containers
 ```
 
 ## Reproducing the OOM Failure Mode

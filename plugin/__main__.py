@@ -1,4 +1,4 @@
-"""StormHub Cloud Compute plugin entry point.
+"""Plugin entry point — invoked as ``python -m plugin``.
 
 Initializes the PluginManager, validates the payload, then dispatches actions
 in the order declared by the payload. Actions are idempotent at the
@@ -23,15 +23,15 @@ from typing import Any, Callable
 from cc.plugin_manager import PluginManager
 from stormhub.logger import initialize_logger
 
-from actions import (
+from plugin.actions import (
     convert_to_dss,
     create_grid_file,
     download_inputs,
     process_storms,
     upload_outputs,
 )
-from context import RunContext
-from validation import validate_payload
+from plugin.context import RunContext
+from plugin.payload import validate_payload
 
 ACTION_DISPATCH: dict[str, Callable[[RunContext], None]] = {
     "download-inputs": download_inputs,

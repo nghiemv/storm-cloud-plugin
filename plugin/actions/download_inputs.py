@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
-from cc.plugin_manager import DataSourceOpInput
-
-from context import LocalInputs, RunContext
-from s3_retry import with_retry
+from plugin.cc_io import download_to_local
+from plugin.context import RunContext
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class LocalInputs:
+    """Files materialized by ``download-inputs`` for downstream actions."""
+
+    watershed_path: Path
+    transposition_path: Path
+    config_path: Path
 
 
 _GEOJSON_TYPES = frozenset(
@@ -68,12 +76,12 @@ def download_inputs(ctx: RunContext) -> None:
     for source in payload.inputs:
         for key, remote_path in source.paths.items():
             local_path = local_root / Path(remote_path).name
-            op = DataSourceOpInput(name=source.name, pathkey=key, datakey=None)
             log.info("Downloading %s -> %s", remote_path, local_path)
-            with_retry(
-                lambda op=op, p=local_path: pm.copy_file_to_local(
-                    ds=op, localpath=str(p)
-                ),
+            download_to_local(
+                pm,
+                source_name=source.name,
+                pathkey=key,
+                local_path=local_path,
                 description=f"S3 download {remote_path}",
             )
             _validate_geojson(local_path, key)

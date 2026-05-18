@@ -1,4 +1,4 @@
-"""Soft failure-ratio check used by batch-style actions.
+"""Soft failure-ratio policy for batch-style actions.
 
 Both ``convert-to-dss`` and ``create-grid-file`` produce one output per storm
 and tolerate a fraction of failures; this helper centralizes the "warn,

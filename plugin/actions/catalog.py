@@ -5,15 +5,24 @@ from __future__ import annotations
 import json
 import logging
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from stormhub.met.storm_catalog import StormCatalog, new_catalog, new_collection
 
-from context import RunContext, StormState
-from worker_sizing import resolve_num_workers
+from plugin.context import RunContext
+from plugin.workers import resolve_num_workers
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class StormState:
+    """Catalog + parameters built by ``process-storms``."""
+
+    collection: Any  # pystac.Collection
+    params: dict[str, Any]
 
 
 def _load_existing_collection(

@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import logging
 
-from cc.plugin_manager import DataSourceOpInput
-
-from context import RunContext
-from s3_retry import with_retry
+from plugin.cc_io import upload_from_local
+from plugin.context import RunContext
 
 log = logging.getLogger(__name__)
 
@@ -34,11 +32,11 @@ def upload_outputs(ctx: RunContext) -> None:
             rel_path = str(file.relative_to(output_dir))
             remote_path = f"{remote_base}/{rel_path}"
             output_source.paths[rel_path] = remote_path
-            op = DataSourceOpInput(
-                name=output_source.name, pathkey=rel_path, datakey=None
-            )
             log.info("  [%s] %s -> %s", output_source.name, file.name, remote_path)
-            with_retry(
-                lambda op=op, f=file: pm.copy_file_to_remote(ds=op, localpath=str(f)),
+            upload_from_local(
+                pm,
+                source_name=output_source.name,
+                pathkey=rel_path,
+                local_path=file,
                 description=f"S3 upload {file.name}",
             )

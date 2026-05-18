@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Task runner for storm-cloud-plugin. Requires Python 3 and Docker."""
+"""Local dev task runner. Requires Python 3 and Docker.
+
+Run from the project root: ``python dev/tasks.py [command|payload]``.
+"""
 
 from __future__ import annotations
 
@@ -9,20 +12,22 @@ import subprocess
 import sys
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_PAYLOAD = "test/examples/payload.json"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_PAYLOAD = "tests/examples/payload.json"
 COMPOSE = ["docker", "compose", "-f", "docker/docker-compose.yaml"]
 
 
 def run_cmd(args: list[str], env: dict[str, str] | None = None, **kwargs) -> None:
     merged_env = {**os.environ, **(env or {})}
-    result = subprocess.run(args, env=merged_env, **kwargs)
+    result = subprocess.run(args, env=merged_env, cwd=PROJECT_ROOT, **kwargs)
     if result.returncode != 0:
         sys.exit(result.returncode)
 
 
 def run_quiet(args: list[str]) -> None:
-    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=PROJECT_ROOT
+    )
 
 
 def cmd_build() -> None:
@@ -32,10 +37,10 @@ def cmd_build() -> None:
 
 
 def cmd_package() -> None:
-    """Build Docker image and save as stormhub-cloud.tar."""
+    """Build Docker image and save as storm-cloud-plugin.tar."""
     cmd_build()
     image = "ghcr.io/usace/storm-cloud-plugin:latest"
-    out = SCRIPT_DIR / "storm-cloud-plugin.tar"
+    out = PROJECT_ROOT / "storm-cloud-plugin.tar"
     print(f"Saving {image} -> {out}")
     run_cmd(["docker", "save", "-o", str(out), image])
     print(f"Done: {out} ({out.stat().st_size // 1024 // 1024} MB)")
@@ -43,13 +48,13 @@ def cmd_package() -> None:
 
 def cmd_lint() -> None:
     """Ruff linter + format check."""
-    run_cmd(["ruff", "check", "src/"])
-    run_cmd(["ruff", "format", "--check", "src/"])
+    run_cmd(["ruff", "check", "plugin/"])
+    run_cmd(["ruff", "format", "--check", "plugin/"])
 
 
 def cmd_format() -> None:
     """Auto-format with ruff."""
-    run_cmd(["ruff", "format", "src/"])
+    run_cmd(["ruff", "format", "plugin/"])
 
 
 def cmd_freeze() -> None:
@@ -63,6 +68,7 @@ def cmd_freeze() -> None:
         ],
         capture_output=True,
         text=True,
+        cwd=PROJECT_ROOT,
     )
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
@@ -74,7 +80,7 @@ def cmd_freeze() -> None:
         for line in result.stdout.splitlines()
         if line.strip() and not any(line.startswith(s) for s in skip)
     )
-    (SCRIPT_DIR / "constraints.txt").write_text(
+    (PROJECT_ROOT / "constraints.txt").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )
     print("Updated constraints.txt")
@@ -88,7 +94,7 @@ def cmd_down() -> None:
 def cmd_clean() -> None:
     """Remove containers, volumes, Local/."""
     cmd_down()
-    shutil.rmtree(SCRIPT_DIR / "Local", ignore_errors=True)
+    shutil.rmtree(PROJECT_ROOT / "Local", ignore_errors=True)
     run_quiet([*COMPOSE, "down", "-v", "--remove-orphans"])
     print("Cleaned.")
 
@@ -97,8 +103,8 @@ def cmd_run(payload_file: str) -> None:
     run_cmd(["git", "submodule", "update", "--init"])
     cmd_down()
 
-    # Container path: test/ is mounted as /inputs/ in the seed service
-    container_path = "/inputs/" + payload_file.replace("\\", "/").split("test/", 1)[-1]
+    # Container path: tests/ is mounted as /inputs/ in the seed service
+    container_path = "/inputs/" + payload_file.replace("\\", "/").split("tests/", 1)[-1]
 
     print(f"Running: {payload_file}\n")
     run_cmd(
@@ -123,8 +129,8 @@ def main() -> None:
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
 
     if arg in ("-h", "--help", "help"):
-        print("Usage: python run.py [PAYLOAD | command]\n")
-        print("  (no args)    Run with test/examples/payload.json")
+        print("Usage: python dev/tasks.py [PAYLOAD | command]\n")
+        print("  (no args)    Run with tests/examples/payload.json")
         print("  PAYLOAD      Run with a custom payload file\n")
         for name in TASK_COMMANDS:
             print(f"  {name:<12} {TASK_COMMANDS[name].__doc__ or ''}")

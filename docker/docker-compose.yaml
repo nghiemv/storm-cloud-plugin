@@ -1,5 +1,5 @@
 # Local development infrastructure.
-# Usage: python run.py  (from project root)
+# Usage: python dev/tasks.py  (from project root)
 
 name: storm-cloud-plugin
 
@@ -11,7 +11,7 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"   # Web console: ccuser/ccpassword
-    env_file: ../test/local.env
+    env_file: ../dev/local.env
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
@@ -23,9 +23,9 @@ services:
     depends_on:
       minio:
         condition: service_healthy
-    env_file: ../test/local.env
+    env_file: ../dev/local.env
     volumes:
-      - ../test:/inputs
+      - ../fixtures:/fixtures
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
@@ -38,8 +38,8 @@ services:
       mc mb --ignore-existing local/$$CC_AWS_S3_BUCKET &&
       mc mb --ignore-existing local/$$FFRD_AWS_S3_BUCKET &&
 
-      mc put /inputs/transposition-domain.geojson local/$$FFRD_AWS_S3_BUCKET/$$FFRD_STORE_ROOT/$$FFRD_INPUT_PATH/transposition-domain.geojson &&
-      mc put /inputs/watershed-boundary.geojson local/$$FFRD_AWS_S3_BUCKET/$$FFRD_STORE_ROOT/$$FFRD_INPUT_PATH/watershed-boundary.geojson &&
+      mc put /fixtures/transposition-domain.geojson local/$$FFRD_AWS_S3_BUCKET/$$FFRD_STORE_ROOT/$$FFRD_INPUT_PATH/transposition-domain.geojson &&
+      mc put /fixtures/watershed-boundary.geojson local/$$FFRD_AWS_S3_BUCKET/$$FFRD_STORE_ROOT/$$FFRD_INPUT_PATH/watershed-boundary.geojson &&
 
       echo 'MinIO initialized.'
       "
@@ -49,9 +49,9 @@ services:
     depends_on:
       minio-init:
         condition: service_completed_successfully
-    env_file: ../test/local.env
+    env_file: ../dev/local.env
     volumes:
-      - ../test:/inputs
+      - ../tests:/inputs
     environment:
       PAYLOAD_FILE: ${PAYLOAD_FILE:-/inputs/examples/payload.json}
     entrypoint: >
@@ -69,7 +69,7 @@ services:
     depends_on:
       seed:
         condition: service_completed_successfully
-    env_file: ../test/local.env
+    env_file: ../dev/local.env
     environment:
       CC_AWS_ENDPOINT: http://minio:9000
       FFRD_AWS_ENDPOINT: http://minio:9000

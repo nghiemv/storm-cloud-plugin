@@ -25,8 +25,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff
-      - run: ruff check src/
-      - run: ruff format --check src/
+      - run: ruff check plugin/
+      - run: ruff format --check plugin/
 
   build:
     name: Build per-arch

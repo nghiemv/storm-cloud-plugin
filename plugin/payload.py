@@ -1,4 +1,4 @@
-"""Payload validation for the storm-cloud-plugin.
+"""Payload validation.
 
 CC SDK convention: every payload attribute value is a string. This module
 enforces required keys and per-attribute formats so the action handlers can

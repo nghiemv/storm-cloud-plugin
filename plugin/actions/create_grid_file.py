@@ -15,14 +15,13 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterable
 
 from pyproj import Transformer
 
-from context import RunContext
-from dss_naming import dss_filename, parse_storm_datetime
-from failure_threshold import check_failure_ratio
+from plugin.batch import check_failure_ratio
+from plugin.context import RunContext
+from plugin.dss import dss_filename, earliest_dss_paths, parse_storm_datetime
 
 log = logging.getLogger(__name__)
 
@@ -67,36 +66,6 @@ def _centroid_lonlat(item: Any) -> tuple[float, float] | None:
         return float(coords[0]), float(coords[1])
     except (TypeError, ValueError):
         return None
-
-
-def _earliest_dss_paths(dss_file: Path) -> tuple[str | None, str | None]:
-    """Return earliest PRECIPITATION and TEMPERATURE pathnames in a DSS file."""
-    from hecdss import HecDss  # runtime dep; not needed for pure-format tests
-
-    precip_path: str | None = None
-    temp_path: str | None = None
-    earliest_precip: datetime | None = None
-    earliest_temp: datetime | None = None
-
-    with HecDss(str(dss_file)) as dss:
-        for path_obj in dss.get_catalog():
-            path_str = str(path_obj)
-            parts = path_str.strip("/").split("/")
-            if len(parts) < 6:
-                continue
-            part_c = parts[2].upper()
-            try:
-                dt = datetime.strptime(parts[3], "%d%b%Y:%H%M")
-            except ValueError:
-                continue
-            if part_c == "PRECIPITATION":
-                if earliest_precip is None or dt < earliest_precip:
-                    precip_path, earliest_precip = path_str, dt
-            elif part_c == "TEMPERATURE":
-                if earliest_temp is None or dt < earliest_temp:
-                    temp_path, earliest_temp = path_str, dt
-
-    return precip_path, temp_path
 
 
 def _render_grid_block(
@@ -221,7 +190,7 @@ def create_grid_file(ctx: RunContext) -> None:
             continue
 
         try:
-            precip_pn, temp_pn = _earliest_dss_paths(dss_path)
+            precip_pn, temp_pn = earliest_dss_paths(dss_path)
         except Exception as e:
             log.error("Skipping %s: could not read DSS catalog (%s)", item.id, e)
             failed.append(item.id)
