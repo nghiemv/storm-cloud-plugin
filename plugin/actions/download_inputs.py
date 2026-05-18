@@ -9,6 +9,7 @@ from pathlib import Path
 
 from plugin.cc_io import download_to_local
 from plugin.context import RunContext
+from plugin.progress import Progress
 
 log = logging.getLogger(__name__)
 
@@ -73,10 +74,17 @@ def download_inputs(ctx: RunContext) -> None:
     payload = ctx.payload
     local_root = ctx.local_root
 
-    for source in payload.inputs:
-        for key, remote_path in source.paths.items():
-            local_path = local_root / Path(remote_path).name
-            log.info("Downloading %s -> %s", remote_path, local_path)
+    transfers = [
+        (source, key, remote_path)
+        for source in payload.inputs
+        for key, remote_path in source.paths.items()
+    ]
+    progress = Progress(total=len(transfers), label="download-inputs", log_every_n=1)
+
+    for source, key, remote_path in transfers:
+        local_path = local_root / Path(remote_path).name
+        log.info("Downloading %s -> %s", remote_path, local_path)
+        try:
             download_to_local(
                 pm,
                 source_name=source.name,
@@ -85,6 +93,8 @@ def download_inputs(ctx: RunContext) -> None:
                 description=f"S3 download {remote_path}",
             )
             _validate_geojson(local_path, key)
+        finally:
+            progress.tick()
 
     catalog_id = payload.attributes["catalog_id"]
     input_paths = payload.inputs[0].paths

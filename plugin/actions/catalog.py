@@ -12,6 +12,7 @@ from typing import Any
 from stormhub.met.storm_catalog import StormCatalog, new_catalog, new_collection
 
 from plugin.context import RunContext
+from plugin.progress import StormhubProgressTracker
 from plugin.workers import resolve_num_workers
 
 log = logging.getLogger(__name__)
@@ -90,7 +91,8 @@ def process_storms(ctx: RunContext) -> None:
             catalog_description=attrs["catalog_description"],
         )
         try:
-            collection = new_collection(catalog, **params)
+            with StormhubProgressTracker(label="process-storms"):
+                collection = new_collection(catalog, **params)
         except BrokenProcessPool as e:
             raise RuntimeError(
                 f"Storm processing pool died with num_workers={params['num_workers']} "

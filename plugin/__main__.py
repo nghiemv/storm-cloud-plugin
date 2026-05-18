@@ -32,6 +32,7 @@ from plugin.actions import (
 )
 from plugin.context import RunContext
 from plugin.payload import validate_payload
+from plugin.progress import format_duration
 
 ACTION_DISPATCH: dict[str, Callable[[RunContext], None]] = {
     "download-inputs": download_inputs,
@@ -106,6 +107,11 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
 
     succeeded = False
     start_time = time.monotonic()
+    n_actions = len(payload.actions)
+    action_names = [a.name for a in payload.actions]
+    log.info("[plan] pipeline: %s", " → ".join(action_names))
+    durations: list[float] = []
+
     try:
         for i, action in enumerate(payload.actions, start=1):
             if interrupted:
@@ -119,15 +125,27 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
                     f"(available: {list(ACTION_DISPATCH)})"
                 )
 
-            log.info("[%d/%d] Running action: %s", i, len(payload.actions), action.name)
+            log.info("[step %d/%d] start %s", i, n_actions, action.name)
             t0 = time.monotonic()
             handler(ctx)
-            log.info("Action %s completed in %.1fs", action.name, time.monotonic() - t0)
+            elapsed = time.monotonic() - t0
+            durations.append(elapsed)
+            log.info(
+                "[step %d/%d] done %s in %s",
+                i,
+                n_actions,
+                action.name,
+                format_duration(elapsed),
+            )
 
         succeeded = True
         log.info(
-            "All actions completed successfully in %.1fs",
-            time.monotonic() - start_time,
+            "[summary] all %d actions completed in %s (%s)",
+            n_actions,
+            format_duration(time.monotonic() - start_time),
+            ", ".join(
+                f"{n}={format_duration(d)}" for n, d in zip(action_names, durations)
+            ),
         )
     finally:
         if succeeded:

@@ -22,6 +22,7 @@ from pyproj import Transformer
 from plugin.batch import check_failure_ratio
 from plugin.context import RunContext
 from plugin.dss import dss_filename, earliest_dss_paths, parse_storm_datetime
+from plugin.progress import Progress
 
 log = logging.getLogger(__name__)
 
@@ -143,6 +144,71 @@ def build_grid_file(
     return "".join(out)
 
 
+def _build_entry(
+    *,
+    item: Any,
+    idx: int,
+    storm_duration: int,
+    dss_dir: Any,
+    entries: list[dict[str, Any]],
+    failed: list[str],
+) -> None:
+    """One iteration of the grid-file loop. Appends to entries or failed."""
+    storm_start = parse_storm_datetime(item)
+    if storm_start is None:
+        log.warning("Skipping item %s: unparseable datetime", item.id)
+        failed.append(item.id)
+        return
+
+    fname = dss_filename(storm_start, idx, storm_duration)
+    dss_path = dss_dir / fname
+
+    if not dss_path.exists():
+        log.warning("Skipping %s: %s not found", item.id, fname)
+        failed.append(item.id)
+        return
+
+    try:
+        precip_pn, temp_pn = earliest_dss_paths(dss_path)
+    except Exception as e:
+        log.error("Skipping %s: could not read DSS catalog (%s)", item.id, e)
+        failed.append(item.id)
+        return
+
+    if precip_pn is None and temp_pn is None:
+        log.warning("Skipping %s: no PRECIPITATION or TEMPERATURE paths", item.id)
+        failed.append(item.id)
+        return
+
+    lonlat = _centroid_lonlat(item)
+    if lonlat is None:
+        log.warning("No centroid for %s — emitting grid without Storm Center", item.id)
+
+    grid_base = fname[:-4]  # drop ".dss"
+    rel_dss = f"data/{fname}"
+
+    if precip_pn is not None:
+        entries.append(
+            {
+                "name": grid_base,
+                "grid_type": "Precipitation",
+                "dss_filename": rel_dss,
+                "dss_pathname": precip_pn,
+                "storm_center_lonlat": lonlat,
+            }
+        )
+    if temp_pn is not None:
+        entries.append(
+            {
+                "name": grid_base,
+                "grid_type": "Temperature",
+                "dss_filename": rel_dss,
+                "dss_pathname": temp_pn,
+                "storm_center_lonlat": lonlat,
+            }
+        )
+
+
 def create_grid_file(ctx: RunContext) -> None:
     if ctx.storms is None:
         raise RuntimeError("create-grid-file requires process-storms to have run first")
@@ -173,63 +239,20 @@ def create_grid_file(ctx: RunContext) -> None:
 
     entries: list[dict[str, Any]] = []
     failed: list[str] = []
+    progress = Progress(total=len(items), label="create-grid-file")
 
     for idx, item in enumerate(items, start=1):
-        storm_start = parse_storm_datetime(item)
-        if storm_start is None:
-            log.warning("Skipping item %s: unparseable datetime", item.id)
-            failed.append(item.id)
-            continue
-
-        fname = dss_filename(storm_start, idx, storm_duration)
-        dss_path = dss_dir / fname
-
-        if not dss_path.exists():
-            log.warning("Skipping %s: %s not found", item.id, fname)
-            failed.append(item.id)
-            continue
-
         try:
-            precip_pn, temp_pn = earliest_dss_paths(dss_path)
-        except Exception as e:
-            log.error("Skipping %s: could not read DSS catalog (%s)", item.id, e)
-            failed.append(item.id)
-            continue
-
-        if precip_pn is None and temp_pn is None:
-            log.warning("Skipping %s: no PRECIPITATION or TEMPERATURE paths", item.id)
-            failed.append(item.id)
-            continue
-
-        lonlat = _centroid_lonlat(item)
-        if lonlat is None:
-            log.warning(
-                "No centroid for %s — emitting grid without Storm Center", item.id
+            _build_entry(
+                item=item,
+                idx=idx,
+                storm_duration=storm_duration,
+                dss_dir=dss_dir,
+                entries=entries,
+                failed=failed,
             )
-
-        grid_base = fname[:-4]  # drop ".dss"
-        rel_dss = f"data/{fname}"
-
-        if precip_pn is not None:
-            entries.append(
-                {
-                    "name": grid_base,
-                    "grid_type": "Precipitation",
-                    "dss_filename": rel_dss,
-                    "dss_pathname": precip_pn,
-                    "storm_center_lonlat": lonlat,
-                }
-            )
-        if temp_pn is not None:
-            entries.append(
-                {
-                    "name": grid_base,
-                    "grid_type": "Temperature",
-                    "dss_filename": rel_dss,
-                    "dss_pathname": temp_pn,
-                    "storm_center_lonlat": lonlat,
-                }
-            )
+        finally:
+            progress.tick()
 
     check_failure_ratio(
         failed,

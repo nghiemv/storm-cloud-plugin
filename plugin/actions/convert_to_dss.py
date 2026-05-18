@@ -12,6 +12,7 @@ from typing import Optional
 from plugin.batch import check_failure_ratio
 from plugin.context import RunContext
 from plugin.dss import dss_filename, parse_storm_datetime
+from plugin.progress import Progress
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +105,7 @@ def convert_to_dss(ctx: RunContext) -> None:
             DSS_WORKERS if DSS_WORKERS > 0 else min(len(work), os.cpu_count() or 1)
         )
         log.info("Running %d conversions with %d workers", len(work), workers)
+        progress = Progress(total=len(work), label="convert-to-dss")
 
         with ProcessPoolExecutor(max_workers=workers, mp_context=_SPAWN_CTX) as pool:
             futures = {
@@ -125,6 +127,7 @@ def convert_to_dss(ctx: RunContext) -> None:
                     failed.append(item_id)
                 else:
                     log.info("  Converted %s", item_id)
+                progress.tick()
 
     check_failure_ratio(
         failed, len(items), label="DSS conversion", max_ratio=MAX_FAILURE_RATIO
