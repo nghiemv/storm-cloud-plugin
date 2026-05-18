@@ -36,18 +36,10 @@ def _s3_download_with_retry(pm: Any, op: DataSourceOpInput, local_path: str) -> 
             delay *= 2
 
 
-def _validate_geojson(path: str, key: str) -> None:
-    """Validate that a downloaded file is parseable GeoJSON with geometry."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        raise ValueError(f"Input '{key}' is not valid JSON: {path} — {e}") from e
-
-    geo_type = data.get("type", "")
-    if geo_type in ("Feature", "FeatureCollection"):
-        return  # valid GeoJSON
-    if geo_type in (
+_GEOJSON_TYPES = frozenset(
+    (
+        "Feature",
+        "FeatureCollection",
         "Point",
         "MultiPoint",
         "LineString",
@@ -55,8 +47,38 @@ def _validate_geojson(path: str, key: str) -> None:
         "Polygon",
         "MultiPolygon",
         "GeometryCollection",
-    ):
-        return  # bare geometry object — also valid
+    )
+)
+
+
+def _validate_geojson(path: str, key: str) -> None:
+    """Validate (and if needed unwrap) a downloaded geometry file.
+
+    StormCloud UI stores geometries as {"catalog_name": ..., "geometry": "<json-string>"}.
+    If that wrapper is detected, the inner GeoJSON is extracted and written back in place.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ValueError(f"Input '{key}' is not valid JSON: {path} — {e}") from e
+
+    # Unwrap StormCloud UI envelope: {"catalog_name": ..., "geometry": "<geojson-string>"}
+    if "geometry" in data and isinstance(data["geometry"], str) and "type" not in data:
+        try:
+            inner = json.loads(data["geometry"])
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Input '{key}' has a geometry wrapper but the inner value is not valid JSON: {path} — {e}"
+            ) from e
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(inner, f)
+        data = inner
+        log.info("Unwrapped StormCloud geometry envelope for '%s': %s", key, path)
+
+    geo_type = data.get("type", "")
+    if geo_type in _GEOJSON_TYPES:
+        return
     raise ValueError(f"Input '{key}' is not valid GeoJSON (type={geo_type!r}): {path}")
 
 
