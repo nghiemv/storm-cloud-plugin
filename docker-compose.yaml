@@ -69,7 +69,6 @@ services:
     environment:
       CC_AWS_ENDPOINT: http://minio:9000
       FFRD_AWS_ENDPOINT: http://minio:9000
-    # Kill the container if it hangs (e.g. stormhub v0.5.0 deadlock).
-    # Override with: PLUGIN_TIMEOUT=7200 docker compose run ...
+    # Bound container shutdown so a hung run doesn't block compose down.
     stop_grace_period: 10s
     init: true
