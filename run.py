@@ -171,22 +171,33 @@ def _docker_plugin_cli(
     return subprocess.run(args, capture_output=True, text=True, cwd=ROOT)
 
 
-def _list_hec_payloads() -> list[tuple[str, str]]:
-    """Return [(uuid, last_modified), ...] for payloads in s3://$BUCKET/$CC_ROOT/."""
+def _list_hec_payloads() -> list[dict]:
+    """Return payload records sorted newest-first. Each record has at least
+    ``uuid`` and ``mtime``; clean payloads also have ``catalog_id``,
+    ``catalog_description``, ``start_date``, ``end_date``, ``storm_duration``,
+    ``top_n_events``. Malformed payloads carry an ``error`` field.
+    """
     r = _docker_plugin_cli(["list-payloads"])
     if r.returncode != 0:
         sys.stderr.write(r.stderr)
         sys.exit(r.returncode)
-    payloads: list[tuple[str, str]] = []
-    for line in r.stdout.splitlines():
-        if "\t" in line:
-            uuid, mtime = line.split("\t", 1)
-            payloads.append((uuid, mtime))
-    return payloads
+    return json.loads(r.stdout or "[]")
 
 
-def _pick_hec_payload() -> str | None:
-    """Print available payloads, prompt for selection. Returns chosen UUID or None."""
+def _safe_subdir(name: str) -> str:
+    """Filesystem-safe coercion for use as a compute/outputs/<name>/ subdir."""
+    import re
+
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+    return cleaned or "run"
+
+
+def _pick_hec_payload() -> tuple[str, str] | None:
+    """Print available payloads + prompt. Returns (uuid, output-subdir-name) or None.
+
+    The output-subdir-name is the catalog_id (sanitized) when available, else
+    the raw UUID — gives users meaningful local directories rather than UUIDs.
+    """
     payloads = _list_hec_payloads()
     bucket = os.environ["CC_AWS_S3_BUCKET"]
     root = os.environ.get("CC_ROOT", "manifests")
@@ -194,9 +205,19 @@ def _pick_hec_payload() -> str | None:
         print(f"No payloads found at s3://{bucket}/{root}/", file=sys.stderr)
         return None
     print(f"Payloads at s3://{bucket}/{root}/:\n")
-    for i, (uuid, mtime) in enumerate(payloads, 1):
-        print(f"  {i:3d}. {uuid}  ({mtime})")
-    print()
+    for i, p in enumerate(payloads, 1):
+        cid = p.get("catalog_id") or "(unnamed)"
+        desc = (p.get("catalog_description") or "").strip()
+        start = p.get("start_date", "")
+        end = p.get("end_date", "") or start
+        dur = p.get("storm_duration", "")
+        dates = start if start == end else f"{start} → {end}"
+        line2 = "  ".join(s for s in (dates, f"{dur}h" if dur else "", desc) if s)
+        print(f"  {i:3d}. {cid}")
+        if line2:
+            print(f"         {line2}")
+        print(f"         uuid {p['uuid']}  ·  {p.get('mtime', '')}")
+        print()
     try:
         choice = input("Pick number (or paste a UUID; Enter to cancel): ").strip()
     except EOFError:
@@ -204,12 +225,13 @@ def _pick_hec_payload() -> str | None:
     if not choice:
         return None
     if choice.isdigit() and 1 <= int(choice) <= len(payloads):
-        return payloads[int(choice) - 1][0]
-    return choice  # raw UUID
+        p = payloads[int(choice) - 1]
+        return p["uuid"], _safe_subdir(p.get("catalog_id") or p["uuid"])
+    return choice, choice  # raw UUID — no catalog_id known
 
 
 def _run_hec_job(uuid: str, name: str | None = None) -> None:
-    name = name or uuid
+    name = _safe_subdir(name or uuid)
     (COMPUTE / "outputs" / name).mkdir(parents=True, exist_ok=True)
     print(f"Running HEC S3: payload={uuid} (results -> compute/outputs/{name}/)\n")
     forwarded = (
@@ -253,22 +275,40 @@ def cmd_hec(args: list[str]) -> None:
     """Run the plugin against HEC S3.
 
     Usage:
-      ./run.py hec              List payloads in S3 and pick one interactively
-      ./run.py hec list         Just list payloads (machine-readable)
-      ./run.py hec UUID [NAME]  Run that payload (NAME = output subdir name)
+      ./run.py hec                    List payloads in S3 and pick one interactively
+      ./run.py hec list               TSV columns: uuid, catalog_id, start_date,
+                                      storm_duration, mtime
+      ./run.py hec list --json        Full structured JSON (all attributes)
+      ./run.py hec UUID [NAME]        Run that payload (NAME = output subdir name;
+                                      defaults to catalog_id from the payload, then UUID)
     """
     _require_hec_env()
 
     if not args:
-        uuid = _pick_hec_payload()
-        if uuid is None:
+        pick = _pick_hec_payload()
+        if pick is None:
             return
-        _run_hec_job(uuid)
+        uuid, name = pick
+        _run_hec_job(uuid, name)
         return
 
     if args[0] == "list":
-        for uuid, mtime in _list_hec_payloads():
-            print(f"{uuid}\t{mtime}")
+        payloads = _list_hec_payloads()
+        if "--json" in args[1:]:
+            print(json.dumps(payloads))
+            return
+        for p in payloads:
+            print(
+                "\t".join(
+                    [
+                        p.get("uuid", ""),
+                        p.get("catalog_id", ""),
+                        p.get("start_date", ""),
+                        p.get("storm_duration", ""),
+                        p.get("mtime", ""),
+                    ]
+                )
+            )
         return
 
     uuid = args[0]

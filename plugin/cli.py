@@ -4,9 +4,12 @@ Python + Docker.
 Invoked from run.py via ``docker run --rm ... IMAGE python3.12 -m plugin.cli <subcmd>``.
 
 Subcommands:
-    list-payloads          stdout: "<uuid>\\t<iso-mtime>" per line, newest first.
-    upload-batch <DIR>     each <DIR>/<jobname>/compute-manifest.json is staged to
-                           s3://$CC_AWS_S3_BUCKET/manifests/<uuid>/payload.
+    list-payloads          stdout: JSON array of payload records, newest first.
+                           Each record has: uuid, mtime, and (when the payload
+                           body parses cleanly) catalog_id, catalog_description,
+                           start_date, end_date, storm_duration, top_n_events.
+    upload-batch <DIR>     each <DIR>/<jobname>/compute-manifest.json is staged
+                           to s3://$CC_AWS_S3_BUCKET/manifests/<uuid>/payload.
 
 All S3 wiring reads CC_AWS_* from the environment (forwarded by run.py).
 """
@@ -16,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -31,11 +35,23 @@ def _s3_client():
     )
 
 
+_PAYLOAD_ATTRS = (
+    "catalog_id",
+    "catalog_description",
+    "start_date",
+    "end_date",
+    "storm_duration",
+    "top_n_events",
+)
+
+
 def _cmd_list_payloads() -> int:
     bucket = os.environ["CC_AWS_S3_BUCKET"]
     prefix = f"{os.environ.get('CC_ROOT', 'manifests')}/"
     s3 = _s3_client()
-    payloads: dict[str, str] = {}
+
+    # Enumerate UUIDs via list_objects_v2 (cheap).
+    found: dict[str, str] = {}
     for page in s3.get_paginator("list_objects_v2").paginate(
         Bucket=bucket, Prefix=prefix
     ):
@@ -45,9 +61,28 @@ def _cmd_list_payloads() -> int:
             parts = rel.split("/", 2)
             if len(parts) >= 2 and parts[1] == "payload":
                 mtime = obj.get("LastModified")
-                payloads[parts[0]] = mtime.isoformat() if mtime else ""
-    for uuid, mtime in sorted(payloads.items(), key=lambda x: x[1], reverse=True):
-        print(f"{uuid}\t{mtime}")
+                found[parts[0]] = mtime.isoformat() if mtime else ""
+
+    # Fan-out GetObject calls in parallel so listing 50 payloads doesn't
+    # serialize to 50 × round-trip-time. boto3 clients are thread-safe.
+    def fetch(uuid: str) -> dict:
+        rec: dict = {"uuid": uuid, "mtime": found[uuid]}
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=f"{prefix}{uuid}/payload")
+            attrs = json.loads(obj["Body"].read()).get("attributes") or {}
+            for key in _PAYLOAD_ATTRS:
+                rec[key] = attrs.get(key, "")
+        except Exception as e:
+            rec["error"] = str(e)
+        return rec
+
+    records: list[dict] = []
+    if found:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            records = list(pool.map(fetch, found.keys()))
+        records.sort(key=lambda r: r.get("mtime", ""), reverse=True)
+
+    json.dump(records, sys.stdout)
     return 0
 
 

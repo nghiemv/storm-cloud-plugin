@@ -85,24 +85,25 @@ def _list_payloads() -> dict:
     {"state": "unconfigured"}              — no env file yet
     {"state": "error",  "detail": "..."}   — env present, listing failed
     {"state": "ok",     "payloads": [...]} — listing succeeded (may be empty)
+
+    Each payload dict carries uuid, mtime, and (for parseable payloads)
+    catalog_id, catalog_description, start_date, end_date, storm_duration,
+    top_n_events. See plugin/cli.py:_cmd_list_payloads.
     """
     if not HEC_ENV.is_file():
         return {"state": "unconfigured"}
     r = subprocess.run(
-        [sys.executable, str(RUN_PY), "hec", "list"],
+        [sys.executable, str(RUN_PY), "hec", "list", "--json"],
         capture_output=True,
         text=True,
         cwd=ROOT,
     )
     if r.returncode != 0:
         return {"state": "error", "detail": (r.stderr or r.stdout).strip()}
-    payloads = []
-    for line in r.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split("\t", 1)
-        payloads.append({"uuid": parts[0], "mtime": parts[1] if len(parts) > 1 else ""})
+    try:
+        payloads = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError as e:
+        return {"state": "error", "detail": f"could not parse list output: {e}"}
     return {"state": "ok", "payloads": payloads}
 
 
@@ -266,15 +267,31 @@ async function renderPayloads() {
     return;
   }
   count.textContent = `(${payloads.length})`;
-  root.innerHTML = payloads.map(p => `
-    <div class="row">
-      <div class="left">
-        <span class="uuid">${esc(p.uuid)}</span>
-        <div class="meta">${esc(p.mtime)}</div>
+  root.innerHTML = payloads.map(p => {
+    const cid = p.catalog_id || "";
+    const desc = p.catalog_description || "";
+    const start = p.start_date || "";
+    const end = p.end_date || start;
+    const dates = (start && end && start !== end) ? `${start} → ${end}` : start;
+    const dur = p.storm_duration ? `${p.storm_duration}h` : "";
+    const tn = p.top_n_events ? `top ${p.top_n_events}` : "";
+    const facts = [dates, dur, tn].filter(Boolean).join(" · ");
+    const title = cid
+      ? `<strong>${esc(cid)}</strong>`
+      : `<em class="muted">(no catalog_id)</em>`;
+    const cidArg = JSON.stringify(cid);
+    return `
+      <div class="row">
+        <div class="left">
+          ${title}
+          ${desc ? `<div class="meta">${esc(desc)}</div>` : ""}
+          ${facts ? `<div class="meta">${esc(facts)}</div>` : ""}
+          <div class="meta uuid">${esc(p.uuid)}</div>
+        </div>
+        <button onclick="launchHec(this, '${esc(p.uuid)}', ${cidArg})">Run</button>
       </div>
-      <button onclick="launchHec(this, '${esc(p.uuid)}')">Run</button>
-    </div>
-  `).join("");
+    `;
+  }).join("");
 }
 
 async function renderRuns() {
@@ -324,14 +341,14 @@ async function launchLocal(btn) {
   }
 }
 
-async function launchHec(btn, uuid) {
+async function launchHec(btn, uuid, catalogId) {
   btn.disabled = true;
   btn.textContent = "Launching…";
   try {
     await getJson("/api/launch/hec", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({uuid}),
+      body: JSON.stringify({uuid, name: catalogId || undefined}),
     });
     await renderRuns();
   } finally {
