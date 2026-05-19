@@ -21,7 +21,7 @@ is at http://localhost:9001 (`ccuser`/`ccpassword`); output files land in
 
 > Local runs serialize storm-search by default (1 worker) because no container
 > memory limit is enforced. For a faster loop, set `CC_NUM_WORKERS=4` in
-> `compute/smoke/local.env` or pass `num_workers` in the payload `attributes`.
+> `compute/local/dev.env` or pass `num_workers` in the payload `attributes`.
 
 ## Repo Layout
 
@@ -35,13 +35,13 @@ plugin/                   # the CC compute plugin (python -m plugin)
   workers.py              #   cgroup-aware worker count (OOM guard)
   tests/                  #   pytest (excluded from the image by .dockerignore)
 compute/                  # resources run.py uses, split by target
-  Dockerfile              #   run.py build — shared by smoke and HEC S3
+  Dockerfile              #   run.py build — shared by local and HEC S3
   requirements.txt
   constraints.txt
-  smoke/                  #   `run.py` (default) — local MinIO smoke test
+  local/                  #   `run.py` (default) — MinIO dev stack
     compose.yaml          #     spins up MinIO + plugin
-    local.env             #     fake MinIO creds (committed)
-    fixtures/             #     one canonical test case
+    dev.env               #     fake MinIO creds (committed)
+    sample/               #     one canonical test case
       manifest.json
       payload.json
       watershed-boundary.geojson
@@ -56,8 +56,8 @@ stormhub/                 # forked upstream library (git submodule)
 ## `run.py` Commands
 
 ```bash
-./run.py                  # Smoke run with compute/smoke/fixtures/payload.json
-./run.py PAYLOAD          # Smoke run with a custom payload
+./run.py                  # Local run with compute/local/sample/payload.json
+./run.py PAYLOAD          # Local run with a custom payload
 ./run.py hec              # List HEC S3 payloads and pick one interactively
 ./run.py hec UUID         # Run a specific HEC S3 payload by UUID
 ./run.py batch [DIR]      # Multi-job HEC S3 driver (one subdir per job)
@@ -82,11 +82,11 @@ mirror`, lazy-imported only when invoked).
 
 ## Custom Payloads
 
-Edit `compute/smoke/fixtures/payload.json` or copy it and pass the path:
+Edit `compute/local/sample/payload.json` or copy it and pass the path:
 
 ```bash
-cp compute/smoke/fixtures/payload.json compute/smoke/fixtures/mine.json
-./run.py compute/smoke/fixtures/mine.json
+cp compute/local/sample/payload.json compute/local/sample/mine.json
+./run.py compute/local/sample/mine.json
 ```
 
 Storm parameters are in `attributes`. All values are strings (CC SDK convention).
@@ -150,8 +150,8 @@ memory ceiling. To reproduce under a 3 GB cap:
 
 ```bash
 ./run.py build
-docker compose -f compute/smoke/compose.yaml run --rm seed
-docker compose -f compute/smoke/compose.yaml run --rm --memory=3g --memory-swap=3g storm-cloud-plugin
+docker compose -f compute/local/compose.yaml run --rm seed
+docker compose -f compute/local/compose.yaml run --rm --memory=3g --memory-swap=3g storm-cloud-plugin
 ```
 
 With the fix, the resolver reads the cgroup limit and picks a safe worker

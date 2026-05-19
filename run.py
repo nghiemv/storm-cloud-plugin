@@ -9,8 +9,8 @@ Invocation:
     Anywhere portable:    python run.py <cmd>
 
 Usage:
-    run.py                  Smoke run with compute/smoke/fixtures/payload.json
-    run.py PAYLOAD          Smoke run with a custom payload
+    run.py                  Local run with compute/local/sample/payload.json
+    run.py PAYLOAD          Local run with a custom payload
     run.py hec              List payloads on HEC S3 and pick one interactively
     run.py hec list         Just list payloads (UUID + timestamp, tab-separated)
     run.py hec UUID [NAME]  Run a specific payload (NAME = output subdir name)
@@ -37,10 +37,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 COMPUTE = ROOT / "compute"
-SMOKE = COMPUTE / "smoke"
+LOCAL = COMPUTE / "local"
 HEC = COMPUTE / "hec-s3"
-COMPOSE = ["docker", "compose", "-f", str(SMOKE / "compose.yaml")]
-DEFAULT_PAYLOAD = SMOKE / "fixtures" / "payload.json"
+COMPOSE = ["docker", "compose", "-f", str(LOCAL / "compose.yaml")]
+DEFAULT_PAYLOAD = LOCAL / "sample" / "payload.json"
 IMAGE = "ghcr.io/usace/storm-cloud-plugin:latest"
 
 
@@ -58,10 +58,10 @@ def sh_quiet(args):
     )
 
 
-# ─── smoke (local MinIO) ─────────────────────────────────────────────────────
+# ─── local (MinIO dev stack) ─────────────────────────────────────────────────
 
 
-def cmd_smoke(payload: Path = DEFAULT_PAYLOAD) -> None:
+def cmd_local(payload: Path = DEFAULT_PAYLOAD) -> None:
     """Run the plugin against the local MinIO stack."""
     if not payload.is_file():
         print(f"Error: payload not found: {payload}", file=sys.stderr)
@@ -69,9 +69,9 @@ def cmd_smoke(payload: Path = DEFAULT_PAYLOAD) -> None:
     sh(["git", "submodule", "update", "--init"])
     sh_quiet([*COMPOSE, "down", "--remove-orphans"])
     (COMPUTE / "outputs" / "quick-test").mkdir(parents=True, exist_ok=True)
-    # the seed service mounts compute/fixtures at /fixtures inside the container
-    container_path = "/fixtures/" + payload.name
-    print(f"Running smoke: {payload.name}")
+    # the seed service mounts compute/local/sample at /sample inside the container
+    container_path = "/sample/" + payload.name
+    print(f"Running local: {payload.name}")
     print("Progress streams to stdout; outputs land in compute/outputs/quick-test/\n")
     sh([*COMPOSE, "run", "--rm", "seed"], env={"PAYLOAD_FILE": container_path})
     sh([*COMPOSE, "run", "--rm", "storm-cloud-plugin"])
@@ -450,7 +450,7 @@ _WITH_ARGS = {
 
 def main() -> None:
     if len(sys.argv) == 1:
-        cmd_smoke()
+        cmd_local()
         return
 
     arg = sys.argv[1]
@@ -465,18 +465,14 @@ def main() -> None:
         _NO_ARGS[arg]()
         return
 
-    if arg == "smoke":
-        cmd_smoke()
-        return
-
     if arg in _WITH_ARGS:
         _WITH_ARGS[arg](sys.argv[2:])
         return
 
-    # Treat as payload path for a smoke run
+    # Treat as payload path for a local run
     p = Path(arg)
     if p.is_file():
-        cmd_smoke(p)
+        cmd_local(p)
     else:
         print(f"Unknown command or missing payload file: {arg}", file=sys.stderr)
         print("Run ./run.py help for usage.", file=sys.stderr)
