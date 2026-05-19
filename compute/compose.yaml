@@ -41,8 +41,8 @@ services:
       mc mb --ignore-existing local/$$CC_AWS_S3_BUCKET &&
       mc mb --ignore-existing local/$$FFRD_AWS_S3_BUCKET &&
 
-      mc put /sample/transposition-domain.geojson local/$$FFRD_AWS_S3_BUCKET/$$FFRD_STORE_ROOT/$$FFRD_INPUT_PATH/transposition-domain.geojson &&
-      mc put /sample/watershed-boundary.geojson local/$$FFRD_AWS_S3_BUCKET/$$FFRD_STORE_ROOT/$$FFRD_INPUT_PATH/watershed-boundary.geojson &&
+      mc put /sample/transposition-domain.geojson local/$$FFRD_AWS_S3_BUCKET/${FFRD_STORE_ROOT:-}/${FFRD_INPUT_PATH:-}/transposition-domain.geojson &&
+      mc put /sample/watershed-boundary.geojson local/$$FFRD_AWS_S3_BUCKET/${FFRD_STORE_ROOT:-}/${FFRD_INPUT_PATH:-}/watershed-boundary.geojson &&
 
       echo 'MinIO initialized.'
       "

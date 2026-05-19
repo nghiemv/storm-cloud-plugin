@@ -52,8 +52,11 @@ def sh(args, env=None, check=True, **kwargs):
     return r
 
 
-def sh_quiet(args):
-    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+def sh_quiet(args, env=None):
+    merged = {**os.environ, **(env or {})}
+    subprocess.run(
+        args, env=merged, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT
+    )
 
 
 # ─── local (MinIO dev stack) ─────────────────────────────────────────────────
@@ -64,15 +67,26 @@ def cmd_local(payload: Path = DEFAULT_PAYLOAD) -> None:
     if not payload.is_file():
         print(f"Error: payload not found: {payload}", file=sys.stderr)
         sys.exit(1)
+    # Derive the seed paths from the payload — the payload is the single
+    # source of truth for where the plugin will look for inputs, so the
+    # local seeder must put them in exactly that location.
+    data = json.loads(payload.read_text())
+    seed_env = {
+        "FFRD_STORE_ROOT": data["stores"][0]["params"]["root"].lstrip("/"),
+        "FFRD_INPUT_PATH": data["attributes"]["input_path"],
+    }
     sh(["git", "submodule", "update", "--init"])
-    sh_quiet([*COMPOSE, "down", "--remove-orphans"])
+    sh_quiet([*COMPOSE, "down", "--remove-orphans"], env=seed_env)
     (COMPUTE / "outputs" / "quick-test").mkdir(parents=True, exist_ok=True)
     # the seed service mounts compute/sample at /sample inside the container
     container_path = "/sample/" + payload.name
     print(f"Running local: {payload.name}")
     print("Progress streams to stdout; outputs land in compute/outputs/quick-test/\n")
-    sh([*COMPOSE, "run", "--rm", "seed"], env={"PAYLOAD_FILE": container_path})
-    sh([*COMPOSE, "run", "--rm", "storm-cloud-plugin"])
+    sh(
+        [*COMPOSE, "run", "--rm", "seed"],
+        env={**seed_env, "PAYLOAD_FILE": container_path},
+    )
+    sh([*COMPOSE, "run", "--rm", "storm-cloud-plugin"], env=seed_env)
 
 
 # ─── hec (production S3) ─────────────────────────────────────────────────────
