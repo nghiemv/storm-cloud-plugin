@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 OUTPUTS = ROOT / "compute" / "outputs"
-HEC_ENV = ROOT / "compute" / "hec.env"
+HEC_ENV = ROOT / "compute" / "hec" / "env"
 RUN_PY = ROOT / "run.py"
 
 
@@ -178,7 +178,7 @@ code { background: #f3f4f6; padding: .12rem .35rem; border-radius: 4px;
 <h2>Local run</h2>
 <div class="row">
   <div class="left">
-    <code>compute/sample/payload.json</code>
+    <code>compute/local/sample/payload.json</code>
     <div class="meta">MinIO dev stack via <code>./run.py</code></div>
   </div>
   <button onclick="launchLocal(this)">Run</button>
@@ -227,7 +227,7 @@ async function renderPayloads() {
   const root = document.getElementById("payloads");
   const count = document.getElementById("hec-count");
   if (data === null) {
-    root.innerHTML = '<span class="muted">No <code>compute/hec.env</code> — fill it in to enable HEC S3 runs.</span>';
+    root.innerHTML = '<span class="muted">No <code>compute/hec/env</code> — fill it in to enable HEC S3 runs.</span>';
     count.textContent = "";
     return;
   }

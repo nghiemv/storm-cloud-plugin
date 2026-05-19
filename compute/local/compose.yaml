@@ -1,5 +1,5 @@
 # Local dev stack for `./run.py` (run from repo root).
-# Spins up MinIO, seeds it from compute/sample/, then runs the plugin.
+# Spins up MinIO, seeds it from ./sample/, then runs the plugin.
 
 name: storm-cloud-plugin
 
@@ -64,7 +64,7 @@ services:
   storm-cloud-plugin:
     image: storm-cloud-plugin:latest
     build:
-      context: ..
+      context: ../..
       dockerfile: compute/Dockerfile
     depends_on:
       seed:
@@ -76,7 +76,7 @@ services:
     volumes:
       # Bind-mount Local/ to the host so progress.json + DSS outputs
       # land at compute/outputs/quick-test/ while the plugin runs.
-      - ./outputs/quick-test:/usr/src/app/Local
+      - ../outputs/quick-test:/usr/src/app/Local
     # Bound container shutdown so a hung run doesn't block compose down.
     stop_grace_period: 10s
     init: true

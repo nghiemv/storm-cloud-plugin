@@ -21,7 +21,7 @@ is at http://localhost:9001 (`ccuser`/`ccpassword`); output files land in
 
 > Local runs serialize storm-search by default (1 worker) because no container
 > memory limit is enforced. For a faster loop, set `CC_NUM_WORKERS=4` in
-> `compute/dev.env` or pass `num_workers` in the payload `attributes`.
+> `compute/local/dev.env` or pass `num_workers` in the payload `attributes`.
 
 ## Repo Layout
 
@@ -34,17 +34,19 @@ plugin/                   # the CC compute plugin (python -m plugin)
   progress.py             #   [progress] log lines + progress.json snapshot
   workers.py              #   cgroup-aware worker count (OOM guard)
   tests/                  #   pytest (excluded from the image by .dockerignore)
-compute/                  # everything run.py needs — flat by intent
-  Dockerfile              #   image build (local + prod)
-  requirements.txt
-  constraints.txt
-  compose.yaml            #   local MinIO dev stack
-  dev.env                 #   fake MinIO creds (committed)
-  hec.env.example         #   prod creds template — cp to hec.env (gitignored)
-  sample/                 #   canonical local-run inputs
-    payload.json
-    watershed-boundary.geojson
-    transposition-domain.geojson
+compute/                  # run.py's resources, scoped per target
+  Dockerfile              #   image build (shared)
+  requirements.txt        #   shared
+  constraints.txt         #   shared
+  local/                  #   MinIO dev stack — `./run.py`
+    compose.yaml
+    dev.env               #     fake creds (committed)
+    sample/               #     canonical local-run inputs
+      payload.json
+      watershed-boundary.geojson
+      transposition-domain.geojson
+  hec/                    #   HEC S3 — `./run.py hec` / `./run.py batch`
+    env.example           #     cp to compute/hec/env, fill in (gitignored)
   outputs/                #   gitignored runtime — DSS files, progress.json, logs
 stormhub/                 # forked upstream library (git submodule)
 ```
@@ -62,11 +64,11 @@ Windows or anywhere portable.
 
 ## Custom Payloads
 
-Edit `compute/sample/payload.json` or copy it and pass the path:
+Edit `compute/local/sample/payload.json` or copy it and pass the path:
 
 ```bash
-cp compute/sample/payload.json compute/sample/mine.json
-./run.py compute/sample/mine.json
+cp compute/local/sample/payload.json compute/local/sample/mine.json
+./run.py compute/local/sample/mine.json
 ```
 
 Storm parameters are in `attributes`. All values are strings (CC SDK convention).
@@ -105,11 +107,11 @@ behavior and are usually set in the manifest / compose env (Twelve-Factor).
 Same plugin code, different backend. One-time setup:
 
 ```bash
-cp compute/hec.env.example compute/hec.env   # gitignored
-$EDITOR compute/hec.env                      # fill in real creds
+cp compute/hec/env.example compute/hec/env   # gitignored
+$EDITOR compute/hec/env                      # fill in real creds
 ```
 
-`run.py` auto-loads `compute/hec.env` for `hec`, `batch`, and `mirror` — no
+`run.py` auto-loads `compute/hec/env` for `hec`, `batch`, and `mirror` — no
 manual `source`. Shell env still wins, so you can override one var ad-hoc.
 
 **Single job:**
@@ -144,7 +146,7 @@ job, sequentially.
 ./run.py web              # browser UI at http://localhost:8744/
 ```
 
-Lists payloads in HEC S3 (if `compute/hec.env` is configured), launches
+Lists payloads in HEC S3 (if `compute/hec/env` is configured), launches
 local or HEC runs with one click, and shows each run's current step + elapsed
 time. Reads from `compute/outputs/<name>/progress.json` (auto-refreshes every
 2 s). Launches detach to the background, so closing the browser — or the web
@@ -188,8 +190,8 @@ memory ceiling. To reproduce under a 3 GB cap:
 
 ```bash
 ./run.py build
-docker compose -f compute/compose.yaml run --rm seed
-docker compose -f compute/compose.yaml run --rm --memory=3g --memory-swap=3g storm-cloud-plugin
+docker compose -f compute/local/compose.yaml run --rm seed
+docker compose -f compute/local/compose.yaml run --rm --memory=3g --memory-swap=3g storm-cloud-plugin
 ```
 
 With the fix, the resolver reads the cgroup limit and picks a safe worker

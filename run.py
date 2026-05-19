@@ -9,7 +9,7 @@ Invocation:
     Anywhere portable:    python run.py <cmd>
 
 Usage:
-    run.py                  Local run with compute/sample/payload.json
+    run.py                  Local run with compute/local/sample/payload.json
     run.py PAYLOAD          Local run with a custom payload
     run.py hec              List payloads on HEC S3 and pick one interactively
     run.py hec list         Just list payloads (UUID + timestamp, tab-separated)
@@ -38,9 +38,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 COMPUTE = ROOT / "compute"
-HEC_ENV_FILE = COMPUTE / "hec.env"
-COMPOSE = ["docker", "compose", "-f", str(COMPUTE / "compose.yaml")]
-DEFAULT_PAYLOAD = COMPUTE / "sample" / "payload.json"
+LOCAL = COMPUTE / "local"
+HEC = COMPUTE / "hec"
+HEC_ENV_FILE = HEC / "env"
+COMPOSE = ["docker", "compose", "-f", str(LOCAL / "compose.yaml")]
+DEFAULT_PAYLOAD = LOCAL / "sample" / "payload.json"
 IMAGE = "ghcr.io/usace/storm-cloud-plugin:latest"
 
 
@@ -78,7 +80,7 @@ def cmd_local(payload: Path = DEFAULT_PAYLOAD) -> None:
     sh(["git", "submodule", "update", "--init"])
     sh_quiet([*COMPOSE, "down", "--remove-orphans"], env=seed_env)
     (COMPUTE / "outputs" / "quick-test").mkdir(parents=True, exist_ok=True)
-    # the seed service mounts compute/sample at /sample inside the container
+    # the seed service mounts compute/local/sample at /sample inside the container
     container_path = "/sample/" + payload.name
     print(f"Running local: {payload.name}")
     print("Progress streams to stdout; outputs land in compute/outputs/quick-test/\n")
@@ -101,7 +103,7 @@ _HEC_REQUIRED = (
 
 
 def _load_hec_env() -> None:
-    """Overlay compute/hec.env onto os.environ if it exists.
+    """Overlay compute/hec/env onto os.environ if it exists.
 
     Existing env vars win (so an explicit `export FOO=...` overrides the file).
     Quietly no-op if the file is absent — the user gets a clearer error
@@ -123,7 +125,7 @@ def _require_hec_env() -> None:
     if missing:
         print(
             f"Error: missing HEC creds: {missing}\n"
-            f"  Fix: cp compute/hec.env.example compute/hec.env, then fill it in.\n"
+            f"  Fix: cp compute/hec/env.example compute/hec/env, then fill it in.\n"
             f"  See the 'Running Against HEC S3' section of README.md.",
             file=sys.stderr,
         )
@@ -367,7 +369,7 @@ def cmd_mirror(args: list[str]) -> None:
     p.add_argument("--dry-run", action="store_true", help="plan without writing")
     opts = p.parse_args(args)
 
-    _load_hec_env()  # picks up MIRROR_AWS_* if defined in compute/hec.env
+    _load_hec_env()  # picks up MIRROR_AWS_* if defined in compute/hec/env
     try:
         import s3fs
         import xarray as xr

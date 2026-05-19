@@ -5,6 +5,6 @@ Local/
 __pycache__/
 *.pyc
 compute/outputs/
-compute/hec.env
+compute/hec/env
 .pytest_cache/
 .ruff_cache/
