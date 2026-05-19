@@ -82,6 +82,17 @@ def download_inputs(ctx: RunContext) -> None:
 
     for source, key, remote_path in transfers:
         local_path = local_root / Path(remote_path).name
+        # Resumability: skip if a previously-downloaded copy exists and
+        # validates. Cheap to re-validate (small geojson) and avoids
+        # re-fetching from S3 on every resume.
+        try:
+            if local_path.exists() and local_path.stat().st_size > 0:
+                _validate_geojson(local_path, key)
+                log.info("Skipping %s — %s already present locally", key, local_path)
+                progress.tick()
+                continue
+        except ValueError:
+            log.warning("Existing %s is invalid — will re-download", local_path)
         log.info("Downloading %s -> %s", remote_path, local_path)
         try:
             download_to_local(

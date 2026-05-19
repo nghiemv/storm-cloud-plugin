@@ -232,7 +232,12 @@ def _pick_hec_payload() -> tuple[str, str] | None:
 
 def _run_hec_job(uuid: str, name: str | None = None) -> None:
     name = _safe_subdir(name or uuid)
-    (COMPUTE / "outputs" / name).mkdir(parents=True, exist_ok=True)
+    run_dir = COMPUTE / "outputs" / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # ``docker run --cidfile`` refuses to write to an existing path, so wipe
+    # any stale id from a prior run before relaunching.
+    cidfile = run_dir / "container.id"
+    cidfile.unlink(missing_ok=True)
     print(f"Running HEC S3: payload={uuid} (results -> compute/outputs/{name}/)\n")
     forwarded = (
         *_HEC_REQUIRED,
@@ -242,6 +247,16 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
         "FFRD_AWS_DEFAULT_REGION",
         "FFRD_AWS_ENDPOINT",
         "FFRD_AWS_S3_BUCKET",
+        # SC = StormHubStore profile. Payloads reference it as the input /
+        # output store via {"stores":[{"profile":"SC", ...}]}. The CC SDK
+        # composes env var names as "<profile>_AWS_<KEY>", so all five
+        # SC_AWS_* must be in compute/hec/env or PluginManager.connect()
+        # raises KeyError before the first action runs.
+        "SC_AWS_ACCESS_KEY_ID",
+        "SC_AWS_SECRET_ACCESS_KEY",
+        "SC_AWS_DEFAULT_REGION",
+        "SC_AWS_ENDPOINT",
+        "SC_AWS_S3_BUCKET",
         "AORC_S3_BASE_URL",
         "AORC_S3_KEY",
         "AORC_S3_SECRET",
@@ -252,8 +267,17 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
             "docker",
             "run",
             "--rm",
+            # cidfile lets the web UI `docker stop` this container later for
+            # a clean pause; the plugin's signal handler unwinds the current
+            # action and exits, preserving on-disk state for resume.
+            "--cidfile",
+            str(cidfile),
+            # Label so we can also locate orphans (`docker ps --filter
+            # label=storm-cloud-run=<name>`) if the cidfile is gone.
+            "--label",
+            f"storm-cloud-run={name}",
             "-v",
-            f"{COMPUTE / 'outputs' / name}:/usr/src/app/Local",
+            f"{run_dir}:/usr/src/app/Local",
             "-e",
             f"CC_PAYLOAD_ID={uuid}",
             "-e",

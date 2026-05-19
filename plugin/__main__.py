@@ -158,8 +158,24 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
         progress.set_summary(n_actions, total_elapsed)
     finally:
         if succeeded:
-            shutil.rmtree(local_root, ignore_errors=True)
-            log.info("Cleaned up %s", local_root)
+            # Drop intermediate outputs (DSS, grids, downloaded inputs) but
+            # keep the run-metadata files so the web UI can still show the
+            # final summary, the launch command, and the launch log after
+            # the run completes.
+            preserved = {"progress.json", "launch.json", "launch.log"}
+            for item in local_root.iterdir():
+                if item.name in preserved:
+                    continue
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    try:
+                        item.unlink()
+                    except OSError:
+                        pass
+            log.info(
+                "Cleaned up %s (kept %s)", local_root, ", ".join(sorted(preserved))
+            )
         else:
             log.warning(
                 "Preserving %s for debugging (run failed or interrupted)", local_root
