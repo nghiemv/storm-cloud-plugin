@@ -163,10 +163,9 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
 
 
 def main() -> None:
-    # Surface progress at outputs/<run>/progress.json (read by dev/viewer.py).
-    # Local/ is bind-mounted to outputs/<name>/ on the host (see docker
-    # configs); writing here makes the snapshot visible without needing a
-    # port published from the container.
+    # Surface progress at Local/progress.json. The compose stack bind-mounts
+    # Local/ to compute/outputs/<run>/ on the host so the snapshot is visible
+    # without needing a port published from the container.
     progress.configure_state_file(Path("Local") / "progress.json")
     pm = PluginManager()
     payload = pm.get_payload()

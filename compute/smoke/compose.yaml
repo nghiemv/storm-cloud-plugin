@@ -1,5 +1,5 @@
-# Local development infrastructure.
-# Usage: python dev/tasks.py  (from project root)
+# Local smoke-test stack for `./run.py` (run from repo root).
+# Spins up MinIO, seeds it with compute/smoke/fixtures/, then runs the plugin.
 
 name: storm-cloud-plugin
 
@@ -11,7 +11,7 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"   # Web console: ccuser/ccpassword
-    env_file: ../dev/local.env
+    env_file: ./local.env
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
@@ -23,9 +23,9 @@ services:
     depends_on:
       minio:
         condition: service_healthy
-    env_file: ../dev/local.env
+    env_file: ./local.env
     volumes:
-      - ../fixtures:/fixtures
+      - ./fixtures:/fixtures
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
@@ -49,11 +49,11 @@ services:
     depends_on:
       minio-init:
         condition: service_completed_successfully
-    env_file: ../dev/local.env
+    env_file: ./local.env
     volumes:
-      - ../tests:/inputs
+      - ./fixtures:/fixtures
     environment:
-      PAYLOAD_FILE: ${PAYLOAD_FILE:-/inputs/examples/payload.json}
+      PAYLOAD_FILE: ${PAYLOAD_FILE:-/fixtures/payload.json}
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
@@ -64,18 +64,18 @@ services:
   storm-cloud-plugin:
     image: storm-cloud-plugin:latest
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
+      context: ../..
+      dockerfile: compute/Dockerfile
     depends_on:
       seed:
         condition: service_completed_successfully
-    env_file: ../dev/local.env
+    env_file: ./local.env
     environment:
       CC_AWS_ENDPOINT: http://minio:9000
       FFRD_AWS_ENDPOINT: http://minio:9000
     volumes:
-      # Bind-mount Local/ to the host so dev/viewer.py can read
-      # outputs/quick-test/progress.json while the plugin runs.
+      # Bind-mount Local/ to the host so progress.json + DSS outputs
+      # land at compute/outputs/quick-test/ while the plugin runs.
       - ../outputs/quick-test:/usr/src/app/Local
     # Bound container shutdown so a hung run doesn't block compose down.
     stop_grace_period: 10s

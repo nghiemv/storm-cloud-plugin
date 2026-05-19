@@ -2,15 +2,20 @@
 .github
 *.tar
 Local/
-tests/
-dev/
-fixtures/
-outputs/
 __pycache__/
 *.pyc
 *.egg-info/
 *.so
 *.dll
 *.md
-docker/
-manifest.example.json
+
+# tests live with the plugin package but shouldn't ship in the image
+plugin/tests/
+
+# host-only entry script
+run
+
+# everything under compute/ except the requirements the Dockerfile COPYs
+compute/*
+!compute/requirements.txt
+!compute/constraints.txt

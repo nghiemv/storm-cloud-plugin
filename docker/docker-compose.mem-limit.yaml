@@ -1,4 +1,0 @@
-services:
-  storm-cloud-plugin:
-    mem_limit: 3g
-    memswap_limit: 3g

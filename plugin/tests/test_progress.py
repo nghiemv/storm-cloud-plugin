@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 import re
 
-import pytest
-
 from plugin.progress import Progress, StormhubProgressTracker, format_duration
 
 

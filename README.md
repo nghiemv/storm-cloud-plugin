@@ -11,26 +11,81 @@ S3 payload  -->  download-inputs  -->  process-storms  -->  convert-to-dss  --> 
 Requires **Python 3** and **Docker**.
 
 ```bash
-python dev/tasks.py viewer   # one-time, in its own terminal — http://localhost:8080
-python dev/tasks.py          # in another terminal — builds image, starts MinIO, runs plugin
+./run.py        # Linux/macOS — builds the image, starts MinIO, runs the plugin
+python run.py   # Windows / portable invocation
 ```
 
-The viewer is a host-side process; it stays up across runs and shows a card per
-run found under `outputs/`. Plugin writes `Local/progress.json` on every tick;
-viewer polls. MinIO output files are at http://localhost:9001 (ccuser/ccpassword).
+Progress streams to the terminal (`[progress]` lines per action). MinIO console
+is at http://localhost:9001 (`ccuser`/`ccpassword`); output files land in
+`compute/outputs/quick-test/` on the host.
 
-> Local dev runs serialize storm-search by default (1 worker) because
-> no container memory limit is enforced. For a faster loop, set
-> `CC_NUM_WORKERS=4` in `dev/local.env` or pass `num_workers` in
-> the payload `attributes`.
+> Local runs serialize storm-search by default (1 worker) because no container
+> memory limit is enforced. For a faster loop, set `CC_NUM_WORKERS=4` in
+> `compute/smoke/local.env` or pass `num_workers` in the payload `attributes`.
+
+## Repo Layout
+
+```
+run.py                    # ONE entry point — dispatches every workflow below
+plugin/                   # the CC compute plugin (python -m plugin)
+  __main__.py             #   dispatches actions from the payload
+  actions/                #   one module per pipeline step (5 steps)
+  lib.py                  #   shared plumbing: context, S3 I/O, DSS naming, validation
+  progress.py             #   [progress] log lines + progress.json snapshot
+  workers.py              #   cgroup-aware worker count (OOM guard)
+  tests/                  #   pytest (excluded from the image by .dockerignore)
+compute/                  # resources run.py uses, split by target
+  Dockerfile              #   run.py build — shared by smoke and HEC S3
+  requirements.txt
+  constraints.txt
+  smoke/                  #   `run.py` (default) — local MinIO smoke test
+    compose.yaml          #     spins up MinIO + plugin
+    local.env             #     fake MinIO creds (committed)
+    fixtures/             #     one canonical test case
+      manifest.json
+      payload.json
+      watershed-boundary.geojson
+      transposition-domain.geojson
+  hec-s3/                 #   `run.py hec` / `run.py batch` — production HEC S3
+    .env.example          #     template; copy to .env (gitignored), fill in real creds
+    README.md             #     how to set up + run
+  outputs/                #   gitignored runtime — DSS files, progress.json, logs
+stormhub/                 # forked upstream library (git submodule)
+```
+
+## `run.py` Commands
+
+```bash
+./run.py                  # Smoke run with compute/smoke/fixtures/payload.json
+./run.py PAYLOAD          # Smoke run with a custom payload
+./run.py hec              # List HEC S3 payloads and pick one interactively
+./run.py hec UUID         # Run a specific HEC S3 payload by UUID
+./run.py batch [DIR]      # Multi-job HEC S3 driver (one subdir per job)
+./run.py build            # docker build the plugin image
+./run.py mirror [args]    # One-shot AORC zarr mirror (NOAA -> private S3)
+./run.py lint             # ruff check + format check
+./run.py format           # ruff format
+./run.py freeze           # Regenerate compute/constraints.txt
+./run.py down             # docker compose down
+./run.py clean            # Stop containers, drop volumes, clear compute/outputs/
+```
+
+`run.py` is a single Python file at the repo root. Only required dependency
+is Python 3 (Docker for build/run subcommands; `s3fs` + `xarray` for `./run.py
+mirror`, lazy-imported only when invoked).
+
+**Cross-platform invocation:**
+- Linux / macOS: `./run.py <cmd>` (shebang + execute bit)
+- Windows cmd / PowerShell: `python run.py <cmd>`
+- Everywhere portable: `python run.py <cmd>`
 
 ## Custom Payloads
 
-Edit `tests/examples/payload.json` or copy it and pass the path:
+Edit `compute/smoke/fixtures/payload.json` or copy it and pass the path:
 
 ```bash
-cp tests/examples/payload.json tests/examples/mine.json
-python dev/tasks.py tests/examples/mine.json
+cp compute/smoke/fixtures/payload.json compute/smoke/fixtures/mine.json
+./run.py compute/smoke/fixtures/mine.json
 ```
 
 Storm parameters are in `attributes`. All values are strings (CC SDK convention).
@@ -50,54 +105,46 @@ Storm parameters are in `attributes`. All values are strings (CC SDK convention)
 | `input_path` | yes | | S3 path to watershed/transposition geometries |
 | `output_path` | yes | | S3 path for results |
 
-## Repo Layout
+## Running Against HEC S3
 
-```
-plugin/         # plugin package (entry: python -m plugin)
-  __main__.py   #   entry: dispatches actions from the payload
-  actions/      #   one module per pipeline step (5 steps)
-  lib.py        #   shared plumbing: context, S3 I/O, DSS naming, validation
-  progress.py   #   [progress] log lines + progress.json for the viewer
-  workers.py    #   cgroup-aware worker count (OOM guard)
-docker/         # Dockerfile + compose
-dev/            # local dev: tasks.py, viewer.py, local.env, batch_run.sh, mirror_aorc.py
-fixtures/       # seeded into MinIO as production inputs (NOT test data)
-tests/          # pytest tests + example payloads
-lib/stormhub/   # vendored upstream library (git submodule)
-```
-
-## Dev Tasks
+Same plugin code, different backend — see [`compute/hec-s3/README.md`](compute/hec-s3/README.md) for the full
+setup. In short:
 
 ```bash
-python dev/tasks.py build     # Init submodule + build Docker image
-python dev/tasks.py package   # Build image and save as storm-cloud-plugin.tar
-python dev/tasks.py lint      # Ruff linter + format check
-python dev/tasks.py format    # Auto-format with ruff
-python dev/tasks.py freeze    # Regenerate constraints.txt
-python dev/tasks.py viewer    # Serve progress viewer at http://localhost:8080
-python dev/tasks.py clean     # Remove containers, volumes, Local/
-python dev/tasks.py down      # Stop containers
+cp compute/hec-s3/.env.example compute/hec-s3/.env   # one-time, gitignored
+$EDITOR compute/hec-s3/.env                          # fill in real creds
+
+./run.py hec                  # list payloads already in S3, pick one interactively
+./run.py hec <PAYLOAD_UUID>   # run a specific payload by UUID
+./run.py batch path/to/jobs/  # multi-job — one subdir per job, each with compute-manifest.json
 ```
+
+`run.py` auto-loads `compute/hec-s3/.env` for these commands; no need to source
+it manually.
+
+`./run.py hec` (no args) calls `s3api list-objects-v2` against
+`s3://$CC_AWS_S3_BUCKET/$CC_ROOT/` and prints a numbered list of available
+payloads sorted by most recent first. Pick a number to run that one. It uses
+`docker run` directly (no compose, no local MinIO).
 
 ## Reproducing the OOM Failure Mode
 
-The vendored stormhub library would spawn `os.cpu_count() - 2` workers,
-which inside a container reads the *host* CPU count and can exceed the
-container's memory ceiling. To reproduce the original failure under a
-3 GB cap:
+The vendored stormhub library would spawn `os.cpu_count() - 2` workers, which
+inside a container reads the *host* CPU count and can exceed the container's
+memory ceiling. To reproduce under a 3 GB cap:
 
 ```bash
-docker compose -f docker/docker-compose.yaml -f docker/docker-compose.mem-limit.yaml build
-docker compose -f docker/docker-compose.yaml -f docker/docker-compose.mem-limit.yaml run --rm seed
-docker compose -f docker/docker-compose.yaml -f docker/docker-compose.mem-limit.yaml run --rm storm-cloud-plugin
+./run.py build
+docker compose -f compute/smoke/compose.yaml run --rm seed
+docker compose -f compute/smoke/compose.yaml run --rm --memory=3g --memory-swap=3g storm-cloud-plugin
 ```
 
 With the fix, the resolver reads the cgroup limit and picks a safe worker
 count; without it, the library would pick 6 and `BrokenProcessPool`.
 
-**Re-run this repro after bumping the `lib/stormhub` submodule** — it's
-the regression test for both the worker-count heuristic and the
-thread-cap env vars in the Dockerfile.
+**Re-run this repro after bumping the `stormhub` submodule** — it's the
+regression test for both the worker-count heuristic and the thread-cap env
+vars in the Dockerfile.
 
 ## Known Limitations
 

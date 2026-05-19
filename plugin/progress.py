@@ -4,10 +4,9 @@ Emits to two destinations:
 
   - structured log lines: ``[plan] / [step / [progress] / [summary]``.
     A grep on ``[progress] <action>`` gives one line per emit per action.
-  - a JSON snapshot at the path configured via ``configure_state_file()``.
-    The host-side ``dev/viewer.py`` reads these files (one per run, by
-    convention under ``outputs/<run-name>/progress.json``) to render the
-    browser-visible page.
+  - a JSON snapshot at the path configured via ``configure_state_file()``,
+    convention ``compute/outputs/<run-name>/progress.json``. Useful for
+    post-mortem inspection or for an external dashboard to poll.
 
 Two reporting flavors:
 
