@@ -80,10 +80,14 @@ def _list_runs() -> list[dict]:
 # ─── HEC S3 payload listing ──────────────────────────────────────────────────
 
 
-def _list_payloads() -> list[dict] | None:
-    """Shell out to ``./run.py hec list``. Returns None if env not configured."""
+def _list_payloads() -> dict:
+    """Three distinct response shapes — the UI picks branches off them:
+    {"state": "unconfigured"}              — no env file yet
+    {"state": "error",  "detail": "..."}   — env present, listing failed
+    {"state": "ok",     "payloads": [...]} — listing succeeded (may be empty)
+    """
     if not HEC_ENV.is_file():
-        return None
+        return {"state": "unconfigured"}
     r = subprocess.run(
         [sys.executable, str(RUN_PY), "hec", "list"],
         capture_output=True,
@@ -91,7 +95,7 @@ def _list_payloads() -> list[dict] | None:
         cwd=ROOT,
     )
     if r.returncode != 0:
-        return None
+        return {"state": "error", "detail": (r.stderr or r.stdout).strip()}
     payloads = []
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -99,7 +103,7 @@ def _list_payloads() -> list[dict] | None:
             continue
         parts = line.split("\t", 1)
         payloads.append({"uuid": parts[0], "mtime": parts[1] if len(parts) > 1 else ""})
-    return payloads
+    return {"state": "ok", "payloads": payloads}
 
 
 # ─── launching ───────────────────────────────────────────────────────────────
@@ -184,7 +188,10 @@ code { background: #f3f4f6; padding: .12rem .35rem; border-radius: 4px;
   <button onclick="launchLocal(this)">Run</button>
 </div>
 
-<h2>HEC S3 payloads <span id="hec-count" class="meta"></span></h2>
+<h2>HEC S3 payloads <span id="hec-count" class="meta"></span>
+  <button class="secondary" style="float:right;font-size:.7rem;padding:.15rem .55rem"
+          onclick="renderPayloads()">Refresh</button>
+</h2>
 <div id="payloads"><span class="muted">Loading…</span></div>
 
 <h2>Recent runs <span id="runs-count" class="meta"></span></h2>
@@ -218,26 +225,34 @@ function esc(s) {
 }
 
 async function renderPayloads() {
-  let data;
-  try {
-    data = await getJson("/api/payloads");
-  } catch {
-    data = null;
-  }
   const root = document.getElementById("payloads");
   const count = document.getElementById("hec-count");
-  if (data === null) {
+  let resp;
+  try {
+    resp = await getJson("/api/payloads");
+  } catch (e) {
+    root.innerHTML = `<span class="muted">Couldn't reach server: ${esc(e.message)}</span>`;
+    count.textContent = "";
+    return;
+  }
+  if (resp.state === "unconfigured") {
     root.innerHTML = '<span class="muted">No <code>compute/hec/env</code> — fill it in to enable HEC S3 runs.</span>';
     count.textContent = "";
     return;
   }
-  if (data.length === 0) {
+  if (resp.state === "error") {
+    root.innerHTML = `<div class="row"><div class="left"><strong style="color:#b91c1c">Listing failed</strong><pre class="meta" style="white-space:pre-wrap;margin:.3rem 0 0">${esc(resp.detail)}</pre></div><button class="secondary" onclick="renderPayloads()">Retry</button></div>`;
+    count.textContent = "";
+    return;
+  }
+  const payloads = resp.payloads || [];
+  if (payloads.length === 0) {
     root.innerHTML = '<span class="muted">No payloads found in S3.</span>';
     count.textContent = "(0)";
     return;
   }
-  count.textContent = `(${data.length})`;
-  root.innerHTML = data.map(p => `
+  count.textContent = `(${payloads.length})`;
+  root.innerHTML = payloads.map(p => `
     <div class="row">
       <div class="left">
         <span class="uuid">${esc(p.uuid)}</span>

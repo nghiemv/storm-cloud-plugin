@@ -53,11 +53,14 @@ stormhub/                 # forked upstream library (git submodule)
 
 ## `run.py`
 
-Single Python file at the repo root, stdlib-only on the host (Docker for
-`build`/`run`; `s3fs`+`xarray` lazy-imported only for `mirror`). Run
-`./run.py help` for the full verb list. Categories: local/HEC runs, dev maint
-(`lint`/`format`/`test`/`freeze`), housekeeping (`down`/`clean`), and the
-browser UI (`web`).
+Single Python file at the repo root. Mostly stdlib; Docker is needed for
+`build`/`run`; `boto3` is lazy-imported for `hec`/`batch`; `s3fs`+`xarray`
+are lazy-imported for `mirror`. Run `./run.py help` for the full verb list.
+Categories: local/HEC runs, dev maint (`lint`/`format`/`test`/`freeze`),
+housekeeping (`down`/`clean`), and the browser UI (`web`).
+
+Install host deps as needed: `pip install boto3` (for `hec`/`batch`),
+`pip install s3fs xarray` (for `mirror`).
 
 Cross-platform: `./run.py <cmd>` on Linux/macOS, `python run.py <cmd>` on
 Windows or anywhere portable.

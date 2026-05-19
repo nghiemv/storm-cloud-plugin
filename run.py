@@ -132,43 +132,36 @@ def _require_hec_env() -> None:
         sys.exit(1)
 
 
+def _s3_client():
+    """Build an S3 client from CC_AWS_* env. Lazy-imports boto3."""
+    import boto3
+
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ["CC_AWS_ENDPOINT"],
+        aws_access_key_id=os.environ["CC_AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["CC_AWS_SECRET_ACCESS_KEY"],
+        region_name=os.environ.get("CC_AWS_DEFAULT_REGION", "us-east-1"),
+    )
+
+
 def _list_hec_payloads() -> list[tuple[str, str]]:
     """Return [(uuid, last_modified), ...] for payloads in s3://$BUCKET/$CC_ROOT/."""
-    endpoint = os.environ["CC_AWS_ENDPOINT"]
     bucket = os.environ["CC_AWS_S3_BUCKET"]
-    root = os.environ.get("CC_ROOT", "manifests")
-    prefix = f"{root}/"
+    prefix = f"{os.environ.get('CC_ROOT', 'manifests')}/"
 
-    r = subprocess.run(
-        [
-            "aws",
-            "--endpoint-url",
-            endpoint,
-            "s3api",
-            "list-objects-v2",
-            "--bucket",
-            bucket,
-            "--prefix",
-            prefix,
-            "--output",
-            "json",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=ROOT,
-    )
-    if r.returncode != 0:
-        print(r.stderr, file=sys.stderr)
-        sys.exit(r.returncode)
-
-    data = json.loads(r.stdout or "{}")
+    s3 = _s3_client()
     payloads: dict[str, str] = {}
-    for obj in data.get("Contents") or []:
-        # CC convention: keys look like <root>/<uuid>/payload
-        rel = obj["Key"][len(prefix) :]
-        parts = rel.split("/", 2)
-        if len(parts) >= 2 and parts[1] == "payload":
-            payloads[parts[0]] = obj.get("LastModified", "")
+    for page in s3.get_paginator("list_objects_v2").paginate(
+        Bucket=bucket, Prefix=prefix
+    ):
+        for obj in page.get("Contents") or []:
+            # CC convention: keys look like <root>/<uuid>/payload
+            rel = obj["Key"][len(prefix) :]
+            parts = rel.split("/", 2)
+            if len(parts) >= 2 and parts[1] == "payload":
+                mtime = obj.get("LastModified")
+                payloads[parts[0]] = mtime.isoformat() if mtime else ""
     return sorted(payloads.items(), key=lambda x: x[1], reverse=True)
 
 
@@ -315,20 +308,11 @@ def cmd_batch(args: list[str]) -> None:
     print(
         f"=== Staging {len(jobs)} manifests to s3://{os.environ['CC_AWS_S3_BUCKET']}/manifests/ ==="
     )
-    endpoint = os.environ["CC_AWS_ENDPOINT"]
+    s3 = _s3_client()
+    bucket = os.environ["CC_AWS_S3_BUCKET"]
     for name, uuid, manifest in jobs:
         print(f"  {name} -> manifests/{uuid}/payload")
-        sh(
-            [
-                "aws",
-                "--endpoint-url",
-                endpoint,
-                "s3",
-                "cp",
-                str(manifest),
-                f"s3://{os.environ['CC_AWS_S3_BUCKET']}/manifests/{uuid}/payload",
-            ]
-        )
+        s3.upload_file(str(manifest), bucket, f"manifests/{uuid}/payload")
 
     for name, uuid, _ in jobs:
         print(f"\n=== Starting: {name} (payload={uuid}) ===")
