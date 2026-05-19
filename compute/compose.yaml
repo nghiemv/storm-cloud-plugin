@@ -1,7 +1,13 @@
 # Local dev stack for `./run.py` (run from repo root).
-# Spins up MinIO, seeds it from compute/local/sample/, then runs the plugin.
+# Spins up MinIO, seeds it from compute/sample/, then runs the plugin.
 
 name: storm-cloud-plugin
+
+x-mc: &mc
+  image: minio/mc:latest
+  env_file: ./dev.env
+  volumes:
+    - ./sample:/sample
 
 services:
   minio:
@@ -19,13 +25,10 @@ services:
       retries: 10
 
   minio-init:
-    image: minio/mc:latest
+    <<: *mc
     depends_on:
       minio:
         condition: service_healthy
-    env_file: ./dev.env
-    volumes:
-      - ./sample:/sample
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
@@ -45,13 +48,10 @@ services:
       "
 
   seed:
-    image: minio/mc:latest
+    <<: *mc
     depends_on:
       minio-init:
         condition: service_completed_successfully
-    env_file: ./dev.env
-    volumes:
-      - ./sample:/sample
     environment:
       PAYLOAD_FILE: ${PAYLOAD_FILE:-/sample/payload.json}
     entrypoint: >
@@ -64,7 +64,7 @@ services:
   storm-cloud-plugin:
     image: storm-cloud-plugin:latest
     build:
-      context: ../..
+      context: ..
       dockerfile: compute/Dockerfile
     depends_on:
       seed:
@@ -76,7 +76,7 @@ services:
     volumes:
       # Bind-mount Local/ to the host so progress.json + DSS outputs
       # land at compute/outputs/quick-test/ while the plugin runs.
-      - ../outputs/quick-test:/usr/src/app/Local
+      - ./outputs/quick-test:/usr/src/app/Local
     # Bound container shutdown so a hung run doesn't block compose down.
     stop_grace_period: 10s
     init: true

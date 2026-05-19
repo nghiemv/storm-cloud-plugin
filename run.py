@@ -9,7 +9,7 @@ Invocation:
     Anywhere portable:    python run.py <cmd>
 
 Usage:
-    run.py                  Local run with compute/local/sample/payload.json
+    run.py                  Local run with compute/sample/payload.json
     run.py PAYLOAD          Local run with a custom payload
     run.py hec              List payloads on HEC S3 and pick one interactively
     run.py hec list         Just list payloads (UUID + timestamp, tab-separated)
@@ -17,6 +17,7 @@ Usage:
     run.py batch [DIR]      Multi-job HEC S3 driver (DIR holds one subdir per job)
     run.py build            docker build the plugin image
     run.py mirror [args]    One-shot AORC zarr mirror (NOAA -> private S3 cache)
+    run.py web [--port N]   Browser UI for browsing payloads + launching runs
     run.py lint             ruff check + format check
     run.py format           ruff format
     run.py test [args...]   pytest plugin/tests/ (forwards extra args to pytest)
@@ -37,10 +38,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 COMPUTE = ROOT / "compute"
-LOCAL = COMPUTE / "local"
-HEC = COMPUTE / "hec-s3"
-COMPOSE = ["docker", "compose", "-f", str(LOCAL / "compose.yaml")]
-DEFAULT_PAYLOAD = LOCAL / "sample" / "payload.json"
+HEC_ENV_FILE = COMPUTE / "hec.env"
+COMPOSE = ["docker", "compose", "-f", str(COMPUTE / "compose.yaml")]
+DEFAULT_PAYLOAD = COMPUTE / "sample" / "payload.json"
 IMAGE = "ghcr.io/usace/storm-cloud-plugin:latest"
 
 
@@ -53,9 +53,7 @@ def sh(args, env=None, check=True, **kwargs):
 
 
 def sh_quiet(args):
-    subprocess.run(
-        args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT
-    )
+    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
 
 
 # ─── local (MinIO dev stack) ─────────────────────────────────────────────────
@@ -69,7 +67,7 @@ def cmd_local(payload: Path = DEFAULT_PAYLOAD) -> None:
     sh(["git", "submodule", "update", "--init"])
     sh_quiet([*COMPOSE, "down", "--remove-orphans"])
     (COMPUTE / "outputs" / "quick-test").mkdir(parents=True, exist_ok=True)
-    # the seed service mounts compute/local/sample at /sample inside the container
+    # the seed service mounts compute/sample at /sample inside the container
     container_path = "/sample/" + payload.name
     print(f"Running local: {payload.name}")
     print("Progress streams to stdout; outputs land in compute/outputs/quick-test/\n")
@@ -80,21 +78,24 @@ def cmd_local(payload: Path = DEFAULT_PAYLOAD) -> None:
 # ─── hec (production S3) ─────────────────────────────────────────────────────
 
 
-_HEC_REQUIRED = ("CC_AWS_ACCESS_KEY_ID", "CC_AWS_SECRET_ACCESS_KEY",
-                 "CC_AWS_ENDPOINT", "CC_AWS_S3_BUCKET")
+_HEC_REQUIRED = (
+    "CC_AWS_ACCESS_KEY_ID",
+    "CC_AWS_SECRET_ACCESS_KEY",
+    "CC_AWS_ENDPOINT",
+    "CC_AWS_S3_BUCKET",
+)
 
 
 def _load_hec_env() -> None:
-    """Overlay compute/hec-s3/.env onto os.environ if it exists.
+    """Overlay compute/hec.env onto os.environ if it exists.
 
     Existing env vars win (so an explicit `export FOO=...` overrides the file).
-    Quietly no-op if the .env file is absent — the user gets a clearer error
-    from _require_hec_env() pointing at the README.
+    Quietly no-op if the file is absent — the user gets a clearer error
+    from _require_hec_env() pointing at the template.
     """
-    env_file = HEC / ".env"
-    if not env_file.is_file():
+    if not HEC_ENV_FILE.is_file():
         return
-    for line in env_file.read_text().splitlines():
+    for line in HEC_ENV_FILE.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -108,8 +109,8 @@ def _require_hec_env() -> None:
     if missing:
         print(
             f"Error: missing HEC creds: {missing}\n"
-            f"  Fix: cp compute/hec-s3/.env.example compute/hec-s3/.env, then fill it in.\n"
-            f"  See compute/hec-s3/README.md.",
+            f"  Fix: cp compute/hec.env.example compute/hec.env, then fill it in.\n"
+            f"  See the 'Running Against HEC S3' section of README.md.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -123,9 +124,22 @@ def _list_hec_payloads() -> list[tuple[str, str]]:
     prefix = f"{root}/"
 
     r = subprocess.run(
-        ["aws", "--endpoint-url", endpoint, "s3api", "list-objects-v2",
-         "--bucket", bucket, "--prefix", prefix, "--output", "json"],
-        capture_output=True, text=True, cwd=ROOT,
+        [
+            "aws",
+            "--endpoint-url",
+            endpoint,
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            bucket,
+            "--prefix",
+            prefix,
+            "--output",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
     )
     if r.returncode != 0:
         print(r.stderr, file=sys.stderr)
@@ -135,7 +149,7 @@ def _list_hec_payloads() -> list[tuple[str, str]]:
     payloads: dict[str, str] = {}
     for obj in data.get("Contents") or []:
         # CC convention: keys look like <root>/<uuid>/payload
-        rel = obj["Key"][len(prefix):]
+        rel = obj["Key"][len(prefix) :]
         parts = rel.split("/", 2)
         if len(parts) >= 2 and parts[1] == "payload":
             payloads[parts[0]] = obj.get("LastModified", "")
@@ -172,20 +186,38 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
     forwarded = (
         *_HEC_REQUIRED,
         "CC_AWS_DEFAULT_REGION",
-        "FFRD_AWS_ACCESS_KEY_ID", "FFRD_AWS_SECRET_ACCESS_KEY",
-        "FFRD_AWS_DEFAULT_REGION", "FFRD_AWS_ENDPOINT", "FFRD_AWS_S3_BUCKET",
-        "AORC_S3_BASE_URL", "AORC_S3_KEY", "AORC_S3_SECRET", "AORC_S3_ENDPOINT",
+        "FFRD_AWS_ACCESS_KEY_ID",
+        "FFRD_AWS_SECRET_ACCESS_KEY",
+        "FFRD_AWS_DEFAULT_REGION",
+        "FFRD_AWS_ENDPOINT",
+        "FFRD_AWS_S3_BUCKET",
+        "AORC_S3_BASE_URL",
+        "AORC_S3_KEY",
+        "AORC_S3_SECRET",
+        "AORC_S3_ENDPOINT",
     )
-    sh([
-        "docker", "run", "--rm",
-        "-v", f"{COMPUTE / 'outputs' / name}:/usr/src/app/Local",
-        "-e", f"CC_PAYLOAD_ID={uuid}",
-        "-e", f"CC_MANIFEST_ID={uuid}",
-        "-e", f"CC_ROOT={os.environ.get('CC_ROOT', 'manifests')}",
-        *[arg for k in forwarded if os.environ.get(k)
-          for arg in ("-e", f"{k}={os.environ[k]}")],
-        IMAGE,
-    ])
+    sh(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{COMPUTE / 'outputs' / name}:/usr/src/app/Local",
+            "-e",
+            f"CC_PAYLOAD_ID={uuid}",
+            "-e",
+            f"CC_MANIFEST_ID={uuid}",
+            "-e",
+            f"CC_ROOT={os.environ.get('CC_ROOT', 'manifests')}",
+            *[
+                arg
+                for k in forwarded
+                if os.environ.get(k)
+                for arg in ("-e", f"{k}={os.environ[k]}")
+            ],
+            IMAGE,
+        ]
+    )
 
 
 def cmd_hec(args: list[str]) -> None:
@@ -230,14 +262,17 @@ def cmd_build() -> None:
 def cmd_batch(args: list[str]) -> None:
     """Multi-job HEC S3 driver.
 
-    Reads each compute-manifest.json under DIR (default: compute/hec-s3/batch/),
+    Reads each compute-manifest.json under DIR (default: compute/batch/),
     stages it to s3://$BUCKET/manifests/<uuid>/payload, then runs the plugin
     once per manifest. Set the same HEC creds as `./run.py hec`.
     """
-    batch_dir = Path(args[0]) if args else HEC / "batch"
+    batch_dir = Path(args[0]) if args else COMPUTE / "batch"
     if not batch_dir.is_dir():
         print(f"Error: batch dir not found: {batch_dir}", file=sys.stderr)
-        print("Expected one subdir per job, each holding compute-manifest.json", file=sys.stderr)
+        print(
+            "Expected one subdir per job, each holding compute-manifest.json",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     _require_hec_env()
@@ -261,15 +296,23 @@ def cmd_batch(args: list[str]) -> None:
         print(f"No jobs found in {batch_dir}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"=== Staging {len(jobs)} manifests to s3://{os.environ['CC_AWS_S3_BUCKET']}/manifests/ ===")
+    print(
+        f"=== Staging {len(jobs)} manifests to s3://{os.environ['CC_AWS_S3_BUCKET']}/manifests/ ==="
+    )
     endpoint = os.environ["CC_AWS_ENDPOINT"]
     for name, uuid, manifest in jobs:
         print(f"  {name} -> manifests/{uuid}/payload")
-        sh([
-            "aws", "--endpoint-url", endpoint,
-            "s3", "cp", str(manifest),
-            f"s3://{os.environ['CC_AWS_S3_BUCKET']}/manifests/{uuid}/payload",
-        ])
+        sh(
+            [
+                "aws",
+                "--endpoint-url",
+                endpoint,
+                "s3",
+                "cp",
+                str(manifest),
+                f"s3://{os.environ['CC_AWS_S3_BUCKET']}/manifests/{uuid}/payload",
+            ]
+        )
 
     for name, uuid, _ in jobs:
         print(f"\n=== Starting: {name} (payload={uuid}) ===")
@@ -297,15 +340,20 @@ def cmd_mirror(args: list[str]) -> None:
     NOAA_BASE = "s3://noaa-nws-aorc-v1-1-1km"
     YEAR_START, YEAR_END = 1979, 2024
 
-    p = _ap.ArgumentParser(prog="./run.py mirror", description=cmd_mirror.__doc__,
-                           formatter_class=_ap.RawDescriptionHelpFormatter)
+    p = _ap.ArgumentParser(
+        prog="./run.py mirror",
+        description=cmd_mirror.__doc__,
+        formatter_class=_ap.RawDescriptionHelpFormatter,
+    )
     p.add_argument("--year-start", type=int, default=YEAR_START, metavar="YEAR")
     p.add_argument("--year-end", type=int, default=YEAR_END, metavar="YEAR")
-    p.add_argument("--dest-base", default="s3://storm-cloud/aorc-cache", metavar="S3_URI")
+    p.add_argument(
+        "--dest-base", default="s3://storm-cloud/aorc-cache", metavar="S3_URI"
+    )
     p.add_argument("--dry-run", action="store_true", help="plan without writing")
     opts = p.parse_args(args)
 
-    _load_hec_env()  # picks up MIRROR_AWS_* if defined in compute/hec-s3/.env
+    _load_hec_env()  # picks up MIRROR_AWS_* if defined in compute/hec.env
     try:
         import s3fs
         import xarray as xr
@@ -330,7 +378,10 @@ def cmd_mirror(args: list[str]) -> None:
 
     src_fs = s3fs.S3FileSystem(anon=True, config_kwargs={"max_pool_connections": 50})
     dst_fs = s3fs.S3FileSystem(
-        anon=False, key=key, secret=secret, endpoint_url=endpoint,
+        anon=False,
+        key=key,
+        secret=secret,
+        endpoint_url=endpoint,
         config_kwargs={"max_pool_connections": 20},
     )
 
@@ -348,7 +399,9 @@ def cmd_mirror(args: list[str]) -> None:
             log.info("[%d] opening %s", year, src_path)
             ds = xr.open_dataset(
                 s3fs.S3Map(root=src_path, s3=src_fs, check=False),
-                engine="zarr", chunks="auto", consolidated=True,
+                engine="zarr",
+                chunks="auto",
+                consolidated=True,
             )
             ds = ds[VARIABLES].sel(
                 longitude=slice(LON_MIN, LON_MAX),
@@ -357,15 +410,21 @@ def cmd_mirror(args: list[str]) -> None:
             n_lat = ds.sizes.get("latitude", 1)
             n_lon = ds.sizes.get("longitude", 1)
             ds = ds.chunk({"time": 24, "latitude": n_lat, "longitude": n_lon})
-            log.info("[%d] clipped: time=%d lat=%d lon=%d",
-                     year, ds.sizes.get("time", 0), n_lat, n_lon)
+            log.info(
+                "[%d] clipped: time=%d lat=%d lon=%d",
+                year,
+                ds.sizes.get("time", 0),
+                n_lat,
+                n_lon,
+            )
             if opts.dry_run:
                 log.info("[%d] dry-run — skip write", year)
                 continue
             log.info("[%d] writing to %s", year, dst_path)
             ds.to_zarr(
                 s3fs.S3Map(root=dst_path, s3=dst_fs, check=False),
-                mode="w", consolidated=True,
+                mode="w",
+                consolidated=True,
             )
             log.info("[%d] done", year)
         except Exception:
@@ -395,25 +454,47 @@ def cmd_test(args: list[str]) -> None:
     sh([sys.executable, "-m", "pytest", "plugin/tests/", *args])
 
 
+def cmd_web(args: list[str]) -> None:
+    """Browser UI: browse S3 payloads, launch runs, watch progress.
+
+    Localhost-only. See web.py for the implementation.
+    """
+    import argparse as _ap
+
+    p = _ap.ArgumentParser(prog="./run.py web")
+    p.add_argument("--port", type=int, default=8744)
+    p.add_argument("--host", default="127.0.0.1")
+    opts = p.parse_args(args)
+    from web import serve
+
+    serve(host=opts.host, port=opts.port)
+
+
 def cmd_freeze() -> None:
     cmd_build()
     r = subprocess.run(
-        [*COMPOSE, "run", "--rm",
-         "--entrypoint", "python3.12 -m pip freeze",
-         "storm-cloud-plugin"],
-        capture_output=True, text=True, cwd=ROOT,
+        [
+            *COMPOSE,
+            "run",
+            "--rm",
+            "--entrypoint",
+            "python3.12 -m pip freeze",
+            "storm-cloud-plugin",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
     )
     if r.returncode != 0:
         print(r.stderr, file=sys.stderr)
         sys.exit(r.returncode)
     skip = ("-e ", "pkg_resources", "stormhub", "cc-py-sdk", "cc_py_sdk")
     lines = sorted(
-        line for line in r.stdout.splitlines()
+        line
+        for line in r.stdout.splitlines()
         if line.strip() and not any(line.startswith(s) for s in skip)
     )
-    (COMPUTE / "constraints.txt").write_text(
-        "\n".join(lines) + "\n", encoding="utf-8"
-    )
+    (COMPUTE / "constraints.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("Updated compute/constraints.txt")
 
 
@@ -445,6 +526,7 @@ _WITH_ARGS = {
     "batch": cmd_batch,
     "mirror": cmd_mirror,
     "test": cmd_test,
+    "web": cmd_web,
 }
 
 

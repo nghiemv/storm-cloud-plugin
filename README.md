@@ -21,7 +21,7 @@ is at http://localhost:9001 (`ccuser`/`ccpassword`); output files land in
 
 > Local runs serialize storm-search by default (1 worker) because no container
 > memory limit is enforced. For a faster loop, set `CC_NUM_WORKERS=4` in
-> `compute/local/dev.env` or pass `num_workers` in the payload `attributes`.
+> `compute/dev.env` or pass `num_workers` in the payload `attributes`.
 
 ## Repo Layout
 
@@ -34,21 +34,18 @@ plugin/                   # the CC compute plugin (python -m plugin)
   progress.py             #   [progress] log lines + progress.json snapshot
   workers.py              #   cgroup-aware worker count (OOM guard)
   tests/                  #   pytest (excluded from the image by .dockerignore)
-compute/                  # resources run.py uses, split by target
-  Dockerfile              #   run.py build — shared by local and HEC S3
+compute/                  # everything run.py needs — flat by intent
+  Dockerfile              #   image build (local + prod)
   requirements.txt
   constraints.txt
-  local/                  #   `run.py` (default) — MinIO dev stack
-    compose.yaml          #     spins up MinIO + plugin
-    dev.env               #     fake MinIO creds (committed)
-    sample/               #     one canonical test case
-      manifest.json
-      payload.json
-      watershed-boundary.geojson
-      transposition-domain.geojson
-  hec-s3/                 #   `run.py hec` / `run.py batch` — production HEC S3
-    .env.example          #     template; copy to .env (gitignored), fill in real creds
-    README.md             #     how to set up + run
+  compose.yaml            #   local MinIO dev stack
+  dev.env                 #   fake MinIO creds (committed)
+  hec.env.example         #   prod creds template — cp to hec.env (gitignored)
+  cc-manifest.example.json#   CC orchestrator deployment spec (reference)
+  sample/                 #   canonical local-run inputs
+    payload.json
+    watershed-boundary.geojson
+    transposition-domain.geojson
   outputs/                #   gitignored runtime — DSS files, progress.json, logs
 stormhub/                 # forked upstream library (git submodule)
 ```
@@ -56,13 +53,14 @@ stormhub/                 # forked upstream library (git submodule)
 ## `run.py` Commands
 
 ```bash
-./run.py                  # Local run with compute/local/sample/payload.json
+./run.py                  # Local run with compute/sample/payload.json
 ./run.py PAYLOAD          # Local run with a custom payload
 ./run.py hec              # List HEC S3 payloads and pick one interactively
 ./run.py hec UUID         # Run a specific HEC S3 payload by UUID
 ./run.py batch [DIR]      # Multi-job HEC S3 driver (one subdir per job)
 ./run.py build            # docker build the plugin image
 ./run.py mirror [args]    # One-shot AORC zarr mirror (NOAA -> private S3)
+./run.py web [--port N]   # Browser UI: browse payloads, launch runs, watch progress
 ./run.py lint             # ruff check + format check
 ./run.py format           # ruff format
 ./run.py test [args...]   # pytest plugin/tests/ (extra args forward to pytest)
@@ -82,11 +80,11 @@ mirror`, lazy-imported only when invoked).
 
 ## Custom Payloads
 
-Edit `compute/local/sample/payload.json` or copy it and pass the path:
+Edit `compute/sample/payload.json` or copy it and pass the path:
 
 ```bash
-cp compute/local/sample/payload.json compute/local/sample/mine.json
-./run.py compute/local/sample/mine.json
+cp compute/sample/payload.json compute/sample/mine.json
+./run.py compute/sample/mine.json
 ```
 
 Storm parameters are in `attributes`. All values are strings (CC SDK convention).
@@ -122,25 +120,56 @@ behavior and are usually set in the manifest / compose env (Twelve-Factor).
 
 ## Running Against HEC S3
 
-Same plugin code, different backend — see [`compute/hec-s3/README.md`](compute/hec-s3/README.md) for the full
-setup. In short:
+Same plugin code, different backend. One-time setup:
 
 ```bash
-cp compute/hec-s3/.env.example compute/hec-s3/.env   # one-time, gitignored
-$EDITOR compute/hec-s3/.env                          # fill in real creds
-
-./run.py hec                  # list payloads already in S3, pick one interactively
-./run.py hec <PAYLOAD_UUID>   # run a specific payload by UUID
-./run.py batch path/to/jobs/  # multi-job — one subdir per job, each with compute-manifest.json
+cp compute/hec.env.example compute/hec.env   # gitignored
+$EDITOR compute/hec.env                      # fill in real creds
 ```
 
-`run.py` auto-loads `compute/hec-s3/.env` for these commands; no need to source
-it manually.
+`run.py` auto-loads `compute/hec.env` for `hec`, `batch`, and `mirror` — no
+manual `source`. Shell env still wins, so you can override one var ad-hoc.
+
+**Single job:**
+
+```bash
+./run.py hec                  # list payloads in S3, pick interactively
+./run.py hec list             # machine-readable: UUID<TAB>timestamp
+./run.py hec <UUID> [NAME]    # run a specific payload (NAME = output subdir)
+```
 
 `./run.py hec` (no args) calls `s3api list-objects-v2` against
-`s3://$CC_AWS_S3_BUCKET/$CC_ROOT/` and prints a numbered list of available
-payloads sorted by most recent first. Pick a number to run that one. It uses
-`docker run` directly (no compose, no local MinIO).
+`s3://$CC_AWS_S3_BUCKET/$CC_ROOT/`, sorts newest-first, prompts to pick. It
+then `docker run`s the image directly — no compose, no local MinIO.
+
+**Many jobs (batch):**
+
+Drop one subdir per job under any path, each containing a `compute-manifest.json`:
+
+```
+jobs/
+  indian-creek-72hr/compute-manifest.json   # has "uuid": "1a63..."
+  kanawha-1000-120hr/compute-manifest.json
+```
+
+Then `./run.py batch jobs/` stages each manifest to
+`s3://$CC_AWS_S3_BUCKET/manifests/<uuid>/payload` and runs the plugin once per
+job, sequentially.
+
+## Web UI
+
+```bash
+./run.py web              # browser UI at http://localhost:8744/
+```
+
+Lists payloads in HEC S3 (if `compute/hec.env` is configured), launches
+local or HEC runs with one click, and shows each run's current step + elapsed
+time. Reads from `compute/outputs/<name>/progress.json` (auto-refreshes every
+2 s). Launches detach to the background, so closing the browser — or the web
+process — doesn't kill the run; logs land in
+`compute/outputs/<name>/launch.log`.
+
+Single file (`web.py`), stdlib only, binds to `127.0.0.1`. No auth.
 
 ## Reproducing the OOM Failure Mode
 
@@ -150,8 +179,8 @@ memory ceiling. To reproduce under a 3 GB cap:
 
 ```bash
 ./run.py build
-docker compose -f compute/local/compose.yaml run --rm seed
-docker compose -f compute/local/compose.yaml run --rm --memory=3g --memory-swap=3g storm-cloud-plugin
+docker compose -f compute/compose.yaml run --rm seed
+docker compose -f compute/compose.yaml run --rm --memory=3g --memory-swap=3g storm-cloud-plugin
 ```
 
 With the fix, the resolver reads the cgroup limit and picks a safe worker
