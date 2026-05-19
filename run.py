@@ -43,7 +43,10 @@ HEC = COMPUTE / "hec"
 HEC_ENV_FILE = HEC / "env"
 COMPOSE = ["docker", "compose", "-f", str(LOCAL / "compose.yaml")]
 DEFAULT_PAYLOAD = LOCAL / "sample" / "payload.json"
-IMAGE = "ghcr.io/usace/storm-cloud-plugin:latest"
+# Local tag — `./run.py build` produces this. For prod images pulled from
+# GHCR, tag them locally: `docker tag ghcr.io/usace/storm-cloud-plugin:latest
+# storm-cloud-plugin:latest`.
+IMAGE = "storm-cloud-plugin:latest"
 
 
 def sh(args, env=None, check=True, **kwargs):
@@ -132,37 +135,54 @@ def _require_hec_env() -> None:
         sys.exit(1)
 
 
-def _s3_client():
-    """Build an S3 client from CC_AWS_* env. Lazy-imports boto3."""
-    import boto3
+_FORWARDED_HEC_ENV = (
+    *_HEC_REQUIRED,
+    "CC_AWS_DEFAULT_REGION",
+    "CC_ROOT",
+)
 
-    return boto3.client(
-        "s3",
-        endpoint_url=os.environ["CC_AWS_ENDPOINT"],
-        aws_access_key_id=os.environ["CC_AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["CC_AWS_SECRET_ACCESS_KEY"],
-        region_name=os.environ.get("CC_AWS_DEFAULT_REGION", "us-east-1"),
-    )
+
+def _docker_plugin_cli(
+    subcmd: list[str], *, mounts: list[tuple[Path, str, str]] = ()
+) -> subprocess.CompletedProcess:
+    """Run ``python3.12 -m plugin.cli <subcmd>`` inside the plugin image.
+
+    Keeps the host stdlib-only — boto3 lives in the image, not on PATH.
+    Forwards CC_AWS_* env so the in-container S3 client authenticates.
+    """
+    args = [
+        "docker",
+        "run",
+        "--rm",
+        "--entrypoint",
+        "python3.12",
+        *[
+            arg
+            for k in _FORWARDED_HEC_ENV
+            if os.environ.get(k)
+            for arg in ("-e", f"{k}={os.environ[k]}")
+        ],
+        *[arg for h, c, m in mounts for arg in ("-v", f"{h}:{c}:{m}")],
+        IMAGE,
+        "-m",
+        "plugin.cli",
+        *subcmd,
+    ]
+    return subprocess.run(args, capture_output=True, text=True, cwd=ROOT)
 
 
 def _list_hec_payloads() -> list[tuple[str, str]]:
     """Return [(uuid, last_modified), ...] for payloads in s3://$BUCKET/$CC_ROOT/."""
-    bucket = os.environ["CC_AWS_S3_BUCKET"]
-    prefix = f"{os.environ.get('CC_ROOT', 'manifests')}/"
-
-    s3 = _s3_client()
-    payloads: dict[str, str] = {}
-    for page in s3.get_paginator("list_objects_v2").paginate(
-        Bucket=bucket, Prefix=prefix
-    ):
-        for obj in page.get("Contents") or []:
-            # CC convention: keys look like <root>/<uuid>/payload
-            rel = obj["Key"][len(prefix) :]
-            parts = rel.split("/", 2)
-            if len(parts) >= 2 and parts[1] == "payload":
-                mtime = obj.get("LastModified")
-                payloads[parts[0]] = mtime.isoformat() if mtime else ""
-    return sorted(payloads.items(), key=lambda x: x[1], reverse=True)
+    r = _docker_plugin_cli(["list-payloads"])
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        sys.exit(r.returncode)
+    payloads: list[tuple[str, str]] = []
+    for line in r.stdout.splitlines():
+        if "\t" in line:
+            uuid, mtime = line.split("\t", 1)
+            payloads.append((uuid, mtime))
+    return payloads
 
 
 def _pick_hec_payload() -> str | None:
@@ -286,6 +306,8 @@ def cmd_batch(args: list[str]) -> None:
 
     _require_hec_env()
 
+    # Walk the batch dir once on the host (stdlib only) so we have the
+    # (name, uuid) map for the per-job runs below.
     jobs = []
     for sub in sorted(batch_dir.iterdir()):
         if not sub.is_dir():
@@ -305,14 +327,18 @@ def cmd_batch(args: list[str]) -> None:
         print(f"No jobs found in {batch_dir}", file=sys.stderr)
         sys.exit(1)
 
+    # Stage all manifests in a single docker run — no host boto3 needed.
     print(
         f"=== Staging {len(jobs)} manifests to s3://{os.environ['CC_AWS_S3_BUCKET']}/manifests/ ==="
     )
-    s3 = _s3_client()
-    bucket = os.environ["CC_AWS_S3_BUCKET"]
-    for name, uuid, manifest in jobs:
-        print(f"  {name} -> manifests/{uuid}/payload")
-        s3.upload_file(str(manifest), bucket, f"manifests/{uuid}/payload")
+    r = _docker_plugin_cli(
+        ["upload-batch", "/batch"],
+        mounts=[(batch_dir.resolve(), "/batch", "ro")],
+    )
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if r.returncode != 0:
+        sys.exit(r.returncode)
 
     for name, uuid, _ in jobs:
         print(f"\n=== Starting: {name} (payload={uuid}) ===")

@@ -8,12 +8,17 @@ S3 payload  -->  download-inputs  -->  process-storms  -->  convert-to-dss  --> 
 
 ## Quick Start
 
-Requires **Python 3** and **Docker**.
+Requires **Python 3** and **Docker**. Works on Linux, macOS, and Windows.
 
 ```bash
 ./run.py        # Linux/macOS — builds the image, starts MinIO, runs the plugin
 python run.py   # Windows / portable invocation
 ```
+
+All non-stdlib work (S3 ops, plugin execution, AORC mirror) runs inside the
+Docker image. The host needs nothing beyond Python 3 + Docker for the core
+workflows. Dev verbs (`lint`/`format`/`test`) additionally need `ruff` /
+`pytest` on the host — `pip install ruff pytest` to enable them.
 
 Progress streams to the terminal (`[progress]` lines per action). MinIO console
 is at http://localhost:9001 (`ccuser`/`ccpassword`); output files land in
@@ -53,14 +58,15 @@ stormhub/                 # forked upstream library (git submodule)
 
 ## `run.py`
 
-Single Python file at the repo root. Mostly stdlib; Docker is needed for
-`build`/`run`; `boto3` is lazy-imported for `hec`/`batch`; `s3fs`+`xarray`
-are lazy-imported for `mirror`. Run `./run.py help` for the full verb list.
+Single Python file at the repo root, stdlib only. Docker carries the rest:
+S3 ops for `hec`/`batch` run inside the plugin image (via `plugin/cli.py`),
+the AORC mirror likewise. Run `./run.py help` for the full verb list.
 Categories: local/HEC runs, dev maint (`lint`/`format`/`test`/`freeze`),
 housekeeping (`down`/`clean`), and the browser UI (`web`).
 
-Install host deps as needed: `pip install boto3` (for `hec`/`batch`),
-`pip install s3fs xarray` (for `mirror`).
+Dev verbs need host installs: `pip install ruff` for `lint`/`format`,
+`pip install pytest` for `test`. Core workflow (`local`/`hec`/`batch`/`web`)
+needs no host pip installs.
 
 Cross-platform: `./run.py <cmd>` on Linux/macOS, `python run.py <cmd>` on
 Windows or anywhere portable.

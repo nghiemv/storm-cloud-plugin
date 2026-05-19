@@ -109,6 +109,20 @@ def _list_payloads() -> dict:
 # ─── launching ───────────────────────────────────────────────────────────────
 
 
+# Cross-platform process detachment: POSIX uses setsid, Windows uses
+# DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP so the child survives the
+# parent's exit and isn't bound to its console.
+if sys.platform == "win32":
+    _DETACH_KWARGS: dict = {
+        "creationflags": (
+            subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+        ),
+    }
+else:
+    _DETACH_KWARGS = {"start_new_session": True}
+
+
 def _launch(args: list[str], name: str) -> str:
     """Detach a run in the background. Logs to compute/outputs/<name>/launch.log."""
     run_dir = OUTPUTS / name
@@ -122,7 +136,7 @@ def _launch(args: list[str], name: str) -> str:
         cwd=str(ROOT),
         stdout=log_file,
         stderr=subprocess.STDOUT,
-        start_new_session=True,
+        **_DETACH_KWARGS,
     )
     return name
 
