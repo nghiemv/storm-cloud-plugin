@@ -19,6 +19,7 @@ Usage:
     run.py mirror [args]    One-shot AORC zarr mirror (NOAA -> private S3 cache)
     run.py lint             ruff check + format check
     run.py format           ruff format
+    run.py test [args...]   pytest plugin/tests/ (forwards extra args to pytest)
     run.py freeze           Regenerate compute/constraints.txt from a built image
     run.py down             docker compose down
     run.py clean            Stop containers, drop volumes, clear compute/outputs/
@@ -389,6 +390,11 @@ def cmd_format() -> None:
     sh(["ruff", "format", "plugin/"])
 
 
+def cmd_test(args: list[str]) -> None:
+    """Run plugin/tests/ via pytest. Extra args forward to pytest."""
+    sh([sys.executable, "-m", "pytest", "plugin/tests/", *args])
+
+
 def cmd_freeze() -> None:
     cmd_build()
     r = subprocess.run(
@@ -438,6 +444,7 @@ _WITH_ARGS = {
     "hec": cmd_hec,
     "batch": cmd_batch,
     "mirror": cmd_mirror,
+    "test": cmd_test,
 }
 
 

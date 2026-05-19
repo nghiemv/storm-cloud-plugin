@@ -1,15 +1,7 @@
-"""Action handlers — one per pipeline step."""
+"""Action handlers — one module per pipeline step.
 
-from plugin.actions.catalog import process_storms
-from plugin.actions.convert_to_dss import convert_to_dss
-from plugin.actions.create_grid_file import create_grid_file
-from plugin.actions.download_inputs import download_inputs
-from plugin.actions.upload_outputs import upload_outputs
-
-__all__ = [
-    "convert_to_dss",
-    "create_grid_file",
-    "download_inputs",
-    "process_storms",
-    "upload_outputs",
-]
+Submodules are imported individually by ``plugin.__main__`` rather than
+re-exported here, so a single action (and its dependency surface) can be
+imported in isolation — e.g. unit tests for ``create_grid_file`` don't pay
+for ``process_storms``'s stormhub import.
+"""

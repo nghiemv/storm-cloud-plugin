@@ -44,7 +44,9 @@ def test_progress_emits_on_every_n(caplog):
     with caplog.at_level(logging.INFO, logger="plugin.progress"):
         for _ in range(10):
             p.tick()
-    progress_msgs = [r.getMessage() for r in caplog.records if "[progress] test" in r.getMessage()]
+    progress_msgs = [
+        r.getMessage() for r in caplog.records if "[progress] test" in r.getMessage()
+    ]
     # ticks at 2,4,6,8,10 → 5 emits
     assert len(progress_msgs) == 5
 
@@ -54,7 +56,9 @@ def test_progress_includes_rate_and_eta(caplog):
     with caplog.at_level(logging.INFO, logger="plugin.progress"):
         for _ in range(5):
             p.tick()
-    msg = next(r.getMessage() for r in caplog.records if "[progress] test" in r.getMessage())
+    msg = next(
+        r.getMessage() for r in caplog.records if "[progress] test" in r.getMessage()
+    )
     assert re.search(r"\d+\.\d+/s", msg), msg
     assert "ETA" in msg
 
@@ -69,7 +73,9 @@ def test_stormhub_tracker_picks_up_remaining(caplog):
             # final emit happens on __exit__
         assert t._start_remaining == 100
         assert t._last_remaining == 98
-    final = [r.getMessage() for r in caplog.records if "[progress] proc" in r.getMessage()]
+    final = [
+        r.getMessage() for r in caplog.records if "[progress] proc" in r.getMessage()
+    ]
     assert any("2/100 complete in" in m for m in final), final
 
 
@@ -78,5 +84,7 @@ def test_stormhub_tracker_no_lines_no_emit(caplog):
     with caplog.at_level(logging.INFO):
         with StormhubProgressTracker(label="proc", emit_every_s=3600):
             pass
-    progress_msgs = [r.getMessage() for r in caplog.records if "[progress] proc" in r.getMessage()]
+    progress_msgs = [
+        r.getMessage() for r in caplog.records if "[progress] proc" in r.getMessage()
+    ]
     assert progress_msgs == []

@@ -6,7 +6,7 @@ Emits to two destinations:
     A grep on ``[progress] <action>`` gives one line per emit per action.
   - a JSON snapshot at the path configured via ``configure_state_file()``,
     convention ``compute/outputs/<run-name>/progress.json``. Useful for
-    post-mortem inspection or for an external dashboard to poll.
+    post-mortem inspection or for an external monitor to poll.
 
 Two reporting flavors:
 
@@ -29,7 +29,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -55,8 +55,8 @@ def format_duration(seconds: float) -> str:
 
 # ─── State + JSON snapshot ───────────────────────────────────────────────────
 #
-# Module-level state holder + file writer. Single instance — there's only one
-# pipeline per process and the viewer expects one file per run.
+# Module-level state holder + file writer. Single instance — one pipeline
+# per process, so one JSON snapshot per run.
 
 
 _state_lock = threading.Lock()
@@ -68,7 +68,7 @@ _state: dict[str, Any] = {
     "completed_steps": [],
     "summary": None,
 }
-_state_file: Optional[Path] = None
+_state_file: Path | None = None
 _write_warned = False
 
 
@@ -89,7 +89,7 @@ def _flush() -> None:
     snap["elapsed_s"] = snap["now"] - snap["started_at"]
     try:
         # Write to a sibling temp file then rename — atomic from the reader's
-        # POV, so viewer never reads a half-written JSON.
+        # POV, so no one ever observes a half-written JSON.
         tmp = _state_file.with_suffix(_state_file.suffix + ".tmp")
         tmp.write_text(json.dumps(snap))
         tmp.replace(_state_file)
@@ -122,7 +122,10 @@ def step_done(i: int, n: int, name: str, duration_s: float) -> None:
         _state["completed_steps"].append(
             {"i": i, "n": n, "name": name, "duration_s": duration_s}
         )
-        if _state["current_step"] is not None and _state["current_step"]["name"] == name:
+        if (
+            _state["current_step"] is not None
+            and _state["current_step"]["name"] == name
+        ):
             _state["current_step"] = None
     _flush()
 
@@ -133,7 +136,9 @@ def set_summary(n_actions: int, total_s: float) -> None:
     _flush()
 
 
-def _push_progress(label: str, *, done: int, total: int, rate: float, eta_s: float) -> None:
+def _push_progress(
+    label: str, *, done: int, total: int, rate: float, eta_s: float
+) -> None:
     with _state_lock:
         _state["action_progress"][label] = {
             "done": done,
@@ -180,10 +185,7 @@ class Progress:
             return True
         if self.log_every_n is not None and self.done % self.log_every_n == 0:
             return True
-        if (
-            self.log_every_s is not None
-            and (now - self._last_emit) >= self.log_every_s
-        ):
+        if self.log_every_s is not None and (now - self._last_emit) >= self.log_every_s:
             return True
         return False
 

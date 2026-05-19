@@ -23,13 +23,11 @@ from typing import Any, Callable
 from cc.plugin_manager import PluginManager
 from stormhub.logger import initialize_logger
 
-from plugin.actions import (
-    convert_to_dss,
-    create_grid_file,
-    download_inputs,
-    process_storms,
-    upload_outputs,
-)
+from plugin.actions.convert_to_dss import convert_to_dss
+from plugin.actions.create_grid_file import create_grid_file
+from plugin.actions.download_inputs import download_inputs
+from plugin.actions.process_storms import process_storms
+from plugin.actions.upload_outputs import upload_outputs
 from plugin import progress
 from plugin.lib import RunContext, validate_payload
 from plugin.progress import format_duration

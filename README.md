@@ -65,6 +65,7 @@ stormhub/                 # forked upstream library (git submodule)
 ./run.py mirror [args]    # One-shot AORC zarr mirror (NOAA -> private S3)
 ./run.py lint             # ruff check + format check
 ./run.py format           # ruff format
+./run.py test [args...]   # pytest plugin/tests/ (extra args forward to pytest)
 ./run.py freeze           # Regenerate compute/constraints.txt
 ./run.py down             # docker compose down
 ./run.py clean            # Stop containers, drop volumes, clear compute/outputs/
@@ -104,6 +105,20 @@ Storm parameters are in `attributes`. All values are strings (CC SDK convention)
 | `num_workers` | no | auto | Parallel workers for storm search. Auto-sized from container memory (cgroup). Use `CC_NUM_WORKERS` env for a fleet default. Falls back to 1 worker when no memory limit is set. |
 | `input_path` | yes | | S3 path to watershed/transposition geometries |
 | `output_path` | yes | | S3 path for results |
+
+## Environment Variables
+
+The plugin reads its config from the payload; these env vars tune runtime
+behavior and are usually set in the manifest / compose env (Twelve-Factor).
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `LOG_LEVEL` | `INFO` | Root log level (`DEBUG`, `INFO`, `WARNING`, …). |
+| `LOG_FORMAT` | unset | Set to `json` for one-line JSON log records. |
+| `CC_NUM_WORKERS` | unset | Fleet default for `process-storms` worker count. Overridden by payload `num_workers` attr. |
+| `DSS_WORKERS` | `0` (= cpu_count) | Worker count for `convert-to-dss` process pool. |
+| `DSS_MAX_FAILURE_RATIO` | `0.5` | `convert-to-dss` hard-fails above this fraction. |
+| `GRID_MAX_FAILURE_RATIO` | `0.5` | `create-grid-file` hard-fails above this fraction. |
 
 ## Running Against HEC S3
 

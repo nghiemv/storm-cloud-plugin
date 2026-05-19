@@ -28,9 +28,19 @@ jobs:
       - run: ruff check plugin/
       - run: ruff format --check plugin/
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pyproj
+      - run: python -m pytest plugin/tests/ -v
+
   build:
     name: Build per-arch
-    needs: lint
+    needs: [lint, test]
     strategy:
       fail-fast: false
       matrix:

@@ -28,7 +28,7 @@ the file.
 `s3://$CC_AWS_S3_BUCKET/$CC_ROOT/`, sorts payloads by most recent first, and
 prompts you to pick. It then skips compose (no MinIO) and `docker run`s the
 image directly with the env vars from your `.env`. Progress JSON for each run
-lands in `compute/outputs/<UUID>/progress.json` so `./run.py viewer` still works.
+lands in `compute/outputs/<UUID>/progress.json` (or `<NAME>/` if you pass one).
 
 ## Run many jobs (batch)
 

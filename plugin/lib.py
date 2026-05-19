@@ -26,10 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from cc.plugin_manager import DataSourceOpInput
-
 if TYPE_CHECKING:
-    from plugin.actions.catalog import StormState
+    from plugin.actions.process_storms import StormState
     from plugin.actions.download_inputs import LocalInputs
 
 log = logging.getLogger(__name__)
@@ -163,6 +161,8 @@ def _with_retry(op: Callable[[], Any], *, description: str) -> Any:
 def download_to_local(
     pm: Any, *, source_name: str, pathkey: str, local_path: Path, description: str
 ) -> None:
+    from cc.plugin_manager import DataSourceOpInput
+
     op = DataSourceOpInput(name=source_name, pathkey=pathkey, datakey=None)
     _with_retry(
         lambda: pm.copy_file_to_local(ds=op, localpath=str(local_path)),
@@ -173,6 +173,8 @@ def download_to_local(
 def upload_from_local(
     pm: Any, *, source_name: str, pathkey: str, local_path: Path, description: str
 ) -> None:
+    from cc.plugin_manager import DataSourceOpInput
+
     op = DataSourceOpInput(name=source_name, pathkey=pathkey, datakey=None)
     _with_retry(
         lambda: pm.copy_file_to_remote(ds=op, localpath=str(local_path)),
