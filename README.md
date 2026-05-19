@@ -41,7 +41,6 @@ compute/                  # everything run.py needs — flat by intent
   compose.yaml            #   local MinIO dev stack
   dev.env                 #   fake MinIO creds (committed)
   hec.env.example         #   prod creds template — cp to hec.env (gitignored)
-  cc-manifest.example.json#   CC orchestrator deployment spec (reference)
   sample/                 #   canonical local-run inputs
     payload.json
     watershed-boundary.geojson
@@ -50,33 +49,16 @@ compute/                  # everything run.py needs — flat by intent
 stormhub/                 # forked upstream library (git submodule)
 ```
 
-## `run.py` Commands
+## `run.py`
 
-```bash
-./run.py                  # Local run with compute/sample/payload.json
-./run.py PAYLOAD          # Local run with a custom payload
-./run.py hec              # List HEC S3 payloads and pick one interactively
-./run.py hec UUID         # Run a specific HEC S3 payload by UUID
-./run.py batch [DIR]      # Multi-job HEC S3 driver (one subdir per job)
-./run.py build            # docker build the plugin image
-./run.py mirror [args]    # One-shot AORC zarr mirror (NOAA -> private S3)
-./run.py web [--port N]   # Browser UI: browse payloads, launch runs, watch progress
-./run.py lint             # ruff check + format check
-./run.py format           # ruff format
-./run.py test [args...]   # pytest plugin/tests/ (extra args forward to pytest)
-./run.py freeze           # Regenerate compute/constraints.txt
-./run.py down             # docker compose down
-./run.py clean            # Stop containers, drop volumes, clear compute/outputs/
-```
+Single Python file at the repo root, stdlib-only on the host (Docker for
+`build`/`run`; `s3fs`+`xarray` lazy-imported only for `mirror`). Run
+`./run.py help` for the full verb list. Categories: local/HEC runs, dev maint
+(`lint`/`format`/`test`/`freeze`), housekeeping (`down`/`clean`), and the
+browser UI (`web`).
 
-`run.py` is a single Python file at the repo root. Only required dependency
-is Python 3 (Docker for build/run subcommands; `s3fs` + `xarray` for `./run.py
-mirror`, lazy-imported only when invoked).
-
-**Cross-platform invocation:**
-- Linux / macOS: `./run.py <cmd>` (shebang + execute bit)
-- Windows cmd / PowerShell: `python run.py <cmd>`
-- Everywhere portable: `python run.py <cmd>`
+Cross-platform: `./run.py <cmd>` on Linux/macOS, `python run.py <cmd>` on
+Windows or anywhere portable.
 
 ## Custom Payloads
 
@@ -170,6 +152,33 @@ process — doesn't kill the run; logs land in
 `compute/outputs/<name>/launch.log`.
 
 Single file (`web.py`), stdlib only, binds to `127.0.0.1`. No auth.
+
+## Publishing to Cloud Compute
+
+When registering this plugin in CC's orchestrator catalog, submit a manifest
+shaped like:
+
+```json
+{
+  "name": "storm-cloud-plugin",
+  "image_and_tag": "ghcr.io/usace/storm-cloud-plugin:latest",
+  "description": "Creates storm catalogs from NOAA AORC precipitation data and converts to HEC-DSS files.",
+  "command": ["python3.12", "-u", "-m", "plugin"],
+  "compute_environment": [
+    { "resource_type": "vcpu", "value": "4" },
+    { "resource_type": "memory", "value": "8192" }
+  ],
+  "environment": {},
+  "credentials": {
+    "FFRD": {
+      "aws_access_key_id": "",
+      "aws_secret_access_key": "",
+      "aws_default_region": "us-east-1",
+      "aws_s3_bucket": ""
+    }
+  }
+}
+```
 
 ## Reproducing the OOM Failure Mode
 

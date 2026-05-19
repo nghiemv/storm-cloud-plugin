@@ -32,12 +32,18 @@ from plugin import progress
 from plugin.lib import RunContext, validate_payload
 from plugin.progress import format_duration
 
+_ACTIONS: tuple[Callable[[RunContext], None], ...] = (
+    download_inputs,
+    process_storms,
+    convert_to_dss,
+    create_grid_file,
+    upload_outputs,
+)
+
+# Payloads use kebab-case action names ("download-inputs"); the Python
+# function uses snake_case. They are 1:1 by convention — keep them so.
 ACTION_DISPATCH: dict[str, Callable[[RunContext], None]] = {
-    "download-inputs": download_inputs,
-    "process-storms": process_storms,
-    "convert-to-dss": convert_to_dss,
-    "create-grid-file": create_grid_file,
-    "upload-outputs": upload_outputs,
+    fn.__name__.replace("_", "-"): fn for fn in _ACTIONS
 }
 
 
