@@ -12,7 +12,12 @@ from typing import Any
 
 from stormhub.met.storm_catalog import StormCatalog, new_catalog, new_collection
 
-from plugin.actions import parallel_threads, vectorized_scan, vectorized_transpose
+from plugin.actions import (
+    cumsum_scan,
+    parallel_threads,
+    vectorized_scan,
+    vectorized_transpose,
+)
 from plugin.lib import RunContext
 from plugin.progress import StormhubProgressTracker
 from plugin.workers import resolve_num_workers
@@ -141,6 +146,13 @@ def process_storms(ctx: RunContext) -> None:
             parallel_threads.install()
         if vectorized_scan.enabled():
             vectorized_scan.install()
+        # cumsum_scan (CC_CUMSUM_SCAN=1) is mutually exclusive with the
+        # per-date pipeline: it monkey-patches collect_event_stats to
+        # bypass storm_search entirely and run a single in-memory cumsum
+        # per year. ~30-50× expected speedup; opt-in until parity is
+        # validated against an upstream baseline.
+        if cumsum_scan.enabled():
+            cumsum_scan.install()
         try:
             with StormhubProgressTracker(label="process-storms"):
                 collection = new_collection(catalog, **params)
@@ -151,6 +163,7 @@ def process_storms(ctx: RunContext) -> None:
                 "CC_NUM_WORKERS env."
             ) from e
         finally:
+            cumsum_scan.restore()
             vectorized_scan.restore()
             vectorized_transpose.restore()
             parallel_threads.restore()
