@@ -29,7 +29,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import logging
 import os
 import shutil
 import subprocess
@@ -418,113 +417,52 @@ def cmd_batch(args: list[str]) -> None:
 def cmd_mirror(args: list[str]) -> None:
     """Mirror AORC zarr data from NOAA public S3 to a private cache.
 
-    One-shot. Subsequent runs skip years already mirrored. Required env:
-    MIRROR_AWS_ACCESS_KEY_ID, MIRROR_AWS_SECRET_ACCESS_KEY,
-    MIRROR_AWS_ENDPOINT (default: https://s3.hecdev.net).
+    Delegates to ``python -m plugin.cli mirror`` inside the plugin image so
+    the host only needs Python + Docker (s3fs + xarray live in the image,
+    not on the host). Subsequent runs skip years already mirrored.
+
+    Required env (read from compute/hec/env):
+      MIRROR_AWS_ACCESS_KEY_ID, MIRROR_AWS_SECRET_ACCESS_KEY,
+      MIRROR_AWS_ENDPOINT (default: https://s3.hecdev.net).
     """
-    import argparse as _ap
-
-    LON_MIN, LON_MAX = -97.2, -77.4
-    LAT_MIN, LAT_MAX = 33.3, 44.1
-    VARIABLES = ["APCP_surface", "TMP_2maboveground"]
-    NOAA_BASE = "s3://noaa-nws-aorc-v1-1-1km"
-    YEAR_START, YEAR_END = 1979, 2024
-
-    p = _ap.ArgumentParser(
-        prog="./run.py mirror",
-        description=cmd_mirror.__doc__,
-        formatter_class=_ap.RawDescriptionHelpFormatter,
-    )
-    p.add_argument("--year-start", type=int, default=YEAR_START, metavar="YEAR")
-    p.add_argument("--year-end", type=int, default=YEAR_END, metavar="YEAR")
-    p.add_argument(
-        "--dest-base", default="s3://storm-cloud/aorc-cache", metavar="S3_URI"
-    )
-    p.add_argument("--dry-run", action="store_true", help="plan without writing")
-    opts = p.parse_args(args)
-
-    _load_hec_env()  # picks up MIRROR_AWS_* if defined in compute/hec/env
-    try:
-        import s3fs
-        import xarray as xr
-    except ImportError:
-        print(
-            "./run.py mirror needs s3fs + xarray. Install with:\n"
-            "    pip install s3fs xarray",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        stream=sys.stdout,
-    )
-    log = logging.getLogger("mirror")
-
-    key = os.environ["MIRROR_AWS_ACCESS_KEY_ID"]
-    secret = os.environ["MIRROR_AWS_SECRET_ACCESS_KEY"]
-    endpoint = os.environ.get("MIRROR_AWS_ENDPOINT", "https://s3.hecdev.net")
-
-    src_fs = s3fs.S3FileSystem(anon=True, config_kwargs={"max_pool_connections": 50})
-    dst_fs = s3fs.S3FileSystem(
-        anon=False,
-        key=key,
-        secret=secret,
-        endpoint_url=endpoint,
-        config_kwargs={"max_pool_connections": 20},
-    )
-
-    def year_done(dest_path):
-        return dst_fs.exists(dest_path.replace("s3://", "") + "/.zmetadata")
-
-    failed = []
-    for year in range(opts.year_start, opts.year_end + 1):
-        src_path = f"{NOAA_BASE}/{year}.zarr"
-        dst_path = f"{opts.dest_base}/{year}.zarr"
-        try:
-            if year_done(dst_path):
-                log.info("[%d] already cached — skip", year)
-                continue
-            log.info("[%d] opening %s", year, src_path)
-            ds = xr.open_dataset(
-                s3fs.S3Map(root=src_path, s3=src_fs, check=False),
-                engine="zarr",
-                chunks="auto",
-                consolidated=True,
+    _load_hec_env()
+    for required in ("MIRROR_AWS_ACCESS_KEY_ID", "MIRROR_AWS_SECRET_ACCESS_KEY"):
+        if not os.environ.get(required):
+            print(
+                f"Error: {required} not set. Add it to compute/hec/env "
+                "(typically mirror your SC_AWS_* values).",
+                file=sys.stderr,
             )
-            ds = ds[VARIABLES].sel(
-                longitude=slice(LON_MIN, LON_MAX),
-                latitude=slice(LAT_MIN, LAT_MAX),
-            )
-            n_lat = ds.sizes.get("latitude", 1)
-            n_lon = ds.sizes.get("longitude", 1)
-            ds = ds.chunk({"time": 24, "latitude": n_lat, "longitude": n_lon})
-            log.info(
-                "[%d] clipped: time=%d lat=%d lon=%d",
-                year,
-                ds.sizes.get("time", 0),
-                n_lat,
-                n_lon,
-            )
-            if opts.dry_run:
-                log.info("[%d] dry-run — skip write", year)
-                continue
-            log.info("[%d] writing to %s", year, dst_path)
-            ds.to_zarr(
-                s3fs.S3Map(root=dst_path, s3=dst_fs, check=False),
-                mode="w",
-                consolidated=True,
-            )
-            log.info("[%d] done", year)
-        except Exception:
-            log.exception("[%d] failed", year)
-            failed.append(year)
+            sys.exit(1)
 
-    if failed:
-        log.error("failed years: %s", failed)
-        sys.exit(1)
-    log.info("mirror complete (%d–%d)", opts.year_start, opts.year_end)
+    forwarded = (
+        "MIRROR_AWS_ACCESS_KEY_ID",
+        "MIRROR_AWS_SECRET_ACCESS_KEY",
+        "MIRROR_AWS_ENDPOINT",
+    )
+    # Stream output live (no capture) so the user sees per-year progress
+    # while the long-running mirror runs.
+    docker_args = [
+        "docker",
+        "run",
+        "--rm",
+        "--entrypoint",
+        "python3.12",
+        *[
+            arg
+            for k in forwarded
+            if os.environ.get(k)
+            for arg in ("-e", f"{k}={os.environ[k]}")
+        ],
+        IMAGE,
+        "-m",
+        "plugin.cli",
+        "mirror",
+        *args,
+    ]
+    r = subprocess.run(docker_args, cwd=ROOT)
+    if r.returncode != 0:
+        sys.exit(r.returncode)
 
 
 # ─── dev maintenance ─────────────────────────────────────────────────────────

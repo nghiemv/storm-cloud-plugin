@@ -10,6 +10,10 @@ Subcommands:
                            start_date, end_date, storm_duration, top_n_events.
     upload-batch <DIR>     each <DIR>/<jobname>/compute-manifest.json is staged
                            to s3://$CC_AWS_S3_BUCKET/manifests/<uuid>/payload.
+    mirror [--year-start Y] [--year-end Y] [--dest-base URI] [--dry-run]
+                           Mirror NOAA AORC zarr years into a private cache.
+                           Reads from MIRROR_AWS_* env. Skips years already
+                           present (checks for .zmetadata).
 
 All S3 wiring reads CC_AWS_* from the environment (forwarded by run.py).
 """
@@ -17,6 +21,7 @@ All S3 wiring reads CC_AWS_* from the environment (forwarded by run.py).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -116,6 +121,129 @@ def _cmd_upload_batch(batch_dir: str) -> int:
     return 0
 
 
+def _cmd_mirror(argv: list[str]) -> int:
+    """Mirror NOAA AORC zarr years to a private cache.
+
+    Runs inside the plugin image (s3fs + xarray are baked in), so the host
+    needs only Python + Docker. Reads ``MIRROR_AWS_ACCESS_KEY_ID`` /
+    ``MIRROR_AWS_SECRET_ACCESS_KEY`` / ``MIRROR_AWS_ENDPOINT`` for the
+    write target. Source is NOAA's public bucket (anonymous).
+
+    The image-wide default scheduler is ``synchronous`` (set in Dockerfile
+    to cap memory during the plugin's process-storms scan loop). For bulk
+    mirroring we override to ``threads`` so dask reads/writes many zarr
+    chunks in parallel — without this, sustained throughput is ~440 KB/s
+    (one chunk RTT at a time) instead of tens of MB/s.
+    """
+    import argparse
+
+    # Must be set BEFORE importing dask-using libs so the global scheduler
+    # picks it up.
+    os.environ["DASK_SCHEDULER"] = os.environ.get(
+        "MIRROR_DASK_SCHEDULER", "threads"
+    )
+
+    import dask
+    import s3fs
+    import xarray as xr
+
+    dask.config.set(scheduler=os.environ["DASK_SCHEDULER"])
+
+    LON_MIN, LON_MAX = -97.2, -77.4
+    LAT_MIN, LAT_MAX = 33.3, 44.1
+    VARIABLES = ["APCP_surface", "TMP_2maboveground"]
+    NOAA_BASE = "s3://noaa-nws-aorc-v1-1-1km"
+
+    p = argparse.ArgumentParser(prog="plugin.cli mirror")
+    p.add_argument("--year-start", type=int, default=1979)
+    p.add_argument("--year-end", type=int, default=2024)
+    p.add_argument("--dest-base", default="s3://storm-cloud/aorc-cache")
+    p.add_argument("--dry-run", action="store_true")
+    opts = p.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        stream=sys.stdout,
+    )
+    log = logging.getLogger("mirror")
+
+    key = os.environ["MIRROR_AWS_ACCESS_KEY_ID"]
+    secret = os.environ["MIRROR_AWS_SECRET_ACCESS_KEY"]
+    endpoint = os.environ.get("MIRROR_AWS_ENDPOINT", "https://s3.hecdev.net")
+
+    src_fs = s3fs.S3FileSystem(anon=True, config_kwargs={"max_pool_connections": 50})
+    dst_fs = s3fs.S3FileSystem(
+        anon=False,
+        key=key,
+        secret=secret,
+        endpoint_url=endpoint,
+        config_kwargs={"max_pool_connections": 20},
+    )
+
+    def year_done(dest_path: str) -> bool:
+        return dst_fs.exists(dest_path.replace("s3://", "") + "/.zmetadata")
+
+    failed: list[int] = []
+    for year in range(opts.year_start, opts.year_end + 1):
+        src_path = f"{NOAA_BASE}/{year}.zarr"
+        dst_path = f"{opts.dest_base}/{year}.zarr"
+        try:
+            if year_done(dst_path):
+                log.info("[%d] already cached — skip", year)
+                continue
+            log.info("[%d] opening %s", year, src_path)
+            ds = xr.open_dataset(
+                s3fs.S3Map(root=src_path, s3=src_fs, check=False),
+                engine="zarr",
+                chunks="auto",
+                consolidated=True,
+            )
+            ds = ds[VARIABLES].sel(
+                longitude=slice(LON_MIN, LON_MAX),
+                latitude=slice(LAT_MIN, LAT_MAX),
+            )
+            # Keep source-aligned chunking so to_zarr streams chunk-to-chunk
+            # instead of buffering the whole year. NOAA uses (144, 128, 256);
+            # rechunking to anything else (e.g. time=24, lat=full) forces
+            # dask to read all source chunks before the first write — that's
+            # what made the previous attempt sit at ~470 KB/s. We still pop
+            # the encoded chunks so safe_chunks doesn't trip on a phantom
+            # post-clip mismatch.
+            ds = ds.chunk({"time": 144, "latitude": 128, "longitude": 256})
+            for var in ds.data_vars:
+                ds[var].encoding.pop("chunks", None)
+            for coord in ds.coords:
+                ds[coord].encoding.pop("chunks", None)
+            log.info(
+                "[%d] clipped: time=%d lat=%d lon=%d",
+                year,
+                ds.sizes.get("time", 0),
+                ds.sizes.get("latitude", 0),
+                ds.sizes.get("longitude", 0),
+            )
+            if opts.dry_run:
+                log.info("[%d] dry-run — skip write", year)
+                continue
+            log.info("[%d] writing to %s", year, dst_path)
+            ds.to_zarr(
+                s3fs.S3Map(root=dst_path, s3=dst_fs, check=False),
+                mode="w",
+                consolidated=True,
+                safe_chunks=False,
+            )
+            log.info("[%d] done", year)
+        except Exception:
+            log.exception("[%d] failed", year)
+            failed.append(year)
+
+    if failed:
+        log.error("failed years: %s", failed)
+        return 1
+    log.info("mirror complete (%d–%d)", opts.year_start, opts.year_end)
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print(__doc__, file=sys.stderr)
@@ -125,6 +253,8 @@ def main() -> int:
         return _cmd_list_payloads()
     if cmd == "upload-batch" and len(args) == 1:
         return _cmd_upload_batch(args[0])
+    if cmd == "mirror":
+        return _cmd_mirror(args)
     print(f"unknown command or wrong arg count: {cmd} {args}", file=sys.stderr)
     print(__doc__, file=sys.stderr)
     return 2
