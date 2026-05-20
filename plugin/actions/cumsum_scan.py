@@ -5,22 +5,31 @@ storm-date and sums them. With ``check_every_n_hours`` < ``storm_duration``
 consecutive windows overlap heavily — each hour of data gets read and
 summed roughly ``storm_duration / check_every_n_hours`` times.
 
-This module loads each year's transposition-bbox precip into memory
-once, computes a cumulative sum along the time axis, and derives each
-storm-date's window sum as a single subtraction:
-``window_sum = cumsum[t_end + 1] - cumsum[t_start]``. Per-date work is
-then just ``fftconvolve`` + argmax + stats (a few ms).
+This module sweeps each year once. For every storm-date we only need
+two snapshots of the running cumulative sum (one at the window start,
+one just past the window end), so the algorithm is:
 
-Bit-for-bit parity with the upstream pipeline at valid shifts:
-``valid_shifts`` is computed once from a 2D template that has the
-correct NaN pattern (rio.clip output), then cached. At every valid
-shift, the watershed window only covers cells that were finite in the
-original data, so treating NaN as 0 in the cumsum does not perturb the
-mean (mean is computed via numpy masked_array reduction on cells
-selected by ``watershed_mask_clipped`` only).
+1. For each year, compute the set of "times of interest" — for each
+   storm-date ``d``, ``i_start = idx_of(d + 1h)`` and ``i_end1 = idx_of(d + D) + 1``.
+2. Stream the year's transposition-bbox precip in time-chunks
+   (default 720h = 1 month). Maintain a running cumulative sum
+   ``(Y, X) float64``. Whenever the stream passes a time-of-interest,
+   snapshot the running sum.
+3. For each storm-date: ``window_sum = snapshot[i_end1] - snapshot[i_start]``,
+   feed into the reused ``Transpose`` object, write CSV row.
 
-Gating: opt-in via ``CC_CUMSUM_SCAN=1``. Patches stormhub's
-``collect_event_stats`` so ``new_collection`` picks it up transparently.
+Peak memory is bounded by one chunk + the snapshot pool (~3 GB for a
+1000×1000 transposition bbox), not by the full-year cube (which would
+be tens of GB for large domains).
+
+Bit-equivalent to upstream at valid shifts. ``valid_shifts`` is
+computed once from a 2D template that has the rio.clip NaN pattern.
+At any valid shift the watershed window only overlaps cells that were
+finite in the original data, so treating NaN as 0 in the running sum
+cannot perturb any mean we'll actually emit.
+
+Gating: opt-in via ``CC_CUMSUM_SCAN=1``. Chunk size: ``CC_CUMSUM_CHUNK_HOURS``
+(default 720).
 """
 
 from __future__ import annotations
@@ -48,6 +57,8 @@ def enabled() -> bool:
     )
 
 
+_CHUNK_HOURS = int(os.environ.get("CC_CUMSUM_CHUNK_HOURS", "720"))
+
 _original_collect_event_stats: Callable | None = None
 
 
@@ -60,7 +71,10 @@ def install() -> None:
         return
     _original_collect_event_stats = sc_mod.collect_event_stats
     sc_mod.collect_event_stats = cumsum_collect_event_stats
-    log.info("Cumsum-based AORC scan installed (CC_CUMSUM_SCAN=1)")
+    log.info(
+        "Cumsum-based AORC scan installed (CC_CUMSUM_SCAN=1, chunk=%dh)",
+        _CHUNK_HOURS,
+    )
 
 
 def restore() -> None:
@@ -85,10 +99,9 @@ def cumsum_collect_event_stats(
 ) -> None:
     """Drop-in replacement for ``stormhub.met.storm_catalog.collect_event_stats``.
 
-    Single-process for the v0 prototype. Memory is bounded to one year
-    of transposition-bbox data at a time (~1-5 GB depending on payload).
-    Parallelization across years can be added later if the single-process
-    throughput proves insufficient.
+    Streams each year's transposition-bbox precip in 1-month chunks,
+    accumulating a running cumulative sum and snapshotting it at the
+    indices each storm-date needs. Memory bounded to ~one chunk's worth.
     """
     from shapely.geometry import shape
     from stormhub.met.consts import (
@@ -112,8 +125,6 @@ def cumsum_collect_event_stats(
     transposition_geom = shape(catalog.valid_transposition_region.geometry)
     bounds = transposition_geom.bounds
 
-    # Group dates by storm-start year. Cross-year storm windows are
-    # handled by also loading the next year's data when needed.
     by_year: dict[int, list] = defaultdict(list)
     for d in event_dates:
         by_year[d.year].append(d)
@@ -125,14 +136,14 @@ def cumsum_collect_event_stats(
 
     for year in sorted(by_year.keys()):
         dates_in_year = sorted(by_year[year])
-        t_load = time.monotonic()
+        t_year = time.monotonic()
 
-        # Determine year range needed: storm windows may cross year boundary.
+        # Open year(s) — cross-year storm windows need year+1 too.
         max_end = max(d + datetime.timedelta(hours=storm_duration) for d in dates_in_year)
         years_needed = list(range(year, max_end.year + 1))
         paths = tuple(f"{NOAA_AORC_S3_BASE_URL}/{y}.zarr" for y in years_needed)
         log.info(
-            "[cumsum-scan] year=%s loading paths=%s (%d dates)",
+            "[cumsum-scan] year=%s opening %s for %d dates",
             year, paths, len(dates_in_year),
         )
 
@@ -141,78 +152,118 @@ def cumsum_collect_event_stats(
             longitude=slice(bounds[0], bounds[2]),
             latitude=slice(bounds[1], bounds[3]),
         )
+        # rio.clip is eager — masks outside-polygon cells with NaN but
+        # the lazy structure is preserved if the source was dask-backed.
         precip_da = precip_da.rio.clip(
             [transposition_geom], drop=True, all_touched=True
         )
 
+        T = precip_da.sizes["time"]
+        Y = precip_da.sizes["latitude"]
+        X = precip_da.sizes["longitude"]
         log.info(
-            "[cumsum-scan] year=%d clipped time=%d lat=%d lon=%d",
-            year,
-            precip_da.sizes["time"],
-            precip_da.sizes["latitude"],
-            precip_da.sizes["longitude"],
-        )
-        precip = precip_da.compute().values  # (T, Y, X) float32
-        log.info(
-            "[cumsum-scan] year=%d in-memory %.2f GB, loaded in %.1fs",
-            year, precip.nbytes / 1e9, time.monotonic() - t_load,
+            "[cumsum-scan] year=%d clipped time=%d lat=%d lon=%d (~%.1f GB cube avoided)",
+            year, T, Y, X, T * Y * X * 4 / 1e9,
         )
 
-        # NaN → 0 for cumsum accumulation. At valid_shifts (computed
-        # once from the rio-clipped template below) no watershed cell
-        # ever overlaps an originally-NaN cell, so this substitution
-        # cannot perturb any mean we'll actually compute.
-        t_cs = time.monotonic()
-        precip_filled = np.where(np.isfinite(precip), precip, 0.0)
-        # Float64 accumulator → float32 result for memory.
-        # cumsum[t] = sum precip[0..t-1], so window [i0..i1] = cumsum[i1+1] - cumsum[i0].
-        cumsum = np.empty(
-            (precip.shape[0] + 1, precip.shape[1], precip.shape[2]),
-            dtype=np.float32,
-        )
-        cumsum[0] = 0.0
-        np.cumsum(precip_filled, axis=0, dtype=np.float64, out=cumsum[1:])
-        del precip_filled
-        log.info("[cumsum-scan] year=%d cumsum in %.1fs", year, time.monotonic() - t_cs)
-
-        # Build the time → index map. Storm window in the upstream
-        # pipeline is sel(time=slice(start+1h, end)); both ends inclusive.
-        times = precip_da.time.values
+        # Map zarr-time to integer index using a small probe.
+        times_np = precip_da.time.values
         time_to_idx: dict[datetime.datetime, int] = {}
-        for i, t in enumerate(times):
-            # np.datetime64 → python datetime (UTC-naive, matching event_dates)
+        for i, t in enumerate(times_np):
             ts = (t - np.datetime64("1970-01-01T00:00:00")) / np.timedelta64(1, "s")
             time_to_idx[datetime.datetime.utcfromtimestamp(float(ts))] = i
 
-        # Construct Transpose from a 2D template that has the correct
-        # NaN pattern. valid_shifts and watershed_mask are computed on
-        # first access and then cached; we swap in cumsum-derived
-        # window sums per date without rebuilding them.
-        template = precip_da.isel(time=0)
-        transpose_obj = Transpose(
-            template, watershed_geom, "longitude", "latitude"
-        )
-        _ = transpose_obj.valid_shifts  # warm cache with correct NaN-mask
-
-        for storm_start in dates_in_year:
-            start_t = storm_start + datetime.timedelta(hours=1)
-            end_t = storm_start + datetime.timedelta(hours=storm_duration)
+        # Build the set of cumsum-indices each date needs.
+        date_to_io = {}
+        toi: set[int] = {0}  # snapshot[0] = zeros (used as the lower edge for early-year windows)
+        for d in dates_in_year:
+            start_t = d + datetime.timedelta(hours=1)
+            end_t = d + datetime.timedelta(hours=storm_duration)
             i0 = time_to_idx.get(start_t)
             i1 = time_to_idx.get(end_t)
             if i0 is None or i1 is None:
+                continue
+            date_to_io[d] = (i0, i1 + 1)
+            toi.add(i0)
+            toi.add(i1 + 1)
+        toi_sorted = sorted(toi)
+        log.info(
+            "[cumsum-scan] year=%d %d snapshots over T=%d",
+            year, len(toi_sorted), T,
+        )
+
+        # Stream the precip cube in CC_CUMSUM_CHUNK_HOURS slabs, maintain
+        # a running cumulative sum, snapshot at each time-of-interest.
+        running = np.zeros((Y, X), dtype=np.float64)
+        snapshots: dict[int, np.ndarray] = {0: running.copy()}
+        t_stream = time.monotonic()
+        bytes_streamed = 0
+        next_toi_idx = 1  # toi_sorted[0] == 0, already snapshotted
+
+        chunk_h = _CHUNK_HOURS
+        for chunk_start in range(0, T, chunk_h):
+            chunk_end = min(chunk_start + chunk_h, T)
+            t_chunk_load = time.monotonic()
+            chunk = (
+                precip_da.isel(time=slice(chunk_start, chunk_end))
+                .compute()
+                .values
+            )  # (chunk_h, Y, X) float32
+            bytes_streamed += chunk.nbytes
+
+            chunk_filled = np.where(np.isfinite(chunk), chunk, 0.0).astype(np.float64)
+            chunk_cum = np.cumsum(chunk_filled, axis=0)
+            del chunk, chunk_filled
+
+            # Snapshot any time-of-interest that falls in (chunk_start, chunk_end].
+            # cumsum[t] = sum precip[0..t-1] = running (sum before chunk) + chunk_cum[t - chunk_start - 1].
+            while next_toi_idx < len(toi_sorted):
+                t_idx = toi_sorted[next_toi_idx]
+                if t_idx <= chunk_start:
+                    # already past, snapshot already taken (or t_idx=0)
+                    next_toi_idx += 1
+                    continue
+                if t_idx > chunk_end:
+                    break
+                local = t_idx - chunk_start - 1  # 0..chunk_cum.shape[0]-1
+                snapshots[t_idx] = running + chunk_cum[local]
+                next_toi_idx += 1
+
+            running = running + chunk_cum[-1]
+            del chunk_cum
+
+            log.debug(
+                "[cumsum-scan] year=%d chunk %d-%d loaded in %.1fs",
+                year, chunk_start, chunk_end, time.monotonic() - t_chunk_load,
+            )
+
+        log.info(
+            "[cumsum-scan] year=%d stream done %.1fs (%.1f GB read, %d snapshots)",
+            year,
+            time.monotonic() - t_stream,
+            bytes_streamed / 1e9,
+            len(snapshots),
+        )
+
+        # Build Transpose from a 2D template with the rio.clip NaN pattern.
+        # valid_shifts + watershed_mask are computed once and reused as we
+        # swap in cumsum-derived window sums.
+        template = precip_da.isel(time=0).compute()
+        transpose_obj = Transpose(
+            template, watershed_geom, "longitude", "latitude"
+        )
+        _ = transpose_obj.valid_shifts
+
+        t_dates = time.monotonic()
+        for storm_start in dates_in_year:
+            io = date_to_io.get(storm_start)
+            if io is None:
                 skipped += 1
                 continue
+            i0, i1p1 = io
+            window_sum = snapshots[i1p1] - snapshots[i0]
 
-            # Window sum: sum precip[i0..i1] inclusive
-            window_sum = cumsum[i1 + 1] - cumsum[i0]
-            # Restore NaN where the original data was NaN (outside
-            # transposition polygon). valid_shifts is already cached, so
-            # this is purely so _create_stats's nanmean does the right
-            # thing if a watershed cell happens to sit on a NaN — which
-            # by construction at valid_shifts it won't, but defense.
-            window_sum_for_transpose = window_sum.astype(np.float64, copy=False)
-
-            transpose_obj._np_data_array = window_sum_for_transpose
+            transpose_obj._np_data_array = window_sum  # float64
             poly, _aff, stats = transpose_obj.max_transpose(_create_stats)
             centroid = poly.centroid
 
@@ -224,7 +275,7 @@ def cumsum_collect_event_stats(
             with open(csv_path, "a", encoding="utf-8") as f:
                 f.write(line)
             completed += 1
-            if completed % 250 == 0:
+            if completed % 500 == 0:
                 rate = completed / (time.monotonic() - t_overall)
                 eta_s = (total - completed) / rate if rate else 0
                 log.info(
@@ -232,7 +283,16 @@ def cumsum_collect_event_stats(
                     completed, total, rate, eta_s / 3600, skipped,
                 )
 
-        del precip, cumsum, transpose_obj
+        log.info(
+            "[cumsum-scan] year=%d per-date pass: %.1fs (%d dates, %.3fs/date) — year total %.1fs",
+            year,
+            time.monotonic() - t_dates,
+            len(date_to_io),
+            (time.monotonic() - t_dates) / max(1, len(date_to_io)),
+            time.monotonic() - t_year,
+        )
+
+        del snapshots, running, transpose_obj
         gc.collect()
 
     log.info(
