@@ -73,6 +73,20 @@ log = logging.getLogger(__name__)
 # dask's own caches, so 2 is a safe bound for the rare cross-year sweep.
 _YEAR_CACHE_SIZE = 2
 
+# How many storm-end-times to materialize per ``.compute()`` call.
+#
+# Peak memory of the materialized batch is N × lat × lon × 4B. For a
+# transposition box like indian-creek (~800×400 cells, ~1 MB/slice),
+# 1500 dates ≈ 1.5 GB — fits inside the 4 GB/worker budget while
+# capturing all dates from a typical year in one batch. Within-year
+# batches amortize chunk reads (one zarr pass per .compute()), so
+# sizing the batch to cover the year's dates is what unlocks the
+# vectorized speedup.
+#
+# Larger transposition domains may need a smaller batch; override via
+# CC_VECTORIZED_BATCH_SIZE.
+_BATCH_SIZE = int(os.environ.get("CC_VECTORIZED_BATCH_SIZE", "1500"))
+
 
 def vectorized_collect_event_stats(
     event_dates: list[Any],
@@ -111,57 +125,92 @@ def vectorized_collect_event_stats(
         transposition_geom=transposition_geom,
     )
 
+    # Group dates by year so we materialize one year's rolling-sum slices
+    # at a time. Within a year we further split into batches sized to
+    # keep peak memory bounded — each batch is one ``.compute()`` call
+    # whose result is N × lat × lon × 4B in RAM.
+    by_year: dict[int, list] = {}
+    for d in event_dates:
+        end_time = d + timedelta(hours=storm_duration)
+        by_year.setdefault(end_time.year, []).append(d)
+
     remaining = len(event_dates)
     with output_csv.open("a", encoding="utf-8") as fp:
-        for date in event_dates:
-            try:
-                result = _scan_one_window(
-                    date,
-                    storm_duration,
-                    catalog,
-                    collection_id,
-                    watershed,
-                    valid_transposition,
-                    cache,
-                )
-                if result is not None:
-                    fp.write(storm_search_results_to_csv_line(result))
-                    fp.flush()
+        for year in sorted(by_year):
+            dates_in_year = by_year[year]
+            for batch_start in range(0, len(dates_in_year), _BATCH_SIZE):
+                batch = dates_in_year[batch_start : batch_start + _BATCH_SIZE]
+                end_times = [d + timedelta(hours=storm_duration) for d in batch]
                 log.info(
-                    "%s processed (%d remaining)",
-                    date.strftime("%Y-%m-%dT%H"),
-                    remaining,
+                    "[vectorized] year %d batch %d-%d (%d dates) — computing",
+                    year,
+                    batch_start,
+                    batch_start + len(batch) - 1,
+                    len(batch),
                 )
-            except Exception as exc:
-                if with_tb:
-                    import traceback
-
-                    log.error(
-                        "Error processing %s: %s\n%s",
-                        date,
-                        exc,
-                        traceback.format_exc(),
+                try:
+                    materialized = cache.materialize_dates(end_times)
+                except KeyError:
+                    # End-time falls in min_periods-NaN region; skip whole batch.
+                    log.warning(
+                        "[vectorized] year %d: skipping batch with pre-window dates",
+                        year,
                     )
-                else:
-                    log.error("Error processing %s: %s", date, exc)
-            finally:
-                remaining -= 1
+                    remaining -= len(batch)
+                    continue
+
+                for i, date in enumerate(batch):
+                    try:
+                        slice_2d = materialized.isel(time=i)
+                        result = _scan_one_window_with_slice(
+                            date,
+                            storm_duration,
+                            catalog,
+                            collection_id,
+                            watershed,
+                            valid_transposition,
+                            slice_2d,
+                        )
+                        if result is not None:
+                            fp.write(storm_search_results_to_csv_line(result))
+                            fp.flush()
+                        log.info(
+                            "%s processed (%d remaining)",
+                            date.strftime("%Y-%m-%dT%H"),
+                            remaining,
+                        )
+                    except Exception as exc:
+                        if with_tb:
+                            import traceback
+
+                            log.error(
+                                "Error processing %s: %s\n%s",
+                                date,
+                                exc,
+                                traceback.format_exc(),
+                            )
+                        else:
+                            log.error("Error processing %s: %s", date, exc)
+                    finally:
+                        remaining -= 1
 
 
-def _scan_one_window(
+def _scan_one_window_with_slice(
     storm_start_date: Any,
     storm_duration: int,
     catalog: Any,
     collection_id: str,
     watershed: Any,
     valid_transposition: Any,
-    cache: _YearlyRollingSumCache,
+    summed_2d: xr.DataArray,
 ) -> dict | None:
-    """Compute one storm window's stats using the cached rolling sum."""
-    summed_2d = cache.get_window(storm_start_date)
-    if summed_2d is None:
-        return None  # window straddles year start or pre-data
+    """Run max_transpose on an already-materialized 2D cumulative-precip map.
 
+    The caller has already computed the rolling-sum slice for this
+    storm window (in a batch ``.compute()``); we just hand it to a
+    normally-constructed AORCItem and let stormhub's spatial search
+    run unchanged.
+    """
     item_id = storm_start_date.strftime("%Y-%m-%dT%H")
     item_dir = catalog.spm.collection_item_dir(collection_id, item_id)
     item = AORCItem(
@@ -242,7 +291,7 @@ class _YearlyRollingSumCache:
 
     def _build_year(self, year: int) -> xr.DataArray:
         path = f"{self._aorc_base}/{year}.zarr"
-        log.info("[vectorized] opening %s", path)
+        log.info("[vectorized] opening %s (lazy)", path)
         ds = xr.open_dataset(
             s3fs.S3Map(root=path, s3=self._s3, check=False),
             engine="zarr",
@@ -260,11 +309,38 @@ class _YearlyRollingSumCache:
         # are NaN, matching the upstream behavior of not processing
         # storm-starts so early that a 72h window would overrun
         # available data.
+        # Stay LAZY here. Eagerly computing the whole year was tempting
+        # (one chunk-read pass per year) but for typical USACE
+        # transposition regions (indian-creek's clipped bounds are 6.7°
+        # × 3.4° ≈ 800×400 cells), 8760h × 800 × 400 × 4B ≈ 11 GB just
+        # for the source slice and another ~11 GB for the rolling
+        # result — OOMs in a 30 GB container, especially with the
+        # parallel mirror also running.
+        #
+        # Amortization happens caller-side via ``materialize_dates``,
+        # which batches dates and runs a single ``.compute()`` per
+        # batch. That lets dask plan chunk reads across the batch
+        # (its only cross-call amortization point) while keeping
+        # peak memory bounded to batch_size × lat × lon × 4B.
         return (
             clipped[AORC_PRECIP_VARIABLE]
             .rolling(time=self._storm_duration_h, min_periods=self._storm_duration_h)
             .sum()
         )
+
+    def materialize_dates(self, end_times: list) -> xr.DataArray:
+        """Eagerly compute rolling-sum 2D maps for a batch of end-times.
+
+        ``rolling.sel(time=[t1, t2, ...]).compute()`` plans chunk reads
+        across the whole batch — that's the only point at which dask
+        amortizes across an otherwise lazy graph. Caller batches dates
+        to a memory-safe size.
+        """
+        if not end_times:
+            raise ValueError("end_times must be non-empty")
+        # Caller guarantees all end_times share a year (one rolling per year).
+        rolled = self._get_year(end_times[0].year)
+        return rolled.sel(time=end_times).compute()
 
 
 # ── Public API: enable / disable the patch ──────────────────────────────────
