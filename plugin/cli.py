@@ -134,15 +134,75 @@ def _cmd_mirror(argv: list[str]) -> int:
     mirroring we override to ``threads`` so dask reads/writes many zarr
     chunks in parallel — without this, sustained throughput is ~440 KB/s
     (one chunk RTT at a time) instead of tens of MB/s.
+
+    With ``--parallel-years N`` (N>1), spawn a worker process per year so
+    multiple years stream concurrently. Each worker gets its own
+    dask/s3fs state — threads in one process would contend for the
+    "threads" scheduler. ~3 cores per year, so 2-3 is the sweet spot on
+    an 8-core host.
     """
     import argparse
 
-    # Must be set BEFORE importing dask-using libs so the global scheduler
-    # picks it up.
-    os.environ["DASK_SCHEDULER"] = os.environ.get(
-        "MIRROR_DASK_SCHEDULER", "threads"
+    p = argparse.ArgumentParser(prog="plugin.cli mirror")
+    p.add_argument("--year-start", type=int, default=1979)
+    p.add_argument("--year-end", type=int, default=2024)
+    p.add_argument("--dest-base", default="s3://storm-cloud/aorc-cache")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--parallel-years",
+        type=int,
+        default=1,
+        help="number of years to mirror concurrently (default 1)",
     )
+    opts = p.parse_args(argv)
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        stream=sys.stdout,
+    )
+    log = logging.getLogger("mirror")
+
+    years = list(range(opts.year_start, opts.year_end + 1))
+    if opts.parallel_years <= 1:
+        results = [
+            _mirror_one_year(year, opts.dest_base, opts.dry_run) for year in years
+        ]
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        log.info(
+            "Mirroring %d years with %d parallel workers",
+            len(years),
+            opts.parallel_years,
+        )
+        results = []
+        with ProcessPoolExecutor(max_workers=opts.parallel_years) as pool:
+            futures = {
+                pool.submit(_mirror_one_year, y, opts.dest_base, opts.dry_run): y
+                for y in years
+            }
+            for fut in as_completed(futures):
+                results.append(fut.result())
+
+    failed = [year for year, ok in results if not ok]
+    if failed:
+        log.error("failed years: %s", sorted(failed))
+        return 1
+    log.info("mirror complete (%d–%d)", opts.year_start, opts.year_end)
+    return 0
+
+
+def _mirror_one_year(year: int, dest_base: str, dry_run: bool) -> tuple[int, bool]:
+    """Mirror a single year. Returns (year, success).
+
+    Runnable in a subprocess (ProcessPoolExecutor) because every name it
+    needs is either imported here or passed in — no closure over the
+    parent's state. Each subprocess sets its own DASK_SCHEDULER so
+    threaded parallelism kicks in for chunk reads/writes.
+    """
+    # Set the scheduler BEFORE importing dask so it picks up our value.
+    os.environ["DASK_SCHEDULER"] = os.environ.get("MIRROR_DASK_SCHEDULER", "threads")
     import dask
     import s3fs
     import xarray as xr
@@ -154,13 +214,7 @@ def _cmd_mirror(argv: list[str]) -> int:
     VARIABLES = ["APCP_surface", "TMP_2maboveground"]
     NOAA_BASE = "s3://noaa-nws-aorc-v1-1-1km"
 
-    p = argparse.ArgumentParser(prog="plugin.cli mirror")
-    p.add_argument("--year-start", type=int, default=1979)
-    p.add_argument("--year-end", type=int, default=2024)
-    p.add_argument("--dest-base", default="s3://storm-cloud/aorc-cache")
-    p.add_argument("--dry-run", action="store_true")
-    opts = p.parse_args(argv)
-
+    # Re-configure logging in the subprocess so log lines reach stdout.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -181,67 +235,54 @@ def _cmd_mirror(argv: list[str]) -> int:
         config_kwargs={"max_pool_connections": 20},
     )
 
-    def year_done(dest_path: str) -> bool:
-        return dst_fs.exists(dest_path.replace("s3://", "") + "/.zmetadata")
-
-    failed: list[int] = []
-    for year in range(opts.year_start, opts.year_end + 1):
-        src_path = f"{NOAA_BASE}/{year}.zarr"
-        dst_path = f"{opts.dest_base}/{year}.zarr"
-        try:
-            if year_done(dst_path):
-                log.info("[%d] already cached — skip", year)
-                continue
-            log.info("[%d] opening %s", year, src_path)
-            ds = xr.open_dataset(
-                s3fs.S3Map(root=src_path, s3=src_fs, check=False),
-                engine="zarr",
-                chunks="auto",
-                consolidated=True,
-            )
-            ds = ds[VARIABLES].sel(
-                longitude=slice(LON_MIN, LON_MAX),
-                latitude=slice(LAT_MIN, LAT_MAX),
-            )
-            # Keep source-aligned chunking so to_zarr streams chunk-to-chunk
-            # instead of buffering the whole year. NOAA uses (144, 128, 256);
-            # rechunking to anything else (e.g. time=24, lat=full) forces
-            # dask to read all source chunks before the first write — that's
-            # what made the previous attempt sit at ~470 KB/s. We still pop
-            # the encoded chunks so safe_chunks doesn't trip on a phantom
-            # post-clip mismatch.
-            ds = ds.chunk({"time": 144, "latitude": 128, "longitude": 256})
-            for var in ds.data_vars:
-                ds[var].encoding.pop("chunks", None)
-            for coord in ds.coords:
-                ds[coord].encoding.pop("chunks", None)
-            log.info(
-                "[%d] clipped: time=%d lat=%d lon=%d",
-                year,
-                ds.sizes.get("time", 0),
-                ds.sizes.get("latitude", 0),
-                ds.sizes.get("longitude", 0),
-            )
-            if opts.dry_run:
-                log.info("[%d] dry-run — skip write", year)
-                continue
-            log.info("[%d] writing to %s", year, dst_path)
-            ds.to_zarr(
-                s3fs.S3Map(root=dst_path, s3=dst_fs, check=False),
-                mode="w",
-                consolidated=True,
-                safe_chunks=False,
-            )
-            log.info("[%d] done", year)
-        except Exception:
-            log.exception("[%d] failed", year)
-            failed.append(year)
-
-    if failed:
-        log.error("failed years: %s", failed)
-        return 1
-    log.info("mirror complete (%d–%d)", opts.year_start, opts.year_end)
-    return 0
+    src_path = f"{NOAA_BASE}/{year}.zarr"
+    dst_path = f"{dest_base}/{year}.zarr"
+    try:
+        if dst_fs.exists(dst_path.replace("s3://", "") + "/.zmetadata"):
+            log.info("[%d] already cached — skip", year)
+            return year, True
+        log.info("[%d] opening %s", year, src_path)
+        ds = xr.open_dataset(
+            s3fs.S3Map(root=src_path, s3=src_fs, check=False),
+            engine="zarr",
+            chunks="auto",
+            consolidated=True,
+        )
+        ds = ds[VARIABLES].sel(
+            longitude=slice(LON_MIN, LON_MAX),
+            latitude=slice(LAT_MIN, LAT_MAX),
+        )
+        # Keep source-aligned chunking so to_zarr streams chunk-to-chunk
+        # instead of buffering the whole year. NOAA uses (144, 128, 256);
+        # rechunking to anything else (e.g. time=24, lat=full) forces dask
+        # to read every source chunk before the first write.
+        ds = ds.chunk({"time": 144, "latitude": 128, "longitude": 256})
+        for var in ds.data_vars:
+            ds[var].encoding.pop("chunks", None)
+        for coord in ds.coords:
+            ds[coord].encoding.pop("chunks", None)
+        log.info(
+            "[%d] clipped: time=%d lat=%d lon=%d",
+            year,
+            ds.sizes.get("time", 0),
+            ds.sizes.get("latitude", 0),
+            ds.sizes.get("longitude", 0),
+        )
+        if dry_run:
+            log.info("[%d] dry-run — skip write", year)
+            return year, True
+        log.info("[%d] writing to %s", year, dst_path)
+        ds.to_zarr(
+            s3fs.S3Map(root=dst_path, s3=dst_fs, check=False),
+            mode="w",
+            consolidated=True,
+            safe_chunks=False,
+        )
+        log.info("[%d] done", year)
+        return year, True
+    except Exception:
+        log.exception("[%d] failed", year)
+        return year, False
 
 
 def main() -> int:
