@@ -12,7 +12,7 @@ from typing import Any
 
 from stormhub.met.storm_catalog import StormCatalog, new_catalog, new_collection
 
-from plugin.actions import vectorized_scan, vectorized_transpose
+from plugin.actions import parallel_threads, vectorized_scan, vectorized_transpose
 from plugin.lib import RunContext
 from plugin.progress import StormhubProgressTracker
 from plugin.workers import resolve_num_workers
@@ -28,28 +28,37 @@ class StormState:
     params: dict[str, Any]
 
 
-def _load_existing_collection(
+def _try_reload(
     catalog_dir: Path, catalog_id: str, storm_duration: int
-) -> Any | None:
-    """Return a previously-saved collection if present and non-empty, else None.
+) -> tuple[Any | None, Any | None]:
+    """Return ``(catalog, collection)`` reloaded from disk if present.
 
-    Enables fast resumes on local re-runs: if a prior invocation left a saved
-    catalog under ``catalog_dir / catalog_id``, reuse it instead of rebuilding.
+    Either may be ``None``:
+      - ``(None, None)`` when no ``catalog.json`` exists (fresh build needed).
+      - ``(catalog, None)`` when the catalog exists but the collection for
+        this storm_duration is missing or empty (skip new_catalog, build only
+        the collection). This also sidesteps stormhub's ``valid_spaces_item``,
+        which hardcodes ``anon=True`` s3fs against our private cache URL and
+        fails to authenticate.
+      - ``(catalog, collection)`` when both are reusable.
     """
     catalog_file = catalog_dir / catalog_id / "catalog.json"
     if not catalog_file.exists():
-        return None
+        return None, None
     try:
         catalog = StormCatalog.from_file(str(catalog_file))
         collection_id = catalog.spm.storm_collection_id(storm_duration)
         collection = catalog.get_child(collection_id)
         if collection is None or not list(collection.get_all_items()):
-            return None
+            collection = None
     except Exception as e:
-        log.warning("Could not reload collection — will rebuild: %s", e)
-        return None
-    log.info("Reloaded existing collection %s from disk", collection_id)
-    return collection
+        log.warning("Could not reload catalog — will rebuild: %s", e)
+        return None, None
+    if collection is not None:
+        log.info("Reloaded existing collection %s from disk", collection_id)
+    else:
+        log.info("Reloaded catalog %s — collection missing, will rebuild it", catalog_id)
+    return catalog, collection
 
 
 def _vec_transpose_enabled() -> bool:
@@ -77,11 +86,11 @@ def _storm_params(attrs: dict[str, str]) -> dict[str, Any]:
         "top_n_events": int(attrs.get("top_n_events", "10")),
         "check_every_n_hours": int(attrs.get("check_every_n_hours", "24")),
         "num_workers": resolve_num_workers(attrs),
-        # When vectorized max_transpose is on, force threads instead of
-        # subprocesses so the monkey-patched Transpose class stays visible
-        # to workers. fftconvolve releases the GIL, so threads still
-        # capture the full 6-core parallelism.
-        "use_threads": _vec_transpose_enabled(),
+        # Processes (use_threads=False): the vectorized max_transpose and
+        # batch_size fix are baked into vendored stormhub, so subprocess
+        # workers inherit them. Threads were tried but the surrounding
+        # per-date Python work is GIL-bound; processes hit cores directly.
+        "use_threads": False,
         "specific_dates": (
             json.loads(attrs["specific_dates"]) if attrs.get("specific_dates") else []
         ),
@@ -96,17 +105,18 @@ def process_storms(ctx: RunContext) -> None:
     catalog_id = attrs["catalog_id"]
     params = _storm_params(attrs)
 
-    collection = _load_existing_collection(
+    catalog, collection = _try_reload(
         ctx.local_root, catalog_id, params["storm_duration"]
     )
 
     if collection is None:
-        catalog = new_catalog(
-            catalog_id,
-            str(ctx.inputs.config_path),
-            local_directory=str(ctx.local_root),
-            catalog_description=attrs["catalog_description"],
-        )
+        if catalog is None:
+            catalog = new_catalog(
+                catalog_id,
+                str(ctx.inputs.config_path),
+                local_directory=str(ctx.local_root),
+                catalog_description=attrs["catalog_description"],
+            )
         # Two independent stormhub patches, each gated by its own env:
         #
         # - vectorized_transpose (CC_VECTORIZED_TRANSPOSE=1, default ON)
@@ -126,6 +136,9 @@ def process_storms(ctx: RunContext) -> None:
         #   Kept opt-in until that design is revisited.
         if _vec_transpose_enabled():
             vectorized_transpose.install()
+            # Pair with the batch-size patch: with vec_transpose+threads,
+            # upstream's batch_size=num_workers//3 leaves most threads idle.
+            parallel_threads.install()
         if vectorized_scan.enabled():
             vectorized_scan.install()
         try:
@@ -140,6 +153,7 @@ def process_storms(ctx: RunContext) -> None:
         finally:
             vectorized_scan.restore()
             vectorized_transpose.restore()
+            parallel_threads.restore()
         if collection is None:
             raise RuntimeError("no storms found matching criteria")
 

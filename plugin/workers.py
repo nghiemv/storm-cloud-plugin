@@ -44,15 +44,19 @@ def _resolve(attrs: dict) -> tuple[str, int]:
         return "from payload attribute", max(1, int(attrs["num_workers"]))
     if os.environ.get("CC_NUM_WORKERS"):
         return "from CC_NUM_WORKERS env", max(1, int(os.environ["CC_NUM_WORKERS"]))
+    cpu_cap = max(1, (os.cpu_count() or 2) - 2)
     mem_mb = _cgroup_mem_limit_mb()
     if mem_mb is None:
-        return "cgroup unset — fallback", 1
+        # No cgroup memory limit — fall back to CPU count. With threads,
+        # workers share host memory; with subprocesses on a fat host it's
+        # still safer to cap at cpu-2 than at 1.
+        return "cgroup unset — capped at cpu-2", cpu_cap
     per_worker = (
         PER_WORKER_MB_THREADS
         if os.environ.get("DASK_SCHEDULER", "synchronous") == "threads"
         else PER_WORKER_MB_SYNC
     )
-    return "auto-sized from cgroup", max(1, mem_mb // per_worker)
+    return "auto-sized from cgroup", max(1, min(cpu_cap, mem_mb // per_worker))
 
 
 def _cgroup_mem_limit_mb() -> int | None:
