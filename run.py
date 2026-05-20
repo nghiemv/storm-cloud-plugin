@@ -261,6 +261,18 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
         "AORC_S3_SECRET",
         "AORC_S3_ENDPOINT",
     )
+    # The image defaults to DASK_SCHEDULER=synchronous (Dockerfile) so
+    # per-worker memory stays predictable (1 dask thread × *_NUM_THREADS=1).
+    # That makes every AORC zarr read serial — fine for the no-cache
+    # baseline but a 5-10x throttle once the cache exists. Override to
+    # "threads" so each storm-window read parallelizes its chunk fetches,
+    # capped at DASK_NUM_WORKERS=4 so total threads = num_workers × 4
+    # stays bounded. Operator can revert by setting CC_DASK_SCHEDULER=
+    # synchronous in the env.
+    dask_env = {
+        "DASK_SCHEDULER": os.environ.get("CC_DASK_SCHEDULER", "threads"),
+        "DASK_NUM_WORKERS": os.environ.get("CC_DASK_NUM_WORKERS", "4"),
+    }
     sh(
         [
             "docker",
@@ -283,6 +295,7 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
             f"CC_MANIFEST_ID={uuid}",
             "-e",
             f"CC_ROOT={os.environ.get('CC_ROOT', 'manifests')}",
+            *[arg for k, v in dask_env.items() for arg in ("-e", f"{k}={v}")],
             *[
                 arg
                 for k in forwarded
