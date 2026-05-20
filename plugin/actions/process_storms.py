@@ -51,6 +51,16 @@ def _load_existing_collection(
     return collection
 
 
+def _vec_transpose_enabled() -> bool:
+    """Vectorized max_transpose is on by default; opt out via env."""
+    return os.environ.get("CC_VECTORIZED_TRANSPOSE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def _storm_params(attrs: dict[str, str]) -> dict[str, Any]:
     end_date = attrs.get("end_date") or attrs["start_date"]
     if not attrs.get("end_date"):
@@ -66,6 +76,11 @@ def _storm_params(attrs: dict[str, str]) -> dict[str, Any]:
         "top_n_events": int(attrs.get("top_n_events", "10")),
         "check_every_n_hours": int(attrs.get("check_every_n_hours", "24")),
         "num_workers": resolve_num_workers(attrs),
+        # When vectorized max_transpose is on, force threads instead of
+        # subprocesses so the monkey-patched Transpose class stays visible
+        # to workers. fftconvolve releases the GIL, so threads still
+        # capture the full 6-core parallelism.
+        "use_threads": _vec_transpose_enabled(),
         "specific_dates": (
             json.loads(attrs["specific_dates"]) if attrs.get("specific_dates") else []
         ),
@@ -91,19 +106,27 @@ def process_storms(ctx: RunContext) -> None:
             local_directory=str(ctx.local_root),
             catalog_description=attrs["catalog_description"],
         )
-        # CC_VECTORIZED_SCAN=1 turns on TWO independent stormhub patches
-        # together:
-        #   - vectorized_scan: O(year) zarr reads instead of O(window).
-        #     Bit-correct, but constrained by max_transpose CPU cost.
-        #   - vectorized_transpose: one scipy.signal.correlate2d per
-        #     date instead of stormhub's Python loop over valid_shifts.
-        #     This is where the ~100× max_transpose speedup lives, and
-        #     is what makes the scan replacement actually pay off in
-        #     end-to-end wall clock (see plugin/actions/vectorized_scan
-        #     docstring's A/B/C benchmark).
+        # Two independent stormhub patches, each gated by its own env:
+        #
+        # - vectorized_transpose (CC_VECTORIZED_TRANSPOSE=1, default ON)
+        #   Replaces Transpose.max_transpose's Python loop with one
+        #   scipy.signal.fftconvolve pass — bit-identical output,
+        #   ~4× wall-clock win per storm date on indian-creek. Paired
+        #   with use_threads=True (set in _storm_params) so the
+        #   class-level patch stays visible to ThreadPoolExecutor
+        #   workers (a ProcessPoolExecutor with 'spawn' would re-import
+        #   stormhub fresh and skip the patch).
+        #
+        # - vectorized_scan (CC_VECTORIZED_SCAN=1, default OFF)
+        #   Replaces collect_event_stats with a single-process loop
+        #   over batched rolling-sum slices. Bit-identical but no net
+        #   speedup in measured runs (dask's rolling().sum() doesn't
+        #   amortize chunk reads the way the implementation assumes).
+        #   Kept opt-in until that design is revisited.
+        if _vec_transpose_enabled():
+            vectorized_transpose.install()
         if vectorized_scan.enabled():
             vectorized_scan.install()
-            vectorized_transpose.install()
         try:
             with StormhubProgressTracker(label="process-storms"):
                 collection = new_collection(catalog, **params)
