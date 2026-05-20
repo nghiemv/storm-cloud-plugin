@@ -11,7 +11,7 @@ from typing import Any
 
 from stormhub.met.storm_catalog import StormCatalog, new_catalog, new_collection
 
-from plugin.actions import vectorized_scan
+from plugin.actions import vectorized_scan, vectorized_transpose
 from plugin.lib import RunContext
 from plugin.progress import StormhubProgressTracker
 from plugin.workers import resolve_num_workers
@@ -91,12 +91,19 @@ def process_storms(ctx: RunContext) -> None:
             local_directory=str(ctx.local_root),
             catalog_description=attrs["catalog_description"],
         )
-        # Optionally swap stormhub's per-window scan for our vectorized
-        # rolling-sum implementation (one zarr-read per year vs one per
-        # window). Opt-in via CC_VECTORIZED_SCAN=1 — defaults off so the
-        # battle-tested loop is the default until a parity test lands.
+        # CC_VECTORIZED_SCAN=1 turns on TWO independent stormhub patches
+        # together:
+        #   - vectorized_scan: O(year) zarr reads instead of O(window).
+        #     Bit-correct, but constrained by max_transpose CPU cost.
+        #   - vectorized_transpose: one scipy.signal.correlate2d per
+        #     date instead of stormhub's Python loop over valid_shifts.
+        #     This is where the ~100× max_transpose speedup lives, and
+        #     is what makes the scan replacement actually pay off in
+        #     end-to-end wall clock (see plugin/actions/vectorized_scan
+        #     docstring's A/B/C benchmark).
         if vectorized_scan.enabled():
             vectorized_scan.install()
+            vectorized_transpose.install()
         try:
             with StormhubProgressTracker(label="process-storms"):
                 collection = new_collection(catalog, **params)
@@ -108,6 +115,7 @@ def process_storms(ctx: RunContext) -> None:
             ) from e
         finally:
             vectorized_scan.restore()
+            vectorized_transpose.restore()
         if collection is None:
             raise RuntimeError("no storms found matching criteria")
 
