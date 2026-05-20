@@ -11,6 +11,7 @@ from typing import Any
 
 from stormhub.met.storm_catalog import StormCatalog, new_catalog, new_collection
 
+from plugin.actions import vectorized_scan
 from plugin.lib import RunContext
 from plugin.progress import StormhubProgressTracker
 from plugin.workers import resolve_num_workers
@@ -90,6 +91,12 @@ def process_storms(ctx: RunContext) -> None:
             local_directory=str(ctx.local_root),
             catalog_description=attrs["catalog_description"],
         )
+        # Optionally swap stormhub's per-window scan for our vectorized
+        # rolling-sum implementation (one zarr-read per year vs one per
+        # window). Opt-in via CC_VECTORIZED_SCAN=1 — defaults off so the
+        # battle-tested loop is the default until a parity test lands.
+        if vectorized_scan.enabled():
+            vectorized_scan.install()
         try:
             with StormhubProgressTracker(label="process-storms"):
                 collection = new_collection(catalog, **params)
@@ -99,6 +106,8 @@ def process_storms(ctx: RunContext) -> None:
                 "(likely OOM). Lower via 'num_workers' payload attribute or "
                 "CC_NUM_WORKERS env."
             ) from e
+        finally:
+            vectorized_scan.restore()
         if collection is None:
             raise RuntimeError("no storms found matching criteria")
 

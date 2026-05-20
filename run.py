@@ -273,6 +273,11 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
         "DASK_SCHEDULER": os.environ.get("CC_DASK_SCHEDULER", "threads"),
         "DASK_NUM_WORKERS": os.environ.get("CC_DASK_NUM_WORKERS", "4"),
     }
+    # Opt-in vectorized scan in process-storms. Inherited from the host's
+    # shell or compute/hec/env; defaults to off so existing behaviour is
+    # unchanged until the operator flips it on.
+    if os.environ.get("CC_VECTORIZED_SCAN"):
+        dask_env["CC_VECTORIZED_SCAN"] = os.environ["CC_VECTORIZED_SCAN"]
     sh(
         [
             "docker",
