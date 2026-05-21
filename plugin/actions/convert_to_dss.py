@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime
 from typing import Optional
 
@@ -20,7 +21,13 @@ from plugin.progress import Progress
 log = logging.getLogger(__name__)
 
 MAX_FAILURE_RATIO = float(os.environ.get("DSS_MAX_FAILURE_RATIO", "0.5"))
-DSS_WORKERS = int(os.environ.get("DSS_WORKERS", "0"))  # 0 = auto (cpu_count)
+# Default to 2 workers, not ``cpu_count``: each subprocess re-imports
+# stormhub + dask + s3fs and loads the storm-duration precip slice into
+# memory. With 8 cores and a 30 GB box, ``cpu_count`` workers OOM-killed
+# the run twice mid-conversion. 2 keeps peak under ~5 GB while staying
+# parallel enough that DSS-write I/O still overlaps with zarr reads.
+# Override via ``DSS_WORKERS`` env to a higher value on a fatter host.
+DSS_WORKERS = int(os.environ.get("DSS_WORKERS", "2"))
 
 # Spawn, not fork: stormhub workers open s3fs, whose async event-loop thread
 # doesn't survive fork() and deadlocks child Event.wait() on first S3 read.
@@ -104,9 +111,7 @@ def convert_to_dss(ctx: RunContext) -> None:
         work.append((item.id, str(out_path), storm_start.isoformat()))
 
     if work:
-        workers = (
-            DSS_WORKERS if DSS_WORKERS > 0 else min(len(work), os.cpu_count() or 1)
-        )
+        workers = min(len(work), max(1, DSS_WORKERS))
         log.info("Running %d conversions with %d workers", len(work), workers)
         progress = Progress(total=len(work), label="convert-to-dss")
 
@@ -122,15 +127,33 @@ def convert_to_dss(ctx: RunContext) -> None:
                 ): item_id
                 for item_id, out_path, start_iso in work
             }
-            for future in as_completed(futures):
-                item_id = futures[future]
-                error = future.result()
-                if error:
-                    log.error("Failed to convert %s: %s", item_id, error)
-                    failed.append(item_id)
-                else:
-                    log.info("  Converted %s", item_id)
-                progress.tick()
+            try:
+                for future in as_completed(futures):
+                    item_id = futures[future]
+                    error = future.result()
+                    if error:
+                        log.error("Failed to convert %s: %s", item_id, error)
+                        failed.append(item_id)
+                    else:
+                        log.info("  Converted %s", item_id)
+                    progress.tick()
+            except BrokenProcessPool as e:
+                # A subprocess died abruptly (OOM, segfault, or external SIGKILL).
+                # The pool is now unusable. Any DSS files completed by surviving
+                # workers are already flushed to disk — they'll be picked up by
+                # the idempotency check on the next resume. Cancel pending work
+                # so we exit promptly with a clear signal.
+                pending = sum(1 for f in futures if not f.done())
+                for f in futures:
+                    f.cancel()
+                raise RuntimeError(
+                    f"convert-to-dss process pool died (workers={workers}, "
+                    f"~{pending} items pending). DSS files completed so far "
+                    f"are preserved on disk; re-run will skip them via "
+                    f"idempotency and resume the rest. If this recurs, "
+                    f"lower DSS_WORKERS (currently {workers}) further or "
+                    f"check container memory headroom."
+                ) from e
 
     check_failure_ratio(
         failed, len(items), label="DSS conversion", max_ratio=MAX_FAILURE_RATIO
