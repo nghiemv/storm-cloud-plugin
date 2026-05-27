@@ -238,6 +238,8 @@ def _pick_hec_payload() -> tuple[str, str] | None:
 
 
 def _run_hec_job(uuid: str, name: str | None = None) -> None:
+    import time as _time
+
     name = _safe_subdir(name or uuid)
     run_dir = COMPUTE / "outputs" / name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -245,6 +247,21 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
     # any stale id from a prior run before relaunching.
     cidfile = run_dir / "container.id"
     cidfile.unlink(missing_ok=True)
+    # Write a minimal launch.json so audit.py's _known_runs() (which filters
+    # by launch.json presence) recognises CLI-launched runs the same way it
+    # recognises web.py-launched ones. catalog_id is the run name by default;
+    # CC SDK plugin reads the real catalog_id from the S3 payload at runtime.
+    (run_dir / "launch.json").write_text(
+        json.dumps(
+            {
+                "launched_at": _time.time(),
+                "args": list(sys.argv),
+                "payload_uuid": uuid,
+                "payload_attrs": {"catalog_id": name},
+                "source": "run.py hec",
+            }
+        )
+    )
     print(f"Running HEC S3: payload={uuid} (results -> compute/outputs/{name}/)\n")
     forwarded = (
         *_HEC_REQUIRED,

@@ -14,6 +14,7 @@ from stormhub.met.storm_catalog import StormCatalog, new_catalog, new_collection
 
 from plugin.actions import (
     aorc_auth,
+    aorc_preflight,
     cumsum_scan,
     parallel_threads,
     vectorized_scan,
@@ -110,6 +111,16 @@ def process_storms(ctx: RunContext) -> None:
     attrs = ctx.payload.attributes
     catalog_id = attrs["catalog_id"]
     params = _storm_params(attrs)
+
+    # Fail fast on missing AORC years before doing any expensive work. The
+    # 2026-05-27 incident burned 30+ minutes before crashing with a cryptic
+    # zarr error because 2025.zarr wasn't mirrored. Now: 1-second HEAD per
+    # year, raise with a copy-pasteable mirror command if any are missing.
+    aorc_preflight.assert_years_available(
+        start_date=attrs["start_date"],
+        end_date=attrs.get("end_date"),
+        storm_duration_hours=params["storm_duration"],
+    )
 
     catalog, collection = _try_reload(
         ctx.local_root, catalog_id, params["storm_duration"]
