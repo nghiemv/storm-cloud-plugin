@@ -613,6 +613,18 @@ def _process_one_year(
         time.monotonic() - t_year,
     )
 
+    # Log this worker's peak RSS so the per-worker estimator's predictions are
+    # auditable against reality. Linux ru_maxrss is reported in KiB; macOS in
+    # bytes. We assume Linux (the container is) but coerce just in case.
+    try:
+        import resource
+
+        peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_mb = peak_kb // 1024
+        wlog.info("[cumsum-scan] year=%d worker peak RSS: %d MiB", year, peak_mb)
+    except (ImportError, OSError):
+        pass  # platform without resource module — fine, not load-bearing
+
     del snapshots, running, transpose_obj
     gc.collect()
     return year, lines, completed, skipped

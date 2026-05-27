@@ -106,10 +106,35 @@ behavior and are usually set in the manifest / compose env (Twelve-Factor).
 |----------|---------|--------|
 | `LOG_LEVEL` | `INFO` | Root log level (`DEBUG`, `INFO`, `WARNING`, …). |
 | `LOG_FORMAT` | unset | Set to `json` for one-line JSON log records. |
-| `CC_NUM_WORKERS` | unset | Fleet default for `process-storms` worker count. Overridden by payload `num_workers` attr. |
+| `CC_NUM_WORKERS` | unset | Fleet default for `process-storms` worker count. Overridden by payload `num_workers` attr. The cumsum scan auto-caps further by bbox+snapshot memory estimate — set this if you want fewer workers than the auto-cap chose, not more. |
+| `CC_CUMSUM_SCAN` | `1` (on) | Year-parallel cumsum scan in place of stormhub's per-date loop. Bit-identical results; ~3× wall-clock vs `num_workers=4` baseline. Set to `0` to opt out. |
+| `CC_CUMSUM_CHUNK_HOURS` | `720` (30 days) | Time-chunk size for cumsum's streaming reads. Larger amortizes per-chunk overhead but quadratically increases the worker's chunk-load transient memory peak. |
+| `CC_MEMORY_GB` | unset → 80% of host MemTotal | Per-container memory budget (`docker run --memory`). Set explicitly when running multiple containers concurrently so they don't oversubscribe host RAM. |
 | `DSS_WORKERS` | `0` (= cpu_count) | Worker count for `convert-to-dss` process pool. |
 | `DSS_MAX_FAILURE_RATIO` | `0.5` | `convert-to-dss` hard-fails above this fraction. |
 | `GRID_MAX_FAILURE_RATIO` | `0.5` | `create-grid-file` hard-fails above this fraction. |
+
+### Automatic safeguards
+
+These run on every `./run.py hec` invocation, no config needed:
+
+- **AORC pre-flight cache check.** Before `process-storms` does any real work,
+  HEAD every `<year>.zarr/.zmetadata` in the AORC cache. Missing years raise
+  immediately with `./run.py mirror --year-start X --year-end Y` in the message.
+- **Per-worker memory cap.** `cumsum_scan` projects per-worker peak RSS from the
+  transposition bbox cell count, the largest year's snapshot count, and the
+  chunk-load transient (the 4 numpy arrays alive simultaneously during
+  `chunk_filled = np.where(...).astype(float64)`). Workers above the host's
+  safe budget are capped automatically with a warning naming the projected
+  per-worker MiB and the safe max.
+- **Upload-side stale-key reconcile.** After `upload-outputs` finishes, list the
+  catalog's S3 prefix and delete any key not in the just-uploaded set —
+  catches the rank-mismatch case where re-running a catalog with a different
+  top-N selection orphans the prior run's DSS filenames. Safety guard refuses
+  to delete >50% of the prefix's keys.
+- **Container memory budget.** `docker run --memory` is set to 80% of host
+  `MemTotal` (override via `CC_MEMORY_GB`) so a runaway worker can't SIGKILL
+  other host processes via OOM.
 
 ## Running Against HEC S3
 

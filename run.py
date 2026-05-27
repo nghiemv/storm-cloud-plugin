@@ -237,6 +237,45 @@ def _pick_hec_payload() -> tuple[str, str] | None:
     return choice, choice  # raw UUID — no catalog_id known
 
 
+def _host_mem_total_mb() -> int | None:
+    """Host RAM in MiB from /proc/meminfo, or None if unreadable."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _docker_memory_flags() -> list[str]:
+    """Return ``--memory`` / ``--memory-swap`` flags for ``docker run``.
+
+    Prefers ``CC_MEMORY_GB`` when set. Otherwise computes 80% of host MemTotal
+    (floor 4 GiB) so docker actually caps the cgroup — without this, the
+    container's ``cgroup memory.max`` reads ``'max'`` and the kernel won't
+    OOM-kill until host RAM is exhausted, taking other host processes with
+    it. ``--memory-swap`` is set equal to ``--memory`` so the container can't
+    silently dip into swap and tank performance.
+    """
+    override = os.environ.get("CC_MEMORY_GB", "").strip()
+    if override:
+        try:
+            gb = max(1, int(override))
+            return [f"--memory={gb}g", f"--memory-swap={gb}g"]
+        except ValueError:
+            print(
+                f"warning: CC_MEMORY_GB={override!r} not an int — ignoring",
+                file=sys.stderr,
+            )
+    host_mb = _host_mem_total_mb()
+    if host_mb is None:
+        return []
+    safe_mb = max(4 * 1024, int(host_mb * 0.8))
+    return [f"--memory={safe_mb}m", f"--memory-swap={safe_mb}m"]
+
+
 def _run_hec_job(uuid: str, name: str | None = None) -> None:
     import time as _time
 
@@ -310,11 +349,21 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
     # transposition domains, vs the workers.py budget of 4 GB).
     if os.environ.get("CC_NUM_WORKERS"):
         dask_env["CC_NUM_WORKERS"] = os.environ["CC_NUM_WORKERS"]
+
+    # Cap the container's memory budget so a runaway worker can't push the
+    # host into OOM territory (the kernel will SIGKILL one of our process
+    # workers and trigger BrokenProcessPool across the whole scan). cumsum's
+    # in-process auto-cap projects per-worker memory from bbox + snapshot
+    # count and respects this docker-side limit via /proc/meminfo (which
+    # reflects the cgroup when one is set). Default: 80% of host MemTotal,
+    # min 4 GiB. Override with CC_MEMORY_GB.
+    memory_flags = _docker_memory_flags()
     sh(
         [
             "docker",
             "run",
             "--rm",
+            *memory_flags,
             # cidfile lets the web UI `docker stop` this container later for
             # a clean pause; the plugin's signal handler unwinds the current
             # action and exits, preserving on-disk state for resume.
