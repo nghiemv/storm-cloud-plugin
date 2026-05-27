@@ -13,6 +13,7 @@ from typing import Any
 from stormhub.met.storm_catalog import StormCatalog, new_catalog, new_collection
 
 from plugin.actions import (
+    aorc_auth,
     cumsum_scan,
     parallel_threads,
     vectorized_scan,
@@ -116,6 +117,11 @@ def process_storms(ctx: RunContext) -> None:
 
     if collection is None:
         if catalog is None:
+            # Patch valid_spaces_item BEFORE new_catalog: stormhub's
+            # implementation reads a sample window with anon=True s3fs,
+            # which 403s against our private AORC cache. aorc_auth swaps
+            # in authenticated s3fs when AORC_S3_KEY is set; no-op otherwise.
+            aorc_auth.install()
             catalog = new_catalog(
                 catalog_id,
                 str(ctx.inputs.config_path),
@@ -167,6 +173,7 @@ def process_storms(ctx: RunContext) -> None:
             vectorized_scan.restore()
             vectorized_transpose.restore()
             parallel_threads.restore()
+            aorc_auth.restore()
         if collection is None:
             raise RuntimeError("no storms found matching criteria")
 
