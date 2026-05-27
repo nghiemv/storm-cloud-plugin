@@ -17,6 +17,12 @@ def no_cgroup(monkeypatch):
     monkeypatch.setattr(workers, "_cgroup_mem_limit_mb", lambda: None)
 
 
+@pytest.fixture
+def fake_cpu_count(monkeypatch):
+    """Pin os.cpu_count() so tests don't depend on the host."""
+    monkeypatch.setattr(workers.os, "cpu_count", lambda: 8)
+
+
 def test_payload_attribute_wins(monkeypatch, no_cgroup):
     monkeypatch.setenv("CC_NUM_WORKERS", "7")
     assert workers.resolve_num_workers({"num_workers": "3"}) == 3
@@ -31,8 +37,10 @@ def test_env_used_when_no_attribute(monkeypatch, no_cgroup):
     assert workers.resolve_num_workers({}) == 5
 
 
-def test_empty_attribute_falls_through(no_cgroup):
-    assert workers.resolve_num_workers({"num_workers": ""}) == 1
+def test_empty_attribute_falls_through_to_cpu_cap(no_cgroup, fake_cpu_count):
+    # cgroup unset + 8 visible CPUs -> cpu_cap = max(1, 8-2) = 6.
+    # Empty payload attribute is falsy, so the cgroup/cpu fallback wins.
+    assert workers.resolve_num_workers({"num_workers": ""}) == 6
 
 
 def test_auto_sizes_from_cgroup(monkeypatch):
@@ -47,8 +55,11 @@ def test_auto_floors_at_one_when_budget_below_per_worker(monkeypatch):
     assert workers.resolve_num_workers({}) == 1
 
 
-def test_fallback_to_one_when_cgroup_unset(no_cgroup):
-    assert workers.resolve_num_workers({}) == 1
+def test_fallback_to_cpu_cap_when_cgroup_unset(no_cgroup, fake_cpu_count):
+    # Behavior changed in commit bd4e6f5 (perf: auto-size workers): an
+    # unbounded host falls back to ``cpu_count - 2`` rather than a hardcoded
+    # 1, on the theory that a fat host with no cgroup has the cores to spare.
+    assert workers.resolve_num_workers({}) == 6
 
 
 def _patch_cgroup_read(monkeypatch, contents):

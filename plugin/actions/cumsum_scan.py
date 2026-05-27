@@ -143,6 +143,9 @@ def cumsum_collect_event_stats(
 
     workers = max(1, int(num_workers or 1))
     workers = min(workers, len(years_sorted))
+    workers = _cap_workers_by_memory(
+        workers, by_year, transposition_geom.bounds, _CHUNK_HOURS
+    )
     log.info(
         "[cumsum-scan] dispatching %d years across %d worker(s)",
         len(years_sorted),
@@ -216,6 +219,128 @@ def cumsum_collect_event_stats(
         # behaviour of the upstream parallel_threads path.
         for y, msg in failed_years:
             log.error("[cumsum-scan] year=%d unrecoverable: %s", y, msg)
+
+
+# AORC native resolution: 1 km grid ≈ 0.0083° at mid-latitudes. Slight
+# over-estimate at high latitudes (where cells shrink in longitude) — that
+# direction is the safe one for a worker-sizing cap.
+_AORC_DEG_PER_CELL = 0.0083
+
+# Reserve headroom in the cgroup budget for the main process, dask threads,
+# numpy temporaries, and allocator fragmentation. 10% on a 30 GiB cgroup is
+# ~3 GiB which empirically covers what we've observed in production runs.
+_MAIN_PROCESS_OVERHEAD = 0.10
+
+# Per-worker peak floor: don't size below this even if the bbox is tiny, so
+# we don't blow up on small-bbox catalogs with a huge year-of-dates scan.
+_MIN_PER_WORKER_MB = 512
+
+# Multiplier on the raw bbox+snapshot byte cost: covers python overhead,
+# numpy intermediate allocations, allocator slack. Calibrated against
+# observed peaks of ~5.7 GB/worker for indian-creek (407×802 cells,
+# ~1473 snaps, chunk_hours=720) — raw estimate is ~6.6 GB before the
+# multiplier; 1.2× gives 7.9 GB which matches the OOM threshold under
+# 6 workers (47 GB exceeds 30 GB cgroup).
+_PER_WORKER_OVERHEAD = 1.2
+
+
+def _aorc_cells_from_bounds(bounds: tuple[float, float, float, float]) -> int:
+    """Estimate AORC cell count from a (minx, miny, maxx, maxy) lon/lat bbox."""
+    n_lon = max(1.0, (bounds[2] - bounds[0]) / _AORC_DEG_PER_CELL)
+    n_lat = max(1.0, (bounds[3] - bounds[1]) / _AORC_DEG_PER_CELL)
+    return int(n_lon * n_lat)
+
+
+def _cgroup_mem_mb() -> int | None:
+    """Read cgroup v2 ``memory.max`` in MiB, or None when unbounded/absent."""
+    try:
+        raw = open("/sys/fs/cgroup/memory.max", encoding="utf-8").read().strip()
+    except (OSError, FileNotFoundError):
+        return None
+    if raw == "max":
+        return None
+    try:
+        b = int(raw)
+    except ValueError:
+        return None
+    if b <= 0 or b >= (1 << 62):  # kernel sentinels for "no limit"
+        return None
+    return b // (1024 * 1024)
+
+
+def _estimate_per_worker_mb(
+    max_snapshots: int, bbox_cells: int, chunk_hours: int
+) -> int:
+    """Project a single cumsum worker's peak RSS in MiB.
+
+    Three dominant arrays live concurrently inside ``_process_one_year``:
+    - snapshot pool: ``max_snapshots × bbox_cells × 8`` (float64)
+    - chunk_cum:     ``chunk_hours × bbox_cells × 8`` (float64)
+    - raw chunk:     ``chunk_hours × bbox_cells × 4`` (float32, before NaN fill)
+
+    Multiplied by ``_PER_WORKER_OVERHEAD`` to cover python/numpy temporaries.
+    """
+    raw_bytes = bbox_cells * (max_snapshots * 8 + chunk_hours * (8 + 4))
+    mb = int(raw_bytes * _PER_WORKER_OVERHEAD / (1024 * 1024))
+    return max(_MIN_PER_WORKER_MB, mb)
+
+
+def _cap_workers_by_memory(
+    requested: int,
+    by_year: dict[int, list],
+    bounds: tuple[float, float, float, float],
+    chunk_hours: int,
+) -> int:
+    """Return ``requested`` capped so the projected worker pool fits the cgroup.
+
+    workers.py auto-sizes by a flat ``PER_WORKER_MB_THREADS=4096`` budget
+    that's right for ~300×400 cell bboxes (Whitehorse) but underprovisions
+    for ~400×800+ bboxes (indian-creek, kanawha). Without this cap, the
+    pool can request ~34 GiB on a 30 GiB cgroup and the kernel OOM-kills
+    one worker, triggering BrokenProcessPool across the whole scan.
+
+    No cap is applied if the cgroup limit can't be read (unbounded host).
+    """
+    cg_mb = _cgroup_mem_mb()
+    if cg_mb is None:
+        log.info(
+            "[cumsum-scan] cgroup memory.max unset; trusting num_workers=%d",
+            requested,
+        )
+        return requested
+
+    cells = _aorc_cells_from_bounds(bounds)
+    max_snaps = max((len(d) for d in by_year.values()), default=1)
+    per_worker = _estimate_per_worker_mb(max_snaps, cells, chunk_hours)
+    safe_budget = int(cg_mb * (1.0 - _MAIN_PROCESS_OVERHEAD))
+    safe_workers = max(1, safe_budget // per_worker)
+    capped = min(requested, safe_workers)
+
+    if capped < requested:
+        log.warning(
+            "[cumsum-scan] capping num_workers=%d -> %d "
+            "(per-worker peak ~%d MiB × %d > %d MiB budget; "
+            "bbox≈%d cells, max snapshots/year=%d, chunk=%dh). "
+            "Override via CC_NUM_WORKERS once you've increased --memory.",
+            requested,
+            capped,
+            per_worker,
+            requested,
+            safe_budget,
+            cells,
+            max_snaps,
+            chunk_hours,
+        )
+    else:
+        log.info(
+            "[cumsum-scan] num_workers=%d fits memory budget "
+            "(per-worker peak ~%d MiB, %d MiB budget, safe max=%d)",
+            requested,
+            per_worker,
+            safe_budget,
+            safe_workers,
+        )
+    return capped
 
 
 def _log_year_done(year, completed, skipped, done_count, total_years, t_overall):

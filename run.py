@@ -288,6 +288,11 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
         dask_env["CC_VECTORIZED_SCAN"] = os.environ["CC_VECTORIZED_SCAN"]
     if os.environ.get("CC_CUMSUM_SCAN"):
         dask_env["CC_CUMSUM_SCAN"] = os.environ["CC_CUMSUM_SCAN"]
+    # Override the auto-sized num_workers when a host operator knows the
+    # bbox is large (cumsum's per-worker peak is ~5-6 GB for ~800×400
+    # transposition domains, vs the workers.py budget of 4 GB).
+    if os.environ.get("CC_NUM_WORKERS"):
+        dask_env["CC_NUM_WORKERS"] = os.environ["CC_NUM_WORKERS"]
     sh(
         [
             "docker",
