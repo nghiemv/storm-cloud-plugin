@@ -40,22 +40,40 @@ def test_estimate_per_worker_floor():
 
 
 def test_estimate_per_worker_whitehorse_scale():
-    # 110k cells × 735 snaps × float64 (~620 MiB) + 720h × 110k × 12B (~907 MiB)
-    # Total raw ~1.5 GiB × 1.2 overhead = ~1.8 GiB.
+    # Snapshot pool ~620 MiB + chunk transient ~1.9 GiB = ~2.5 GiB raw
+    # → ×1.2 + 500 MiB baseline ≈ ~3.6 GiB per worker.
     mb = cs._estimate_per_worker_mb(
         max_snapshots=735, bbox_cells=110_000, chunk_hours=720
     )
-    assert 1500 < mb < 2200, mb
+    assert 3000 < mb < 4500, mb
 
 
 def test_estimate_per_worker_indian_creek_scale():
-    # The OOM regression case. Per the audit on 2026-05-27, peak was ~5.7 GiB
-    # at 6 workers; the estimator should land in that neighbourhood (within
-    # 30%) so the cap calculation picks the right worker count.
+    # Calibrated against 2026-05-27 OOM. Previous estimator predicted ~7.9 GiB
+    # and sized pool to 3 workers; the rerun OOM-crashed at chunk load. The
+    # corrected formula (chunk-transient-aware) predicts ~12 GiB per worker,
+    # which sizes the pool to 2 — within the host's 30 GiB budget.
     mb = cs._estimate_per_worker_mb(
         max_snapshots=1473, bbox_cells=326_000, chunk_hours=720
     )
-    assert 6500 < mb < 9000, mb
+    assert 11_000 < mb < 13_500, mb
+
+
+def test_estimate_per_worker_includes_chunk_transient():
+    """Regression: a previous estimator counted snapshot + chunk_cum + raw_chunk
+    (= 20 × cells × chunk_hours + snapshots), missing the np.where() float32
+    intermediate. The chunk-transient term must reflect *all four* allocations
+    that coexist briefly during ``chunk_filled = np.where(...).astype(float64)``.
+    """
+    # A bbox-and-snapshot-free configuration: only the chunk transient remains.
+    # 24 × 720 × 100_000 = 1.728 GB raw → × 1.2 + 500 MiB = ~2.5 GiB.
+    mb = cs._estimate_per_worker_mb(
+        max_snapshots=1, bbox_cells=100_000, chunk_hours=720
+    )
+    # The old (snapshot + chunk_cum + raw_chunk = 20 × C × h) formula would
+    # have given ~1.7 GiB raw → ~2.5 GiB total. The new one is 24 × C × h →
+    # ~1.92 GiB raw → ~2.9 GiB total. The +500 MiB jump catches the bug.
+    assert mb >= 2400, f"chunk-transient term missing or undersized: {mb}"
 
 
 def test_cap_workers_unset_cgroup_passes_through():
@@ -128,8 +146,9 @@ def test_cap_workers_whitehorse_does_not_cap():
 
 
 def test_cap_workers_indian_creek_caps_to_safe():
-    # 30 GiB cgroup, indian-creek-scale bbox: ~7.9 GiB/worker, 27 GiB budget,
-    # safe_max=3. Request 6 -> capped to 3 (matches the observed safe count).
+    # 30 GiB host, indian-creek-scale bbox: ~12 GiB/worker, 27.6 GiB budget,
+    # safe_max=2. Request 6 -> capped to 2 (matches the observed OOM-safe count;
+    # 3 workers crashed at chunk-load transient on 2026-05-27).
     with mock.patch.object(cs, "_cgroup_mem_mb", return_value=30_720):
         capped = cs._cap_workers_by_memory(
             requested=6,
@@ -137,7 +156,7 @@ def test_cap_workers_indian_creek_caps_to_safe():
             bounds=(-90.0, 36.0, -83.0, 39.4),
             chunk_hours=720,
         )
-        assert capped == 3, capped
+        assert capped == 2, capped
 
 
 def test_cap_workers_respects_lower_request():

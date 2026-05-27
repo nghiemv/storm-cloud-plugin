@@ -235,13 +235,15 @@ _MAIN_PROCESS_OVERHEAD = 0.10
 # we don't blow up on small-bbox catalogs with a huge year-of-dates scan.
 _MIN_PER_WORKER_MB = 512
 
-# Multiplier on the raw bbox+snapshot byte cost: covers python overhead,
-# numpy intermediate allocations, allocator slack. Calibrated against
-# observed peaks of ~5.7 GB/worker for indian-creek (407×802 cells,
-# ~1473 snaps, chunk_hours=720) — raw estimate is ~6.6 GB before the
-# multiplier; 1.2× gives 7.9 GB which matches the OOM threshold under
-# 6 workers (47 GB exceeds 30 GB cgroup).
+# Multiplier on the raw byte cost: covers numpy temporaries, allocator
+# slack, dask sub-chunk reads. Calibrated empirically — the 2026-05-27
+# OOM crashes (both 6-worker and 3-worker) confirmed that the worst peak
+# isn't (snapshot + chunk_cum), it's the chunk-load transient where four
+# arrays coexist for one numpy expression. See _estimate_per_worker_mb.
 _PER_WORKER_OVERHEAD = 1.2
+
+# Python + stormhub + dask + s3fs imports baseline per spawn worker.
+_PYTHON_BASELINE_MB = 500
 
 
 def _aorc_cells_from_bounds(bounds: tuple[float, float, float, float]) -> int:
@@ -293,15 +295,27 @@ def _estimate_per_worker_mb(
 ) -> int:
     """Project a single cumsum worker's peak RSS in MiB.
 
-    Three dominant arrays live concurrently inside ``_process_one_year``:
-    - snapshot pool: ``max_snapshots × bbox_cells × 8`` (float64)
-    - chunk_cum:     ``chunk_hours × bbox_cells × 8`` (float64)
-    - raw chunk:     ``chunk_hours × bbox_cells × 4`` (float32, before NaN fill)
+    Two RSS peaks are reached during a year's work; we size for the WORST.
+    The late-year chunk-load transient dominates:
 
-    Multiplied by ``_PER_WORKER_OVERHEAD`` to cover python/numpy temporaries.
+    1. ``snapshot pool``     — float64, grows to ``max_snapshots × bbox × 8``
+    2. ``chunk transient``   — during ``chunk_filled = np.where(...).astype(float64)``
+       four allocations are alive briefly:
+           raw f32 chunk        : 4 × chunk_hours × bbox
+         + np.where()  f32      : 4 × chunk_hours × bbox
+         + chunk_filled f64     : 8 × chunk_hours × bbox
+         + chunk_cum    f64     : 8 × chunk_hours × bbox  (allocated next)
+       = ``24 × chunk_hours × bbox`` bytes before the ``del chunk, chunk_filled``.
+
+    The first version of this estimator only counted (snapshot + chunk_cum +
+    raw_chunk) and missed the transient — predicted ~6.6 GiB for indian-creek
+    when the real peak was ~9.5 GiB, sized the pool to 3 workers, and the
+    rerun OOM-crashed at chunk load.
     """
-    raw_bytes = bbox_cells * (max_snapshots * 8 + chunk_hours * (8 + 4))
-    mb = int(raw_bytes * _PER_WORKER_OVERHEAD / (1024 * 1024))
+    snapshot_bytes = max_snapshots * bbox_cells * 8
+    chunk_transient_bytes = 24 * chunk_hours * bbox_cells
+    raw_mb = (snapshot_bytes + chunk_transient_bytes) / (1024 * 1024)
+    mb = int(raw_mb * _PER_WORKER_OVERHEAD) + _PYTHON_BASELINE_MB
     return max(_MIN_PER_WORKER_MB, mb)
 
 
