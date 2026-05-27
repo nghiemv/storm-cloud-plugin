@@ -69,6 +69,51 @@ def test_cap_workers_unset_cgroup_passes_through():
         assert capped == 8
 
 
+def test_cgroup_mem_mb_falls_back_to_meminfo_when_unbounded(tmp_path, monkeypatch):
+    """docker run without --memory leaves cgroup memory.max as 'max'; we must
+    still cap by host RAM (the kernel OOM-kills on host exhaustion either way).
+    This is exactly the regression that defeated the first version of this
+    cap: cgroup said 'max' so we returned None and didn't cap at all.
+    """
+    # Synth a fake /sys/fs/cgroup/memory.max -> 'max' and /proc/meminfo with 8 GiB.
+    cgroup = tmp_path / "memory.max"
+    cgroup.write_text("max\n")
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal:    8388608 kB\nMemFree:    1234 kB\n")
+
+    real_open = open
+
+    def fake_open(path, *a, **kw):
+        if path == "/sys/fs/cgroup/memory.max":
+            return real_open(cgroup, *a, **kw)
+        if path == "/proc/meminfo":
+            return real_open(meminfo, *a, **kw)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    # 8 GiB MemTotal / 1024 = 8192 MiB
+    assert cs._cgroup_mem_mb() == 8192
+
+
+def test_cgroup_mem_mb_prefers_smaller_of_cgroup_and_host(tmp_path, monkeypatch):
+    """When both cgroup and host RAM are bounded, take the tighter constraint."""
+    cgroup = tmp_path / "memory.max"
+    cgroup.write_text(str(4 * 1024 * 1024 * 1024) + "\n")  # 4 GiB cgroup
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal:    16777216 kB\n")  # 16 GiB host
+    real_open = open
+
+    def fake_open(path, *a, **kw):
+        if path == "/sys/fs/cgroup/memory.max":
+            return real_open(cgroup, *a, **kw)
+        if path == "/proc/meminfo":
+            return real_open(meminfo, *a, **kw)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert cs._cgroup_mem_mb() == 4096  # cgroup is tighter
+
+
 def test_cap_workers_whitehorse_does_not_cap():
     # 30 GiB cgroup, Whitehorse-scale bbox: ~1.8 GiB/worker, 27 GiB budget,
     # safe_max ~ 14 workers. Request 6 -> keeps 6.

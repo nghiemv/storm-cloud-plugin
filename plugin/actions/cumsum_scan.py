@@ -252,20 +252,40 @@ def _aorc_cells_from_bounds(bounds: tuple[float, float, float, float]) -> int:
 
 
 def _cgroup_mem_mb() -> int | None:
-    """Read cgroup v2 ``memory.max`` in MiB, or None when unbounded/absent."""
+    """Project an effective memory budget in MiB.
+
+    Tries cgroup v2 ``memory.max`` first; falls back to /proc/meminfo when the
+    cgroup is unbounded (the common case for ``docker run`` without
+    ``--memory``). The kernel will OOM-kill on host-RAM exhaustion regardless
+    of whether docker set a cgroup limit, so the fallback is the right safety
+    bound — not "no limit, run as many workers as you want".
+
+    Returns None only if neither source is readable.
+    """
+    cgroup_mb: int | None = None
     try:
         raw = open("/sys/fs/cgroup/memory.max", encoding="utf-8").read().strip()
-    except (OSError, FileNotFoundError):
-        return None
-    if raw == "max":
-        return None
+        if raw != "max":
+            b = int(raw)
+            if 0 < b < (1 << 62):  # kernel sentinels for "no limit" are huge
+                cgroup_mb = b // (1024 * 1024)
+    except (OSError, FileNotFoundError, ValueError):
+        pass
+
+    host_mb: int | None = None
     try:
-        b = int(raw)
-    except ValueError:
-        return None
-    if b <= 0 or b >= (1 << 62):  # kernel sentinels for "no limit"
-        return None
-    return b // (1024 * 1024)
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    # "MemTotal:    31234567 kB"
+                    host_mb = int(line.split()[1]) // 1024
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+
+    if cgroup_mb is not None and host_mb is not None:
+        return min(cgroup_mb, host_mb)
+    return cgroup_mb if cgroup_mb is not None else host_mb
 
 
 def _estimate_per_worker_mb(
