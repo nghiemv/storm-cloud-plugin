@@ -716,15 +716,23 @@ async function renderPayloads() {
       top_n_events: p.top_n_events || "",
       check_every_n_hours: p.check_every_n_hours || "",
     }));
+    // catalog-prefix entries get a small badge and pass their source +
+    // catalog_key to launchHec so the backend can promote on click.
+    const isUnpromoted = p.source === "catalog-prefix";
+    const sourceArg = esc(JSON.stringify(p.source || "manifests"));
+    const catKeyArg = esc(JSON.stringify(p.catalog_key || ""));
+    const badge = isUnpromoted
+      ? ` <span class="meta" title="will be promoted to manifests/ on first Run">[catalog-prefix]</span>`
+      : "";
     return `
       <div class="row">
         <div class="left">
-          ${title}
+          ${title}${badge}
           ${desc ? `<div class="meta">${esc(desc)}</div>` : ""}
           ${facts ? `<div class="meta">${esc(facts)}</div>` : ""}
           <div class="meta uuid">${esc(p.uuid)}</div>
         </div>
-        <button onclick="launchHec(this, ${uuidArg}, ${cidArg}, ${attrsArg})">Run</button>
+        <button onclick="launchHec(this, ${uuidArg}, ${cidArg}, ${attrsArg}, ${sourceArg}, ${catKeyArg})">Run</button>
       </div>
     `;
   }).join("");
@@ -861,14 +869,20 @@ async function launchLocal(btn) {
   }
 }
 
-async function launchHec(btn, uuid, catalogId, attrs) {
+async function launchHec(btn, uuid, catalogId, attrs, source, catalogKey) {
   btn.disabled = true;
-  btn.textContent = "Launching…";
+  btn.textContent = source === "catalog-prefix" ? "Promoting…" : "Launching…";
   try {
     const r = await getJson("/api/launch/hec", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({uuid, name: catalogId || undefined, attrs: attrs || {}}),
+      body: JSON.stringify({
+        uuid,
+        name: catalogId || undefined,
+        attrs: attrs || {},
+        source: source || "manifests",
+        catalog_key: catalogKey || "",
+      }),
     });
     toast(`Launched ${r.name}`);
     await renderRuns();
@@ -976,6 +990,22 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "missing uuid"}, 400)
                     return
                 attrs = data.get("attrs") or {}
+                # ``catalog-prefix`` entries don't have a manifests/<uuid>/payload
+                # yet — promote them first. ``run.py hec promote`` shells out to
+                # plugin.cli inside Docker and is idempotent, so calling it for
+                # an already-promoted catalog is a cheap no-op.
+                catalog_key = data.get("catalog_key")
+                if data.get("source") == "catalog-prefix" and catalog_key:
+                    r = subprocess.run(
+                        [sys.executable, str(RUN_PY), "hec", "promote", catalog_key],
+                        capture_output=True, text=True, cwd=ROOT,
+                    )
+                    if r.returncode != 0:
+                        self._send_json(
+                            {"error": f"promote failed: {(r.stderr or r.stdout).strip()}"},
+                            500,
+                        )
+                        return
                 self._send_json(
                     {"name": _launch_hec(uuid, data.get("name"), payload_attrs=attrs)}
                 )

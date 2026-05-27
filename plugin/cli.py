@@ -5,9 +5,17 @@ Invoked from run.py via ``docker run --rm ... IMAGE python3.12 -m plugin.cli <su
 
 Subcommands:
     list-payloads          stdout: JSON array of payload records, newest first.
-                           Each record has: uuid, mtime, and (when the payload
-                           body parses cleanly) catalog_id, catalog_description,
+                           Each record has: uuid, mtime, source (``manifests``
+                           or ``catalog-prefix``), and (when the payload body
+                           parses cleanly) catalog_id, catalog_description,
                            start_date, end_date, storm_duration, top_n_events.
+                           ``catalog-prefix`` entries also carry catalog_key.
+                           Read-only — promote-catalog handles writes.
+    promote-catalog <KEY>  Copy s3://$CC_AWS_S3_BUCKET/<KEY> (a catalog-prefix
+                           compute-manifest.json) to manifests/<uuid>/payload,
+                           rewriting it to CC-payload shape. Idempotent.
+                           Prints the resolved UUID to stdout. Called by the
+                           web app's launch path for catalog-prefix entries.
     upload-batch <DIR>     each <DIR>/<jobname>/compute-manifest.json is staged
                            to s3://$CC_AWS_S3_BUCKET/manifests/<uuid>/payload.
     mirror [--year-start Y] [--year-end Y] [--dest-base URI] [--dry-run]
@@ -24,6 +32,7 @@ import json
 import logging
 import os
 import sys
+import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -49,13 +58,36 @@ _PAYLOAD_ATTRS = (
     "top_n_events",
 )
 
+# Top-level bucket prefixes that are never catalogs. Used by catalog-prefix
+# discovery below to skip system / cache namespaces.
+_NON_CATALOG_PREFIXES = {"manifests", "aorc-cache", "aorc-cache-conus"}
+
+
+def _stable_catalog_uuid(catalog_id: str) -> str:
+    """Stable UUID for a catalog-prefix payload — same catalog_id always
+    produces the same UUID, so repeated discovery doesn't create new keys
+    and a later promotion step is idempotent.
+    """
+    return str(_uuid.uuid5(_uuid.NAMESPACE_OID, f"sc-catalog:{catalog_id}"))
+
 
 def _cmd_list_payloads() -> int:
+    """Discover both flavors of payload, emit a unified list.
+
+    1. ``manifests/<uuid>/payload`` — the CC-standard location; entries
+       carry ``source: "manifests"``. Ready to launch.
+
+    2. ``<catalog>/compute-manifest.json`` — catalogs created via the UI's
+       POST /api/catalog whose dual-write to ``manifests/`` never landed.
+       Entries carry ``source: "catalog-prefix"`` and a ``catalog_key``
+       pointing at the manifest object. **Read-only here** — the launch
+       path is responsible for promoting before running.
+    """
     bucket = os.environ["CC_AWS_S3_BUCKET"]
     prefix = f"{os.environ.get('CC_ROOT', 'manifests')}/"
     s3 = _s3_client()
 
-    # Enumerate UUIDs via list_objects_v2 (cheap).
+    # Step 1: enumerate manifests/<uuid>/payload via list_objects_v2.
     found: dict[str, str] = {}
     for page in s3.get_paginator("list_objects_v2").paginate(
         Bucket=bucket, Prefix=prefix
@@ -68,10 +100,10 @@ def _cmd_list_payloads() -> int:
                 mtime = obj.get("LastModified")
                 found[parts[0]] = mtime.isoformat() if mtime else ""
 
-    # Fan-out GetObject calls in parallel so listing 50 payloads doesn't
-    # serialize to 50 × round-trip-time. boto3 clients are thread-safe.
-    def fetch(uuid: str) -> dict:
-        rec: dict = {"uuid": uuid, "mtime": found[uuid]}
+    # Step 2: fan-out GetObject for the manifests/ entries so listing 50
+    # payloads doesn't serialize to 50 × round-trip-time.
+    def fetch_manifest(uuid: str) -> dict:
+        rec: dict = {"uuid": uuid, "mtime": found[uuid], "source": "manifests"}
         try:
             obj = s3.get_object(Bucket=bucket, Key=f"{prefix}{uuid}/payload")
             attrs = json.loads(obj["Body"].read()).get("attributes") or {}
@@ -84,10 +116,119 @@ def _cmd_list_payloads() -> int:
     records: list[dict] = []
     if found:
         with ThreadPoolExecutor(max_workers=8) as pool:
-            records = list(pool.map(fetch, found.keys()))
-        records.sort(key=lambda r: r.get("mtime", ""), reverse=True)
+            records = list(pool.map(fetch_manifest, found.keys()))
 
+    # Step 3: discover catalog-prefix payloads. Skip any catalog_id that
+    # already has a manifests/ entry — those are already runnable.
+    already_listed = {r.get("catalog_id") for r in records if r.get("catalog_id")}
+
+    def fetch_catalog_prefix(name: str) -> dict | None:
+        try:
+            obj = s3.get_object(
+                Bucket=bucket, Key=f"{name}/compute-manifest.json"
+            )
+            mtime = obj.get("LastModified")
+            manifest = json.loads(obj["Body"].read())
+        except Exception:
+            return None
+        inputs = manifest.get("inputs") or {}
+        attrs = (
+            inputs.get("payload_attributes") or {}
+            if isinstance(inputs, dict)
+            else {}
+        )
+        catalog_id = attrs.get("catalog_id") or name
+        if catalog_id in already_listed:
+            return None
+        rec: dict = {
+            "uuid": _stable_catalog_uuid(catalog_id),
+            "mtime": mtime.isoformat() if mtime else "",
+            "source": "catalog-prefix",
+            "catalog_key": f"{name}/compute-manifest.json",
+        }
+        for key in _PAYLOAD_ATTRS:
+            rec[key] = attrs.get(key, "")
+        return rec
+
+    candidate_names: list[str] = []
+    for page in s3.get_paginator("list_objects_v2").paginate(
+        Bucket=bucket, Delimiter="/"
+    ):
+        for cp in page.get("CommonPrefixes") or []:
+            name = cp["Prefix"].rstrip("/")
+            if name not in _NON_CATALOG_PREFIXES:
+                candidate_names.append(name)
+
+    if candidate_names:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for rec in pool.map(fetch_catalog_prefix, candidate_names):
+                if rec is not None:
+                    records.append(rec)
+
+    records.sort(key=lambda r: r.get("mtime", ""), reverse=True)
     json.dump(records, sys.stdout)
+    return 0
+
+
+def _cmd_promote_catalog(catalog_key: str) -> int:
+    """Copy ``<catalog>/compute-manifest.json`` to ``manifests/<uuid>/payload``,
+    rewriting the JSON to CC-payload shape. Idempotent — re-running is a
+    no-op once the target key exists.
+
+    The web app's launch path calls this for ``source: catalog-prefix``
+    entries before kicking off the container, so the docker run sees a
+    standard manifests/<uuid>/payload.
+    """
+    bucket = os.environ["CC_AWS_S3_BUCKET"]
+    prefix = f"{os.environ.get('CC_ROOT', 'manifests')}/"
+    s3 = _s3_client()
+
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=catalog_key)
+    except Exception as e:
+        print(f"error: cannot read {catalog_key}: {e}", file=sys.stderr)
+        return 1
+    manifest = json.loads(obj["Body"].read())
+    inputs = manifest.get("inputs") or {}
+    attrs = (
+        inputs.get("payload_attributes") or {}
+        if isinstance(inputs, dict)
+        else {}
+    )
+    catalog_id = attrs.get("catalog_id")
+    if not catalog_id:
+        print(f"error: {catalog_key} has no catalog_id in attributes", file=sys.stderr)
+        return 1
+
+    new_uuid = _stable_catalog_uuid(catalog_id)
+    payload_key = f"{prefix}{new_uuid}/payload"
+    try:
+        s3.head_object(Bucket=bucket, Key=payload_key)
+        print(f"already promoted: {payload_key}")
+        print(new_uuid)
+        return 0
+    except Exception:
+        pass
+
+    # Compute-manifest shape -> CC payload shape: attributes lifted from
+    # inputs.payload_attributes, inputs flattened to inputs.data_sources.
+    payload_body = {
+        "attributes": attrs,
+        "stores": manifest.get("stores", []),
+        "inputs": (inputs.get("data_sources") or [])
+        if isinstance(inputs, dict)
+        else inputs,
+        "outputs": manifest.get("outputs", []),
+        "actions": manifest.get("actions", []),
+    }
+    s3.put_object(
+        Bucket=bucket,
+        Key=payload_key,
+        Body=json.dumps(payload_body).encode(),
+        ContentType="application/json",
+    )
+    print(f"promoted: {catalog_key} -> {payload_key}")
+    print(new_uuid)
     return 0
 
 
@@ -437,6 +578,8 @@ def main() -> int:
     cmd, args = sys.argv[1], sys.argv[2:]
     if cmd == "list-payloads" and not args:
         return _cmd_list_payloads()
+    if cmd == "promote-catalog" and len(args) == 1:
+        return _cmd_promote_catalog(args[0])
     if cmd == "upload-batch" and len(args) == 1:
         return _cmd_upload_batch(args[0])
     if cmd == "mirror":

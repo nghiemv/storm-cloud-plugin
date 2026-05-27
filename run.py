@@ -142,12 +142,18 @@ _FORWARDED_HEC_ENV = (
 
 
 def _docker_plugin_cli(
-    subcmd: list[str], *, mounts: list[tuple[Path, str, str]] = ()
-) -> subprocess.CompletedProcess:
+    subcmd: list[str],
+    *,
+    mounts: list[tuple[Path, str, str]] = (),
+    capture: bool = True,
+):
     """Run ``python3.12 -m plugin.cli <subcmd>`` inside the plugin image.
 
     Keeps the host stdlib-only — boto3 lives in the image, not on PATH.
     Forwards CC_AWS_* env so the in-container S3 client authenticates.
+
+    Returns the subprocess return code when ``capture=False`` (output goes
+    straight to the host terminal); otherwise the full ``CompletedProcess``.
     """
     args = [
         "docker",
@@ -167,7 +173,9 @@ def _docker_plugin_cli(
         "plugin.cli",
         *subcmd,
     ]
-    return subprocess.run(args, capture_output=True, text=True, cwd=ROOT)
+    if capture:
+        return subprocess.run(args, capture_output=True, text=True, cwd=ROOT)
+    return subprocess.call(args, cwd=ROOT)
 
 
 def _list_hec_payloads() -> list[dict]:
@@ -316,12 +324,15 @@ def cmd_hec(args: list[str]) -> None:
     """Run the plugin against HEC S3.
 
     Usage:
-      ./run.py hec                    List payloads in S3 and pick one interactively
-      ./run.py hec list               TSV columns: uuid, catalog_id, start_date,
-                                      storm_duration, mtime
-      ./run.py hec list --json        Full structured JSON (all attributes)
-      ./run.py hec UUID [NAME]        Run that payload (NAME = output subdir name;
-                                      defaults to catalog_id from the payload, then UUID)
+      ./run.py hec                       List payloads in S3 and pick one interactively
+      ./run.py hec list                  TSV columns: uuid, catalog_id, start_date,
+                                         storm_duration, mtime
+      ./run.py hec list --json           Full structured JSON (all attributes)
+      ./run.py hec promote <KEY>         Promote a catalog-prefix compute-manifest.json
+                                         to manifests/<uuid>/payload. Prints the UUID
+                                         on success. Idempotent. Used by the web UI.
+      ./run.py hec UUID [NAME]           Run that payload (NAME = output subdir name;
+                                         defaults to catalog_id from the payload, then UUID)
     """
     _require_hec_env()
 
@@ -351,6 +362,16 @@ def cmd_hec(args: list[str]) -> None:
                 )
             )
         return
+
+    if args[0] == "promote":
+        if len(args) != 2:
+            print("usage: ./run.py hec promote <CATALOG_KEY>", file=sys.stderr)
+            sys.exit(2)
+        # plugin.cli prints "promoted: ..." / "already promoted: ..." to stdout,
+        # followed by the UUID on the last line. Forward stdout verbatim so the
+        # caller can scrape the UUID from the tail.
+        r = _docker_plugin_cli(["promote-catalog", args[1]], capture=False)
+        sys.exit(r)
 
     uuid = args[0]
     name = args[1] if len(args) > 1 else uuid
