@@ -286,6 +286,8 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
     # unchanged until the operator flips it on.
     if os.environ.get("CC_VECTORIZED_SCAN"):
         dask_env["CC_VECTORIZED_SCAN"] = os.environ["CC_VECTORIZED_SCAN"]
+    if os.environ.get("CC_CUMSUM_SCAN"):
+        dask_env["CC_CUMSUM_SCAN"] = os.environ["CC_CUMSUM_SCAN"]
     sh(
         [
             "docker",

@@ -28,8 +28,8 @@ At any valid shift the watershed window only overlaps cells that were
 finite in the original data, so treating NaN as 0 in the running sum
 cannot perturb any mean we'll actually emit.
 
-Gating: opt-in via ``CC_CUMSUM_SCAN=1``. Chunk size: ``CC_CUMSUM_CHUNK_HOURS``
-(default 720).
+Gating: on by default — set ``CC_CUMSUM_SCAN=0`` to opt out. Chunk size:
+``CC_CUMSUM_CHUNK_HOURS`` (default 720).
 """
 
 from __future__ import annotations
@@ -37,23 +37,30 @@ from __future__ import annotations
 import datetime
 import gc
 import logging
+import multiprocessing
 import os
 import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable
 
 import numpy as np
 
 log = logging.getLogger(__name__)
 
+# Spawn, not fork: s3fs's async event-loop thread doesn't survive fork()
+# and deadlocks child Event.wait() on first S3 read. Same fix used in
+# convert_to_dss and stormhub's own pools.
+_SPAWN_CTX = multiprocessing.get_context("spawn")
+
 
 def enabled() -> bool:
-    """Whether the cumsum-scan path is active. Opt-in via env."""
-    return os.environ.get("CC_CUMSUM_SCAN", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+    """Whether the cumsum-scan path is active. On by default; set CC_CUMSUM_SCAN=0 to opt out."""
+    return os.environ.get("CC_CUMSUM_SCAN", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
     )
 
 
@@ -99,211 +106,363 @@ def cumsum_collect_event_stats(
 ) -> None:
     """Drop-in replacement for ``stormhub.met.storm_catalog.collect_event_stats``.
 
-    Streams each year's transposition-bbox precip in 1-month chunks,
-    accumulating a running cumulative sum and snapshotting it at the
-    indices each storm-date needs. Memory bounded to ~one chunk's worth.
+    Groups storm-dates by year, then processes years in parallel via
+    ProcessPoolExecutor (one worker per year, fan-out capped at
+    ``num_workers``). Each worker streams its year's transposition-bbox
+    precip in 1-month chunks, accumulating a running cumulative sum and
+    snapshotting it at the indices each storm-date needs. Memory per
+    worker is bounded to ~one chunk + snapshot pool (~3 GB).
     """
     from shapely.geometry import shape
-    from stormhub.met.consts import (
-        AORC_PRECIP_VARIABLE,
-        NOAA_AORC_S3_BASE_URL,
-    )
-    from stormhub.met.transpose import Transpose
-    from stormhub.met.zarr_to_dss import open_aorc_zarr
 
     if not collection_id:
         collection_id = catalog.spm.storm_collection_id(storm_duration)
     collection_dir = catalog.spm.collection_dir(collection_id)
     os.makedirs(collection_dir, exist_ok=True)
-
     csv_path = os.path.join(collection_dir, "storm-stats.csv")
-    if not os.path.exists(csv_path):
-        with open(csv_path, "w", encoding="utf-8") as f:
-            f.write("storm_date,min,mean,max,x,y\n")
 
+    # Geometries are picklable; the catalog itself isn't (file refs +
+    # pystac links). Workers receive only the primitives they need.
     watershed_geom = shape(catalog.watershed.geometry)
     transposition_geom = shape(catalog.valid_transposition_region.geometry)
-    bounds = transposition_geom.bounds
 
     by_year: dict[int, list] = defaultdict(list)
     for d in event_dates:
         by_year[d.year].append(d)
+    years_sorted = sorted(by_year.keys())
 
     total = len(event_dates)
-    completed = 0
-    skipped = 0
     t_overall = time.monotonic()
 
-    for year in sorted(by_year.keys()):
-        dates_in_year = sorted(by_year[year])
-        t_year = time.monotonic()
+    if not years_sorted:
+        # No dates to process — emit the header-only CSV upstream expects.
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("storm_date,min,mean,max,x,y\n")
+        log.info("[cumsum-scan] DONE: no event dates supplied")
+        return
 
-        # Open year(s) — cross-year storm windows need year+1 too.
-        max_end = max(d + datetime.timedelta(hours=storm_duration) for d in dates_in_year)
-        years_needed = list(range(year, max_end.year + 1))
-        paths = tuple(f"{NOAA_AORC_S3_BASE_URL}/{y}.zarr" for y in years_needed)
-        log.info(
-            "[cumsum-scan] year=%s opening %s for %d dates",
-            year, paths, len(dates_in_year),
-        )
-
-        ds = open_aorc_zarr(paths)
-        precip_da = ds[AORC_PRECIP_VARIABLE].sel(
-            longitude=slice(bounds[0], bounds[2]),
-            latitude=slice(bounds[1], bounds[3]),
-        )
-        # rio.clip is eager — masks outside-polygon cells with NaN but
-        # the lazy structure is preserved if the source was dask-backed.
-        precip_da = precip_da.rio.clip(
-            [transposition_geom], drop=True, all_touched=True
-        )
-
-        T = precip_da.sizes["time"]
-        Y = precip_da.sizes["latitude"]
-        X = precip_da.sizes["longitude"]
-        log.info(
-            "[cumsum-scan] year=%d clipped time=%d lat=%d lon=%d (~%.1f GB cube avoided)",
-            year, T, Y, X, T * Y * X * 4 / 1e9,
-        )
-
-        # Map zarr-time to integer index using a small probe.
-        times_np = precip_da.time.values
-        time_to_idx: dict[datetime.datetime, int] = {}
-        for i, t in enumerate(times_np):
-            ts = (t - np.datetime64("1970-01-01T00:00:00")) / np.timedelta64(1, "s")
-            time_to_idx[datetime.datetime.utcfromtimestamp(float(ts))] = i
-
-        # Build the set of cumsum-indices each date needs.
-        date_to_io = {}
-        toi: set[int] = {0}  # snapshot[0] = zeros (used as the lower edge for early-year windows)
-        for d in dates_in_year:
-            start_t = d + datetime.timedelta(hours=1)
-            end_t = d + datetime.timedelta(hours=storm_duration)
-            i0 = time_to_idx.get(start_t)
-            i1 = time_to_idx.get(end_t)
-            if i0 is None or i1 is None:
-                continue
-            date_to_io[d] = (i0, i1 + 1)
-            toi.add(i0)
-            toi.add(i1 + 1)
-        toi_sorted = sorted(toi)
-        log.info(
-            "[cumsum-scan] year=%d %d snapshots over T=%d",
-            year, len(toi_sorted), T,
-        )
-
-        # Stream the precip cube in CC_CUMSUM_CHUNK_HOURS slabs, maintain
-        # a running cumulative sum, snapshot at each time-of-interest.
-        running = np.zeros((Y, X), dtype=np.float64)
-        snapshots: dict[int, np.ndarray] = {0: running.copy()}
-        t_stream = time.monotonic()
-        bytes_streamed = 0
-        next_toi_idx = 1  # toi_sorted[0] == 0, already snapshotted
-
-        chunk_h = _CHUNK_HOURS
-        for chunk_start in range(0, T, chunk_h):
-            chunk_end = min(chunk_start + chunk_h, T)
-            t_chunk_load = time.monotonic()
-            chunk = (
-                precip_da.isel(time=slice(chunk_start, chunk_end))
-                .compute()
-                .values
-            )  # (chunk_h, Y, X) float32
-            bytes_streamed += chunk.nbytes
-
-            chunk_filled = np.where(np.isfinite(chunk), chunk, 0.0).astype(np.float64)
-            chunk_cum = np.cumsum(chunk_filled, axis=0)
-            del chunk, chunk_filled
-
-            # Snapshot any time-of-interest that falls in (chunk_start, chunk_end].
-            # cumsum[t] = sum precip[0..t-1] = running (sum before chunk) + chunk_cum[t - chunk_start - 1].
-            while next_toi_idx < len(toi_sorted):
-                t_idx = toi_sorted[next_toi_idx]
-                if t_idx <= chunk_start:
-                    # already past, snapshot already taken (or t_idx=0)
-                    next_toi_idx += 1
-                    continue
-                if t_idx > chunk_end:
-                    break
-                local = t_idx - chunk_start - 1  # 0..chunk_cum.shape[0]-1
-                snapshots[t_idx] = running + chunk_cum[local]
-                next_toi_idx += 1
-
-            running = running + chunk_cum[-1]
-            del chunk_cum
-
-            log.debug(
-                "[cumsum-scan] year=%d chunk %d-%d loaded in %.1fs",
-                year, chunk_start, chunk_end, time.monotonic() - t_chunk_load,
-            )
-
-        log.info(
-            "[cumsum-scan] year=%d stream done %.1fs (%.1f GB read, %d snapshots)",
-            year,
-            time.monotonic() - t_stream,
-            bytes_streamed / 1e9,
-            len(snapshots),
-        )
-
-        # Build Transpose from a 2D template with the rio.clip NaN pattern.
-        # valid_shifts + watershed_mask are computed once and reused as we
-        # swap in cumsum-derived window sums.
-        template = precip_da.isel(time=0).compute()
-        transpose_obj = Transpose(
-            template, watershed_geom, "longitude", "latitude"
-        )
-        _ = transpose_obj.valid_shifts
-
-        t_dates = time.monotonic()
-        for storm_start in dates_in_year:
-            io = date_to_io.get(storm_start)
-            if io is None:
-                skipped += 1
-                continue
-            i0, i1p1 = io
-            window_sum = snapshots[i1p1] - snapshots[i0]
-
-            transpose_obj._np_data_array = window_sum  # float64
-            poly, _aff, stats = transpose_obj.max_transpose(_create_stats)
-            centroid = poly.centroid
-
-            line = (
-                f"{storm_start.strftime('%Y-%m-%dT%H')},"
-                f"{stats['min']},{stats['mean']},{stats['max']},"
-                f"{centroid.x},{centroid.y}\n"
-            )
-            with open(csv_path, "a", encoding="utf-8") as f:
-                f.write(line)
-            completed += 1
-            if completed % 500 == 0:
-                rate = completed / (time.monotonic() - t_overall)
-                eta_s = (total - completed) / rate if rate else 0
-                log.info(
-                    "[cumsum-scan] %d/%d (%.2f/s) ETA %.1fh skipped=%d",
-                    completed, total, rate, eta_s / 3600, skipped,
-                )
-
-        log.info(
-            "[cumsum-scan] year=%d per-date pass: %.1fs (%d dates, %.3fs/date) — year total %.1fs",
-            year,
-            time.monotonic() - t_dates,
-            len(date_to_io),
-            (time.monotonic() - t_dates) / max(1, len(date_to_io)),
-            time.monotonic() - t_year,
-        )
-
-        del snapshots, running, transpose_obj
-        gc.collect()
-
+    workers = max(1, int(num_workers or 1))
+    workers = min(workers, len(years_sorted))
     log.info(
-        "[cumsum-scan] DONE: %d/%d processed (skipped=%d) in %.1fs",
-        completed, total, skipped, time.monotonic() - t_overall,
+        "[cumsum-scan] dispatching %d years across %d worker(s)",
+        len(years_sorted),
+        workers,
     )
+
+    # Per-year results: year -> (lines, completed, skipped). Workers may
+    # complete out of order; we sort by year when writing the final CSV.
+    results: dict[int, tuple[list[str], int, int]] = {}
+    failed_years: list[tuple[int, str]] = []
+
+    def _submit_args(year: int):
+        return (
+            year,
+            sorted(by_year[year]),
+            storm_duration,
+            watershed_geom,
+            transposition_geom,
+            _CHUNK_HOURS,
+        )
+
+    if workers == 1:
+        # Sequential path — keeps a single process for debugging and
+        # matches the legacy in-process execution.
+        for year in years_sorted:
+            try:
+                y, lines, c, s = _process_one_year(*_submit_args(year))
+                results[y] = (lines, c, s)
+                _log_year_done(y, c, s, len(results), len(years_sorted), t_overall)
+            except Exception as e:
+                log.error("[cumsum-scan] year=%d FAILED: %s", year, e)
+                failed_years.append((year, str(e)))
+    else:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=_SPAWN_CTX) as ex:
+            futures = {
+                ex.submit(_process_one_year, *_submit_args(y)): y for y in years_sorted
+            }
+            for fut in as_completed(futures):
+                year = futures[fut]
+                try:
+                    y, lines, c, s = fut.result()
+                    results[y] = (lines, c, s)
+                    _log_year_done(y, c, s, len(results), len(years_sorted), t_overall)
+                except Exception as e:
+                    log.error("[cumsum-scan] year=%d FAILED: %s", year, e)
+                    failed_years.append((year, str(e)))
+
+    # Write CSV once at end, in year-sorted order. Header first; idempotency
+    # is "all-or-nothing" — interrupted runs get partial results and the
+    # operator wipes the dir to re-launch. (Resume across crashes would
+    # require per-year temp files; not worth the complexity vs ~10 min
+    # full-rerun cost.)
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("storm_date,min,mean,max,x,y\n")
+        for year in sorted(results):
+            f.writelines(results[year][0])
+
+    completed = sum(r[1] for r in results.values())
+    skipped = sum(r[2] for r in results.values())
+    log.info(
+        "[cumsum-scan] DONE: %d/%d processed (skipped=%d, failed_years=%d) in %.1fs",
+        completed,
+        total,
+        skipped,
+        len(failed_years),
+        time.monotonic() - t_overall,
+    )
+    if failed_years:
+        # Surface per-year failures but don't raise — the run continues with
+        # whatever years succeeded, matching the per-storm-date soft-error
+        # behaviour of the upstream parallel_threads path.
+        for y, msg in failed_years:
+            log.error("[cumsum-scan] year=%d unrecoverable: %s", y, msg)
+
+
+def _log_year_done(year, completed, skipped, done_count, total_years, t_overall):
+    elapsed = time.monotonic() - t_overall
+    log.info(
+        "[cumsum-scan] year=%d done (completed=%d, skipped=%d) — %d/%d years in %.1fs",
+        year,
+        completed,
+        skipped,
+        done_count,
+        total_years,
+        elapsed,
+    )
+
+
+def _open_aorc_resilient(years_needed, bounds, transposition_geom):
+    """Open AORC zarr for ``years_needed``, falling back when years are missing.
+
+    Returns ``(precip_da, years_actually_opened)``. If the trailing year
+    (``year+1``) is missing from the private cache (e.g. partial-year
+    upload still in progress), retries with just ``[year]`` and cross-year
+    storms will be auto-skipped by ``time_to_idx`` lookups (their end
+    index falls outside the dataset).
+
+    Raises if even the primary year is unreadable.
+    """
+    from stormhub.met.consts import AORC_PRECIP_VARIABLE, NOAA_AORC_S3_BASE_URL
+    from stormhub.met.zarr_to_dss import open_aorc_zarr
+
+    remaining = list(years_needed)
+    while remaining:
+        paths = tuple(f"{NOAA_AORC_S3_BASE_URL}/{y}.zarr" for y in remaining)
+        try:
+            ds = open_aorc_zarr(paths)
+            precip_da = ds[AORC_PRECIP_VARIABLE].sel(
+                longitude=slice(bounds[0], bounds[2]),
+                latitude=slice(bounds[1], bounds[3]),
+            )
+            precip_da = precip_da.rio.clip(
+                [transposition_geom], drop=True, all_touched=True
+            )
+            # Force a metadata read so missing keys raise here, not later
+            # mid-stream when the failure is harder to recover from.
+            _ = precip_da.sizes
+            return precip_da, remaining
+        except (KeyError, FileNotFoundError) as e:
+            if len(remaining) == 1:
+                raise  # primary year missing — caller decides what to do
+            dropped = remaining.pop()
+            logging.getLogger(__name__).warning(
+                "[cumsum-scan] open failed for %s (%s); retrying without year=%d",
+                paths,
+                e,
+                dropped,
+            )
+
+
+def _process_one_year(
+    year: int,
+    dates_in_year: list,
+    storm_duration: int,
+    watershed_geom: Any,
+    transposition_geom: Any,
+    chunk_hours: int,
+) -> tuple[int, list[str], int, int]:
+    """Process one year's storm-dates. Returns ``(year, csv_lines, completed, skipped)``.
+
+    Runs in a spawn-based subprocess via ProcessPoolExecutor — must not
+    reference unpicklable module-level state. Reinstalls the
+    ``vectorized_transpose`` monkey-patch because spawn workers re-import
+    stormhub fresh and would otherwise fall back to the 100× slower
+    Python loop in ``Transpose.max_transpose``.
+    """
+    # Worker-local logging — main process uses the root logger, but each
+    # spawn worker starts with no handlers configured.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    wlog = logging.getLogger(f"cumsum.year{year}")
+
+    from stormhub.met.transpose import Transpose
+
+    # Patch must be installed inside the worker process — main-process
+    # monkey-patches do not survive spawn re-import.
+    from plugin.actions import vectorized_transpose
+
+    vectorized_transpose.install()
+
+    bounds = transposition_geom.bounds
+    t_year = time.monotonic()
+
+    max_end = max(d + datetime.timedelta(hours=storm_duration) for d in dates_in_year)
+    years_needed = list(range(year, max_end.year + 1))
+    wlog.info(
+        "[cumsum-scan] year=%s requesting years=%s for %d dates",
+        year,
+        years_needed,
+        len(dates_in_year),
+    )
+
+    try:
+        precip_da, years_opened = _open_aorc_resilient(
+            years_needed, bounds, transposition_geom
+        )
+    except Exception as e:
+        wlog.error("[cumsum-scan] year=%d cannot open AORC: %s", year, e)
+        # Skip entire year. Caller treats the empty result as soft-failure.
+        return year, [], 0, len(dates_in_year)
+
+    if years_opened != years_needed:
+        wlog.warning(
+            "[cumsum-scan] year=%d opened only %s (cross-year storms will skip)",
+            year,
+            years_opened,
+        )
+
+    T = precip_da.sizes["time"]
+    Y = precip_da.sizes["latitude"]
+    X = precip_da.sizes["longitude"]
+    wlog.info(
+        "[cumsum-scan] year=%d clipped time=%d lat=%d lon=%d (~%.1f GB cube avoided)",
+        year,
+        T,
+        Y,
+        X,
+        T * Y * X * 4 / 1e9,
+    )
+
+    # Map zarr-time to integer index using a small probe.
+    times_np = precip_da.time.values
+    time_to_idx: dict[datetime.datetime, int] = {}
+    for i, t in enumerate(times_np):
+        ts = (t - np.datetime64("1970-01-01T00:00:00")) / np.timedelta64(1, "s")
+        time_to_idx[datetime.datetime.utcfromtimestamp(float(ts))] = i
+
+    # Build the set of cumsum-indices each date needs.
+    date_to_io = {}
+    toi: set[int] = {
+        0
+    }  # snapshot[0] = zeros (used as lower edge for early-year windows)
+    for d in dates_in_year:
+        start_t = d + datetime.timedelta(hours=1)
+        end_t = d + datetime.timedelta(hours=storm_duration)
+        i0 = time_to_idx.get(start_t)
+        i1 = time_to_idx.get(end_t)
+        if i0 is None or i1 is None:
+            continue
+        date_to_io[d] = (i0, i1 + 1)
+        toi.add(i0)
+        toi.add(i1 + 1)
+    toi_sorted = sorted(toi)
+    wlog.info(
+        "[cumsum-scan] year=%d %d snapshots over T=%d",
+        year,
+        len(toi_sorted),
+        T,
+    )
+
+    # Stream the precip cube in chunk_hours slabs, maintain a running
+    # cumulative sum, snapshot at each time-of-interest.
+    running = np.zeros((Y, X), dtype=np.float64)
+    snapshots: dict[int, np.ndarray] = {0: running.copy()}
+    t_stream = time.monotonic()
+    bytes_streamed = 0
+    next_toi_idx = 1  # toi_sorted[0] == 0, already snapshotted
+
+    for chunk_start in range(0, T, chunk_hours):
+        chunk_end = min(chunk_start + chunk_hours, T)
+        chunk = (
+            precip_da.isel(time=slice(chunk_start, chunk_end)).compute().values
+        )  # (chunk_hours, Y, X) float32
+        bytes_streamed += chunk.nbytes
+
+        chunk_filled = np.where(np.isfinite(chunk), chunk, 0.0).astype(np.float64)
+        chunk_cum = np.cumsum(chunk_filled, axis=0)
+        del chunk, chunk_filled
+
+        # Snapshot any time-of-interest that falls in (chunk_start, chunk_end].
+        # cumsum[t] = sum precip[0..t-1] = running (sum before chunk) + chunk_cum[t - chunk_start - 1].
+        while next_toi_idx < len(toi_sorted):
+            t_idx = toi_sorted[next_toi_idx]
+            if t_idx <= chunk_start:
+                next_toi_idx += 1
+                continue
+            if t_idx > chunk_end:
+                break
+            local = t_idx - chunk_start - 1
+            snapshots[t_idx] = running + chunk_cum[local]
+            next_toi_idx += 1
+
+        running = running + chunk_cum[-1]
+        del chunk_cum
+
+    wlog.info(
+        "[cumsum-scan] year=%d stream done %.1fs (%.1f GB read, %d snapshots)",
+        year,
+        time.monotonic() - t_stream,
+        bytes_streamed / 1e9,
+        len(snapshots),
+    )
+
+    # Build Transpose from a 2D template with the rio.clip NaN pattern.
+    template = precip_da.isel(time=0).compute()
+    transpose_obj = Transpose(template, watershed_geom, "longitude", "latitude")
+    _ = transpose_obj.valid_shifts
+
+    lines: list[str] = []
+    skipped = 0
+    completed = 0
+    t_dates = time.monotonic()
+    for storm_start in dates_in_year:
+        io = date_to_io.get(storm_start)
+        if io is None:
+            skipped += 1
+            continue
+        i0, i1p1 = io
+        window_sum = snapshots[i1p1] - snapshots[i0]
+
+        transpose_obj._np_data_array = window_sum  # float64
+        poly, _aff, stats = transpose_obj.max_transpose(_create_stats)
+        centroid = poly.centroid
+        lines.append(
+            f"{storm_start.strftime('%Y-%m-%dT%H')},"
+            f"{stats['min']},{stats['mean']},{stats['max']},"
+            f"{centroid.x},{centroid.y}\n"
+        )
+        completed += 1
+
+    wlog.info(
+        "[cumsum-scan] year=%d per-date pass: %.1fs (%d dates, %.3fs/date) — year total %.1fs",
+        year,
+        time.monotonic() - t_dates,
+        len(date_to_io),
+        (time.monotonic() - t_dates) / max(1, len(date_to_io)),
+        time.monotonic() - t_year,
+    )
+
+    del snapshots, running, transpose_obj
+    gc.collect()
+    return year, lines, completed, skipped
 
 
 def _create_stats(array: np.ndarray) -> dict:
     """Match ``stormhub.met.aorc.aorc.AORCItem._create_stats``."""
     from stormhub.met.consts import MM_TO_INCH_CONVERSION_FACTOR
+
     return {
         "min": round(float(np.nanmin(array)) * MM_TO_INCH_CONVERSION_FACTOR, 2),
         "mean": round(float(np.nanmean(array)) * MM_TO_INCH_CONVERSION_FACTOR, 2),

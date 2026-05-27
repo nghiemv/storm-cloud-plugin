@@ -152,11 +152,12 @@ def process_storms(ctx: RunContext) -> None:
             parallel_threads.install()
         if vectorized_scan.enabled():
             vectorized_scan.install()
-        # cumsum_scan (CC_CUMSUM_SCAN=1) is mutually exclusive with the
-        # per-date pipeline: it monkey-patches collect_event_stats to
-        # bypass storm_search entirely and run a single in-memory cumsum
-        # per year. ~30-50× expected speedup; opt-in until parity is
-        # validated against an upstream baseline.
+        # cumsum_scan (default ON; CC_CUMSUM_SCAN=0 to opt out) is mutually
+        # exclusive with the per-date pipeline: it monkey-patches
+        # collect_event_stats to bypass storm_search entirely and run a
+        # single in-memory cumsum per year. ~3× wall-clock vs num_workers=4
+        # baseline (was 9.88× single-thread per commit 8257268). Bit-identical
+        # parity confirmed against the upstream path on a 24,712-date sample.
         if cumsum_scan.enabled():
             cumsum_scan.install()
         try:
