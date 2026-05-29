@@ -76,6 +76,31 @@ def _read_json(p: Path) -> Any | None:
         return None
 
 
+def write_launch_json(
+    run_dir: Path,
+    *,
+    args,
+    pid: int,
+    payload_uuid: str | None = None,
+    payload_attrs: dict | None = None,
+    source: str | None = None,
+) -> None:
+    """Write the launch record _list_runs() reads to recognise + monitor a run.
+
+    Single source of truth for the schema, shared by app.py (web launch) and
+    run.py (CLI launch) so the two can't drift — a mismatch silently breaks
+    progress/ETA. ``pid`` is the launcher process the UI checks for liveness.
+    """
+    rec = {
+        "launched_at": time.time(),
+        "args": list(args),
+        "pid": pid,
+        "payload_uuid": payload_uuid,
+        "payload_attrs": payload_attrs or {},
+    }
+    if source:
+        rec["source"] = source
+    (run_dir / "launch.json").write_text(json.dumps(rec))
 
 
 def _mc_available() -> bool:
@@ -1831,16 +1856,12 @@ def _launch(
         stdin=subprocess.DEVNULL,
         **_DETACH_KWARGS,
     )
-    (run_dir / "launch.json").write_text(
-        json.dumps(
-            {
-                "launched_at": time.time(),
-                "args": args,
-                "pid": proc.pid,
-                "payload_uuid": payload_uuid,
-                "payload_attrs": payload_attrs or {},
-            }
-        )
+    write_launch_json(
+        run_dir,
+        args=args,
+        pid=proc.pid,
+        payload_uuid=payload_uuid,
+        payload_attrs=payload_attrs,
     )
     return safe
 

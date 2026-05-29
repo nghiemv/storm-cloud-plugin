@@ -35,11 +35,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Shared host plumbing lives in app.py (the single home for these), so the CLI
+# launcher and the web server can't drift on env loading, name sanitisation, or
+# the launch.json schema. app.py is stdlib-only and imports nothing from run.py.
+from app import _load_hec_env, _safe_subdir, serve, write_launch_json
+
 ROOT = Path(__file__).resolve().parent
 COMPUTE = ROOT / "compute"
 LOCAL = COMPUTE / "local"
-HEC = COMPUTE / "hec"
-HEC_ENV_FILE = HEC / "env"
 COMPOSE = ["docker", "compose", "-f", str(LOCAL / "compose.yaml")]
 DEFAULT_PAYLOAD = LOCAL / "sample" / "payload.json"
 # Local tag — `./run.py build` produces this. For prod images pulled from
@@ -102,23 +105,6 @@ _HEC_REQUIRED = (
     "CC_AWS_ENDPOINT",
     "CC_AWS_S3_BUCKET",
 )
-
-
-def _load_hec_env() -> None:
-    """Overlay compute/hec/env onto os.environ if it exists.
-
-    Existing env vars win (so an explicit `export FOO=...` overrides the file).
-    Quietly no-op if the file is absent — the user gets a clearer error
-    from _require_hec_env() pointing at the template.
-    """
-    if not HEC_ENV_FILE.is_file():
-        return
-    for line in HEC_ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 def _require_hec_env() -> None:
@@ -189,14 +175,6 @@ def _list_hec_payloads() -> list[dict]:
         sys.stderr.write(r.stderr)
         sys.exit(r.returncode)
     return json.loads(r.stdout or "[]")
-
-
-def _safe_subdir(name: str) -> str:
-    """Filesystem-safe coercion for use as a compute/outputs/<name>/ subdir."""
-    import re
-
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
-    return cleaned or "run"
 
 
 def _pick_hec_payload() -> tuple[str, str] | None:
@@ -277,8 +255,6 @@ def _docker_memory_flags() -> list[str]:
 
 
 def _run_hec_job(uuid: str, name: str | None = None) -> None:
-    import time as _time
-
     name = _safe_subdir(name or uuid)
     run_dir = COMPUTE / "outputs" / name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -286,25 +262,19 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
     # any stale id from a prior run before relaunching.
     cidfile = run_dir / "container.id"
     cidfile.unlink(missing_ok=True)
-    # Write a minimal launch.json so app.py's _known_runs() (which filters
-    # by launch.json presence) recognises CLI-launched runs the same way it
-    # recognises app.py-launched ones. catalog_id is the run name by default;
-    # CC SDK plugin reads the real catalog_id from the S3 payload at runtime.
-    # Record our own pid: this process IS the launcher the web UI monitors for
-    # liveness (app.py Popens us), and we overwrite the launch.json app.py
-    # wrote — without this, the pid is lost and the UI marks every progressed
-    # run "interrupted".
-    (run_dir / "launch.json").write_text(
-        json.dumps(
-            {
-                "launched_at": _time.time(),
-                "pid": os.getpid(),
-                "args": list(sys.argv),
-                "payload_uuid": uuid,
-                "payload_attrs": {"catalog_id": name},
-                "source": "run.py hec",
-            }
-        )
+    # Write launch.json so app.py's _known_runs() (which filters by launch.json
+    # presence) recognises CLI-launched runs. catalog_id defaults to the run
+    # name; the plugin reads the real one from the S3 payload at runtime. We
+    # record our own pid — this process IS the launcher the web UI monitors for
+    # liveness (app.py Popens us) — and overwrite the launch.json app.py wrote;
+    # without our pid the UI marks every progressed run "interrupted".
+    write_launch_json(
+        run_dir,
+        args=sys.argv,
+        pid=os.getpid(),
+        payload_uuid=uuid,
+        payload_attrs={"catalog_id": name},
+        source="run.py hec",
     )
     print(f"Running HEC S3: payload={uuid} (results -> compute/outputs/{name}/)\n")
     forwarded = (
@@ -610,8 +580,6 @@ def cmd_web(args: list[str]) -> None:
     p.add_argument("--port", type=int, default=8744)
     p.add_argument("--host", default="127.0.0.1")
     opts = p.parse_args(args)
-    from app import serve
-
     serve(host=opts.host, port=opts.port)
 
 
