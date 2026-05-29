@@ -181,13 +181,31 @@ job, sequentially.
 ```
 
 Lists payloads in HEC S3 (if `compute/hec/env` is configured), launches
-local or HEC runs with one click, and shows each run's current step + elapsed
+local or HEC runs with one click, and shows each run's progress + elapsed
 time. Reads from `compute/outputs/<name>/progress.json` (auto-refreshes every
 2 s). Launches detach to the background, so closing the browser — or the web
 process — doesn't kill the run; logs land in
 `compute/outputs/<name>/launch.log`.
 
-Single file (`web.py`), stdlib only, binds to `127.0.0.1`. No auth.
+**Progress is duration-weighted.** Each pipeline step contributes to the bar
+in proportion to its real cost (learned from past runs' measured durations,
+falling back to an analytic estimate), not 1/N. Since `process-storms`
+typically dominates (~98% of wall time), the bar reflects that instead of
+jumping a flat 20% per step. The `process-storms` sub-progress is read live
+from `launch.log`'s cumsum-scan year counts, so the bar advances smoothly
+through the longest step instead of freezing.
+
+**Auditing is built in.** Each completed run has a **Details** view
+(`/run/<name>` — per-step weighted breakdown + log tail) and an **Audit**
+view (`/audit/<name>` — DSS/grid/STAC integrity checks, maps, charts).
+Click *Download audit* to pull a catalog's artifacts from HEC S3 in the
+background, then *Audit* to view the report inline. This replaces the old
+separate `./audit.py serve` on `:8745`; that command now forwards here.
+`./audit.py download` / `./audit.py report` still work for offline static
+reports.
+
+Single file (`web.py`, with audit logic imported from `audit.py`), stdlib
+only, binds to `127.0.0.1`. No auth.
 
 ## Publishing to Cloud Compute
 

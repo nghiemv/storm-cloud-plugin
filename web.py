@@ -13,15 +13,26 @@ Localhost-only by default — no auth.
 
 from __future__ import annotations
 
+import html
 import json
+import mimetypes
 import os
 import re
+import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+# Audit logic (download, quality checks, rich report rendering) lives in
+# audit.py. We import it so the unified web app can serve audit reports inline
+# at /audit/<name> instead of running a second server on :8745. audit.py has no
+# module-level side effects and does not import web (its `serve` subcommand
+# imports lazily), so this is not circular.
+import audit
 
 ROOT = Path(__file__).resolve().parent
 OUTPUTS = ROOT / "compute" / "outputs"
@@ -144,6 +155,91 @@ def _predict_total_s(attrs: dict) -> float | None:
     return sum(breakdown.values()) + _S_OVERHEAD_FIXED
 
 
+# ─── duration-weighted step weights ──────────────────────────────────────────
+#
+# The pipeline's steps have wildly unequal durations — process-storms commonly
+# runs ~98% of total wall time (e.g. 1730s of 1753s on a real run) while
+# create-grid-file is milliseconds. Weighting each step as 1/N makes the bar
+# misrepresent true progress, so we weight by *seconds*. Weights come, in
+# priority order, from (1) historical medians measured on this machine, (2) the
+# analytic per-unit prediction, (3) a small floor so no step is weightless.
+
+_STEP_FLOOR_S = 2.0  # minimum weight so an unseen/instant step still shows
+_HIST_TTL_S = 10.0  # cache historical scan; the dashboard polls every 2s
+_hist_cache: dict = {"at": 0.0, "data": None}
+
+
+def _historical_step_seconds() -> dict[str, float]:
+    """Median completed-step durations learned from finished runs.
+
+    Scans every ``compute/outputs/*/progress.json`` that has a ``summary``
+    (i.e. completed) and returns ``{step_name: median_duration_s}`` for steps
+    with >=2 samples. Memoized with a short TTL so the 2s poll doesn't rescan.
+    """
+    now = time.time()
+    cached = _hist_cache["data"]
+    if cached is not None and now - _hist_cache["at"] < _HIST_TTL_S:
+        return cached
+    samples: dict[str, list[float]] = {}
+    if OUTPUTS.is_dir():
+        for run_dir in OUTPUTS.iterdir():
+            if not run_dir.is_dir():
+                continue
+            prog = _read_json(run_dir / "progress.json")
+            if not prog or not prog.get("summary"):
+                continue
+            for s in prog.get("completed_steps") or []:
+                nm, dur = s.get("name"), s.get("duration_s")
+                if nm and isinstance(dur, (int, float)) and dur >= 0:
+                    samples.setdefault(nm, []).append(float(dur))
+    medians = {nm: statistics.median(v) for nm, v in samples.items() if len(v) >= 2}
+    _hist_cache.update(at=now, data=medians)
+    return medians
+
+
+def weight_for_step(
+    name: str, attrs: dict | None, predicted: dict[str, float] | None = None
+) -> float:
+    """Resolve a step's weight in seconds: historical median > predicted > floor."""
+    hist = _historical_step_seconds()
+    if name in hist:
+        return max(_STEP_FLOOR_S, hist[name])
+    if predicted is None:
+        predicted = _predict_action_seconds(_work_units(attrs or {}))
+    if predicted.get(name, 0) > 0:
+        return max(_STEP_FLOOR_S, predicted[name])
+    return _STEP_FLOOR_S
+
+
+def _step_weights(plan: list[str], attrs: dict | None) -> dict[str, float]:
+    """{step_name: weight_seconds} for every step in the run's plan."""
+    predicted = _predict_action_seconds(_work_units(attrs or {}))
+    return {nm: weight_for_step(nm, attrs, predicted) for nm in plan}
+
+
+def _within_step_frac(run: dict, cs: dict, cur_weight: float) -> float:
+    """0..1 fraction of the current step complete.
+
+    ``action_progress`` is keyed by step name, so we look up the current step
+    directly (not "freshest across all labels", which could surface a prior
+    completed step's 100%). Falls back to a time-based estimate (in-step
+    elapsed / expected step seconds, capped 0.95) so long steps without
+    sub-progress reporting still advance. Phase 3 supplies a real fraction for
+    process-storms via launch.log.
+    """
+    cur = cs.get("name")
+    now = time.time()
+    a = (run.get("action_progress") or {}).get(cur) if cur else None
+    if a:
+        ts = a.get("updated_at") or 0
+        if ts and now - ts <= 120:
+            return max(0.0, min(100.0, a.get("pct") or 0)) / 100.0
+    started = cs.get("started_at")
+    if started and cur_weight > 0:
+        return min(0.95, max(0.0, now - started) / cur_weight)
+    return 0.0
+
+
 def _runtime_eta_s(run: dict, attrs: dict | None) -> float | None:
     """Live ETA for a running run.
 
@@ -155,39 +251,40 @@ def _runtime_eta_s(run: dict, attrs: dict | None) -> float | None:
 
     Returns ``None`` when there's no analytic baseline AND no live signal.
     """
-    breakdown = _predict_action_seconds(_work_units(attrs or {}))
+    plan = run.get("plan") or []
     completed = {s["name"] for s in run.get("completed_steps", [])}
     cs = run.get("current_step")
-    if not cs:
-        # Either pre-step or post-summary — fall back to predicted_total minus
-        # elapsed if we have one, else nothing.
+    if not plan:
+        # No plan recorded — fall back to the pre-launch analytic estimate.
+        breakdown = _predict_action_seconds(_work_units(attrs or {}))
         if not breakdown:
             return None
         total = sum(breakdown.values()) + _S_OVERHEAD_FIXED
         return max(0.0, total - (run.get("elapsed_s") or 0.0))
 
+    weights = _step_weights(plan, attrs)
+    if not cs:
+        # Pre-step or post-summary: remaining = total weight minus elapsed.
+        total = sum(weights.values())
+        return max(0.0, total - (run.get("elapsed_s") or 0.0))
+
     current_name = cs.get("name")
+    cur_w = weights.get(current_name, 0.0)
     eta = 0.0
 
-    # Current step: prefer live measured ETA from action_progress (freshest,
-    # non-stale, non-complete entry).
-    current_step_eta = _live_current_step_eta(run.get("action_progress") or {})
-    if current_step_eta is not None:
-        eta += current_step_eta
-    elif current_name in breakdown:
-        step_started = cs.get("started_at") or 0
-        in_step_elapsed = max(0.0, time.time() - step_started) if step_started else 0.0
-        eta += max(0.0, breakdown[current_name] - in_step_elapsed)
-    elif not breakdown:
-        # No analytic model AND no live data — can't say.
-        return None
+    # Current step: prefer a live measured ETA; else weight × remaining fraction.
+    live = _live_current_step_eta(run.get("action_progress") or {})
+    if live is not None:
+        eta += live
+    else:
+        within = _within_step_frac(run, cs, cur_w)
+        eta += max(0.0, cur_w * (1.0 - within))
 
-    # Future steps (in breakdown but not completed and not current).
-    for name, pred in breakdown.items():
+    # Future steps: every planned step not yet completed and not current.
+    for name, w in weights.items():
         if name == current_name or name in completed:
             continue
-        eta += pred
-
+        eta += w
     return eta
 
 
@@ -273,15 +370,75 @@ def _has_run_output(run_dir: Path) -> bool:
     return False
 
 
-def _tail_log(path: Path, max_lines: int = 12) -> str:
-    """Read the last ``max_lines`` of a log file for surfacing failure context."""
+def _tail_bytes(path: Path, n: int = 65536) -> str:
+    """Decode the last ``n`` bytes of a file (bounded read for large logs)."""
     try:
-        data = path.read_bytes()
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - n))
+            return f.read().decode("utf-8", errors="replace")
     except OSError:
         return ""
-    text = data.decode("utf-8", errors="replace")
-    lines = text.splitlines()[-max_lines:]
-    return "\n".join(lines)
+
+
+def _tail_log(path: Path, max_lines: int = 12) -> str:
+    """Read the last ``max_lines`` of a log file for surfacing failure context."""
+    text = _tail_bytes(path)
+    if not text:
+        return ""
+    return "\n".join(text.splitlines()[-max_lines:])
+
+
+# Process-storms (the dominant step) runs the cumsum scan, which doesn't write
+# progress.json action_progress but DOES log per-year completion to launch.log:
+#   [cumsum-scan] dispatching 47 years ...
+#   [cumsum-scan] year=1979 done (completed=184, skipped=0) — 1/47 years in 29.5s
+# Parsing these gives the only real sub-progress for the step that otherwise
+# freezes the bar through ~98% of the run. Bracket-anchored to tolerate the
+# leading "<ts> [INFO] " logging prefix.
+_CUMSUM_YEAR_RE = re.compile(r"\[cumsum-scan\] year=\d+ done .*?(\d+)/(\d+) years")
+_CUMSUM_DISPATCH_RE = re.compile(r"\[cumsum-scan\] dispatching (\d+) years")
+
+
+def _scan_launch_log(run_dir: Path, step_started: float | None = None) -> dict | None:
+    """Synthesize a process-storms action_progress entry from launch.log.
+
+    Returns an entry shaped like progress.json's action_progress values
+    ({done,total,pct,rate,eta_s,updated_at}) or None when no year count is
+    determinable yet. Used only for a running process-storms step.
+    """
+    text = _tail_bytes(run_dir / "launch.log")
+    if not text:
+        return None
+    years_total = None
+    for m in _CUMSUM_DISPATCH_RE.finditer(text):
+        years_total = int(m.group(1))
+    last_year = None
+    for m in _CUMSUM_YEAR_RE.finditer(text):
+        last_year = m
+    years_done = 0
+    if last_year:
+        years_done = int(last_year.group(1))
+        years_total = years_total or int(last_year.group(2))
+    if not years_total:
+        return None
+    pct = 100.0 * years_done / years_total
+    entry = {
+        "done": years_done,
+        "total": years_total,
+        "pct": round(pct, 1),
+        "rate": None,
+        "eta_s": None,
+        "updated_at": time.time(),
+    }
+    if step_started and years_done > 0:
+        elapsed = max(0.0, time.time() - step_started)
+        if elapsed > 0:
+            rate = years_done / elapsed  # years/sec
+            entry["rate"] = rate
+            entry["eta_s"] = (years_total - years_done) / rate if rate > 0 else None
+    return entry
 
 
 def _list_runs() -> list[dict]:
@@ -318,42 +475,60 @@ def _list_runs() -> list[dict]:
             # payload UUID (legacy CLI run without launch.json).
             "payload_uuid": (launch or {}).get("payload_uuid"),
             "predicted_total_s": _predict_total_s(attrs),
+            # Audit availability so the dashboard can link/trigger audits.
+            "has_audit": _has_audit(run_dir.name),
         }
+        dljob = _download_jobs.get(run_dir.name)
+        if dljob and dljob.get("state") == "running":
+            rec["audit_downloading"] = True
         if status == "running":
+            # The cumsum process-storms step emits no action_progress; derive
+            # its real sub-progress from launch.log's per-year lines and inject
+            # a synthetic entry so the weighted bar + ETA pick it up naturally.
+            cs = rec.get("current_step") or {}
+            if (
+                cs.get("name") == "process-storms"
+                and "process-storms" not in rec["action_progress"]
+            ):
+                scan = _scan_launch_log(run_dir, cs.get("started_at"))
+                if scan:
+                    rec["action_progress"] = {
+                        **rec["action_progress"],
+                        "process-storms": scan,
+                    }
             rec["eta_s"] = _runtime_eta_s(rec, attrs)
-            rec["overall_pct"] = _overall_pct(rec)
+            rec["overall_pct"] = _overall_pct(rec, attrs)
         if status in ("failed", "interrupted"):
             rec["error_tail"] = _tail_log(run_dir / "launch.log")
         runs.append(rec)
     return runs
 
 
-def _overall_pct(run: dict) -> float | None:
-    """Fraction of the pipeline complete, 0..100.
+def _overall_pct(run: dict, attrs: dict | None = None) -> float | None:
+    """Fraction of the pipeline complete, 0..100 — weighted by step duration.
 
-    Combines coarse step progress with the live sub-loop fraction so the
-    bar reflects overall progress rather than within-step progress. We
-    always have elapsed + this, even when ETA is too uncertain to display.
+    Each step contributes its weight (historical median seconds, else analytic
+    prediction, else a floor) rather than 1/N, so the bar tracks true cost.
+    A run where process-storms is 98% of the time will show ~98% of the bar
+    devoted to that step instead of a misleading 20%.
     """
     cs = run.get("current_step") or {}
-    i, n = cs.get("i"), cs.get("n")
-    if not n:
-        return None
-    completed_frac = max(0, (i or 1) - 1) / n
-    # Within-step fraction from the freshest non-stale action_progress entry.
-    within = 0.0
-    ap = run.get("action_progress") or {}
-    now = time.time()
-    best_ts = -1.0
-    for _label, a in ap.items():
-        ts = a.get("updated_at") or 0
-        if not ts or now - ts > 120:
-            continue
-        if ts > best_ts:
-            best_ts = ts
-            pct = a.get("pct") or 0
-            within = max(0.0, min(100.0, pct)) / 100.0
-    overall = completed_frac + within / n
+    plan = run.get("plan") or []
+    if not plan:
+        # No plan — fall back to the coarse step counter.
+        i, n = cs.get("i"), cs.get("n")
+        if not n:
+            return None
+        return round(min(1.0, max(0.0, (max(1, i or 1) - 1) / n)) * 100, 1)
+
+    weights = _step_weights(plan, attrs)
+    total = sum(weights.values()) or 1.0
+    completed = {s.get("name") for s in run.get("completed_steps", [])}
+    done_weight = sum(w for nm, w in weights.items() if nm in completed)
+    cur = cs.get("name")
+    cur_w = weights.get(cur, 0.0) if cur else 0.0
+    within = _within_step_frac(run, cs, cur_w) if cur else 0.0
+    overall = (done_weight + within * cur_w) / total
     return round(min(1.0, max(0.0, overall)) * 100, 1)
 
 
@@ -596,6 +771,11 @@ pre.errlog { background: #fef2f2; color: #7f1d1d; border: 1px solid #fecaca;
          opacity: 0; transition: opacity .2s ease; pointer-events: none; }
 .toast.show { opacity: 1; }
 .toast.err { background: #991b1b; }
+.actions { display: flex; gap: .4rem; align-items: center; flex-shrink: 0; }
+a.btnlink { padding: .35rem .9rem; border: 1px solid #2563eb; background: #fff;
+            color: #2563eb; border-radius: 6px; font-size: .85rem; font-weight: 500;
+            text-decoration: none; white-space: nowrap; }
+a.btnlink:hover { background: #eff6ff; }
 </style>
 </head>
 <body>
@@ -825,6 +1005,18 @@ async function renderRuns() {
       actionBtn = `<button class="secondary" onclick="rerun(this, ${nameArg})">Re-run</button>`;
     }
 
+    // Audit action: view if downloaded, download if outputs likely exist,
+    // disabled "Downloading…" while a background pull is in flight.
+    let auditBtn = "";
+    if (r.has_audit) {
+      auditBtn = `<a class="btnlink" href="/audit/${encodeURIComponent(r.name)}">Audit</a>`;
+    } else if (r.audit_downloading) {
+      auditBtn = `<button class="secondary" disabled>Downloading…</button>`;
+    } else if (r.status === "done") {
+      auditBtn = `<button class="secondary" onclick="downloadAudit(this, ${nameArg})">Download audit</button>`;
+    }
+    const detailLink = `<a class="btnlink" href="/run/${encodeURIComponent(r.name)}">Details</a>`;
+
     return `
       <div class="row">
         <div class="left">
@@ -833,7 +1025,7 @@ async function renderRuns() {
           ${bar}
           ${errLog}
         </div>
-        ${actionBtn}
+        <div class="actions">${detailLink}${auditBtn}${actionBtn}</div>
       </div>
     `;
   }).join("");
@@ -866,6 +1058,23 @@ async function launchLocal(btn) {
   } finally {
     btn.disabled = false;
     btn.textContent = "Run";
+  }
+}
+
+async function downloadAudit(btn, name) {
+  btn.disabled = true;
+  btn.textContent = "Downloading…";
+  try {
+    await getJson(`/api/audit/${encodeURIComponent(name)}/download`,
+                  {method: "POST"});
+    toast(`Audit download started for ${name}`);
+    // Re-render shortly so the row reflects the in-flight job, then again
+    // once it completes (the row flips to a "View audit" link).
+    setTimeout(renderRuns, 1500);
+  } catch (e) {
+    toast(`Download failed: ${e.message}`, "err");
+    btn.disabled = false;
+    btn.textContent = "Download audit";
   }
 }
 
@@ -943,6 +1152,321 @@ setInterval(renderRuns, 2000);
 """
 
 
+# ─── audit integration (renders audit.py reports inline) ─────────────────────
+
+
+def _has_audit(name: str) -> bool:
+    return (OUTPUTS / name / "audit").is_dir()
+
+
+def _audit_nav_runs() -> list[dict]:
+    """Lightweight {run_name, catalog_id} list for report nav links — avoids a
+    full ``_audit()`` per run (the report's nav loop only needs these two)."""
+    runs = []
+    for r in audit._known_runs():
+        if _has_audit(r):
+            runs.append({"run_name": r, "catalog_id": audit._catalog_id_for(r)})
+    return runs
+
+
+def _render_audit_html(name: str) -> tuple[str, int]:
+    """(html, status) for GET /audit/<name>."""
+    if not _has_audit(name):
+        body = (
+            "<!doctype html><meta charset=utf-8>"
+            f"<title>Audit — {html.escape(name)}</title>"
+            "<body style='font-family:system-ui;max-width:640px;margin:4rem auto'>"
+            f"<h1>{html.escape(name)}</h1>"
+            "<p>No audit artifacts downloaded yet for this catalog.</p>"
+            f"<p>Run <code>./audit.py download {html.escape(name)}</code> "
+            "(or use the Download button on the dashboard) to fetch them, then "
+            "reload.</p><p><a href='/'>← back</a></p></body>"
+        )
+        return body, 200
+    try:
+        a = audit._audit(name)
+        report = audit._build_report(name, a, _audit_nav_runs(), http_mode=True)
+        return report, 200
+    except Exception as e:  # noqa: BLE001 — surface render errors to the page
+        return (
+            f"<!doctype html><meta charset=utf-8><h1>Audit render error</h1>"
+            f"<pre>{html.escape(repr(e))}</pre><p><a href='/'>← back</a></p>",
+            500,
+        )
+
+
+def _audit_summary(name: str) -> dict:
+    """Compact JSON summary for GET /api/audit/<name>."""
+    if not _has_audit(name):
+        return {"name": name, "state": "not-downloaded"}
+    try:
+        a = audit._audit(name)
+    except Exception as e:  # noqa: BLE001
+        return {"name": name, "state": "error", "error": repr(e)}
+    n_anomalies = (
+        len(a.get("outlier_dss") or [])
+        + len(a.get("grid_without_dss") or [])
+        + len(a.get("out_of_box") or [])
+        + len(a.get("duration_mismatches") or [])
+    )
+    summary = {
+        "name": name,
+        "state": "downloaded",
+        "catalog_id": a.get("catalog_id"),
+        "n_events": a.get("n_events"),
+        "n_dss": a.get("n_dss"),
+        "top_n": a.get("top_n"),
+        "n_anomalies": n_anomalies,
+    }
+    # Overlay an in-flight download job, if any.
+    job = _download_jobs.get(name)
+    if job and job.get("state") == "running":
+        summary["download"] = "running"
+    return summary
+
+
+# ─── background audit download ───────────────────────────────────────────────
+#
+# Downloading a catalog's audit artifacts (~600 MB of prefixes via mc) must not
+# block the request thread. We run it in a daemon thread and expose status via
+# /api/audit/<name>; the dashboard polls and flips the button to "Downloading…".
+
+_download_jobs: dict[str, dict] = {}
+_download_lock = threading.Lock()
+
+
+def _start_audit_download(name: str) -> dict:
+    with _download_lock:
+        existing = _download_jobs.get(name)
+        if existing and existing.get("state") == "running":
+            return existing
+        job = {"state": "running", "started_at": time.time(), "error": None}
+        _download_jobs[name] = job
+
+    def _worker() -> None:
+        try:
+            audit._load_hec_env()
+            audit._download_run(name)
+            result = {"state": "done", "started_at": job["started_at"], "error": None}
+        except Exception as e:  # noqa: BLE001 — surface to the dashboard
+            result = {
+                "state": "error",
+                "started_at": job["started_at"],
+                "error": repr(e),
+            }
+        with _download_lock:
+            _download_jobs[name] = result
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return job
+
+
+# ─── unified S3-centric catalog discovery ────────────────────────────────────
+
+
+# Top-level S3 prefixes that are infrastructure, not storm catalogs.
+_NON_CATALOG_PREFIXES = {
+    "manifests",
+    "aorc-cache",
+    "aorc-cache-conus",
+    "diagnostic-throughput",
+}
+
+
+def _s3_output_catalogs() -> tuple[set[str], str | None]:
+    """Catalog ids that have an output prefix in S3. Best-effort: one `mc ls`
+    of the bucket root, infrastructure prefixes filtered out. Returns
+    (catalog_ids, note) where note explains why the set is empty/partial."""
+    try:
+        audit._load_hec_env()
+        lines = audit._mc_ls_lines("")
+    except Exception as e:  # noqa: BLE001 — mc/alias may be absent; degrade
+        return set(), f"S3 output listing unavailable: {e}"
+    cids = set()
+    for ln in lines:
+        tok = ln.split()[-1] if ln.split() else ""
+        name = tok.rstrip("/")
+        if name and name not in _NON_CATALOG_PREFIXES:
+            cids.add(name)
+    return cids, None
+
+
+def _list_catalogs() -> dict:
+    """Unified, S3-centric catalog list keyed by catalog_id.
+
+    Merges three sources: S3 manifest payloads (launchable), local runs
+    (compute/outputs, with live progress), and S3 output prefixes (auditable
+    even without a local run). HEC S3 is the source of truth for what exists;
+    local progress is overlaid for runs executing on this machine.
+    """
+    by_cid: dict[str, dict] = {}
+
+    def rec(cid: str) -> dict:
+        return by_cid.setdefault(
+            cid,
+            {
+                "catalog_id": cid,
+                "uuid": None,
+                "attrs": {},
+                "predicted_s": None,
+                "local_run": None,
+                "s3_outputs": False,
+                "audit": "none",
+            },
+        )
+
+    payloads = _list_payloads()
+    pstate = payloads.get("state")
+    if pstate == "ok":
+        for p in payloads.get("payloads", []):
+            cid = p.get("catalog_id") or p.get("uuid")
+            if not cid:
+                continue
+            r = rec(cid)
+            r["uuid"] = p.get("uuid")
+            r["predicted_s"] = p.get("predicted_s")
+            r["attrs"] = {
+                k: p.get(k)
+                for k in (
+                    "catalog_id",
+                    "catalog_description",
+                    "start_date",
+                    "end_date",
+                    "storm_duration",
+                    "top_n_events",
+                )
+                if p.get(k) is not None
+            }
+
+    for run in _list_runs():
+        cid = audit._catalog_id_for(run["name"])
+        r = rec(cid)
+        r["local_run"] = run
+        if not r["uuid"] and run.get("payload_uuid"):
+            r["uuid"] = run["payload_uuid"]
+        if _has_audit(run["name"]):
+            r["audit"] = "downloaded"
+
+    s3_cids, s3_note = _s3_output_catalogs()
+    for cid in s3_cids:
+        r = rec(cid)
+        r["s3_outputs"] = True
+        if r["audit"] == "none":
+            r["audit"] = "available"  # outputs exist in S3, can download to audit
+
+    # Sort: active runs first, then by catalog_id.
+    def _key(r: dict) -> tuple:
+        lr = r.get("local_run") or {}
+        active = 0 if lr.get("status") == "running" else 1
+        return (active, r["catalog_id"].lower())
+
+    return {
+        "state": pstate,
+        "catalogs": sorted(by_cid.values(), key=_key),
+        "s3_note": s3_note,
+    }
+
+
+def _get_run(name: str) -> dict | None:
+    for r in _list_runs():
+        if r["name"] == name:
+            return r
+    return None
+
+
+def _step_breakdown(run: dict, attrs: dict | None) -> list[dict]:
+    """Per-step rows for the detail view: name, weight%, state, duration/eta."""
+    plan = run.get("plan") or []
+    if not plan:
+        return []
+    weights = _step_weights(plan, attrs)
+    total = sum(weights.values()) or 1.0
+    completed = {s.get("name"): s for s in run.get("completed_steps", [])}
+    cur = (run.get("current_step") or {}).get("name")
+    rows = []
+    for nm in plan:
+        w = weights.get(nm, 0.0)
+        if nm in completed:
+            state, detail = "done", f"{completed[nm].get('duration_s', 0):.1f}s"
+        elif nm == cur:
+            ap = (run.get("action_progress") or {}).get(nm) or {}
+            if ap.get("total"):
+                state = "running"
+                detail = f"{ap.get('done', 0)}/{ap['total']}"
+            else:
+                state, detail = "running", "…"
+        else:
+            state, detail = "pending", f"~{w:.0f}s"
+        rows.append(
+            {"name": nm, "weight_pct": round(100 * w / total, 1), "state": state, "detail": detail}
+        )
+    return rows
+
+
+def _render_run_detail_html(name: str) -> tuple[str, int]:
+    run = _get_run(name)
+    if not run:
+        return (
+            f"<!doctype html><meta charset=utf-8><h1>{html.escape(name)}</h1>"
+            "<p>No such run.</p><p><a href='/'>← back</a></p>",
+            404,
+        )
+    attrs = {}  # detail view reuses run's recorded plan/progress; attrs optional
+    lj = _read_json(OUTPUTS / name / "launch.json") or {}
+    attrs = lj.get("payload_attrs") or {}
+    rows = _step_breakdown(run, attrs)
+    pct = run.get("overall_pct")
+    eta = run.get("eta_s")
+    bar_rows = "".join(
+        f"<tr class='st-{r['state']}'><td>{html.escape(r['name'])}</td>"
+        f"<td style='text-align:right'>{r['weight_pct']}%</td>"
+        f"<td>{r['state']}</td><td>{html.escape(str(r['detail']))}</td></tr>"
+        for r in rows
+    )
+    log_tail = html.escape(_tail_log(OUTPUTS / name / "launch.log", 40))
+    audit_link = (
+        f"<a href='/audit/{html.escape(name)}'>View audit report →</a>"
+        if _has_audit(name)
+        else "<span class='muted'>No audit downloaded</span>"
+    )
+    body = f"""<!doctype html><meta charset=utf-8>
+<title>{html.escape(name)} — run detail</title>
+<style>
+ body{{font-family:system-ui,sans-serif;max-width:880px;margin:2rem auto;padding:0 1rem;color:#1f2937}}
+ h1{{margin-bottom:.2rem}} .muted{{color:#6b7280}}
+ .bar{{height:14px;background:#e5e7eb;border-radius:7px;overflow:hidden;margin:.6rem 0}}
+ .bar>div{{height:100%;background:#2563eb}}
+ table{{border-collapse:collapse;width:100%;margin-top:1rem}}
+ td,th{{padding:.4rem .6rem;border-bottom:1px solid #eee;text-align:left}}
+ tr.st-done td{{color:#16a34a}} tr.st-running td{{font-weight:600;color:#2563eb}}
+ tr.st-pending td{{color:#9ca3af}}
+ pre{{background:#0b1021;color:#d6e2ff;padding:1rem;border-radius:8px;overflow:auto;font-size:12px;line-height:1.4}}
+</style>
+<p><a href="/">← dashboard</a></p>
+<h1>{html.escape(name)}</h1>
+<p class="muted">status: <b>{html.escape(run.get('status') or '?')}</b>
+ · {audit_link}</p>
+<div class="bar"><div style="width:{pct or 0}%"></div></div>
+<p>{(str(pct) + '% complete') if pct is not None else ''}
+ {('· ETA ' + _fmt_dur(eta)) if eta else ''}</p>
+<table><thead><tr><th>step</th><th style='text-align:right'>weight</th>
+ <th>state</th><th>detail</th></tr></thead><tbody>{bar_rows}</tbody></table>
+<h3>Recent log</h3><pre>{log_tail}</pre>
+"""
+    return body, 200
+
+
+def _fmt_dur(s: float | None) -> str:
+    if not s or s <= 0:
+        return "—"
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
 # ─── HTTP layer ──────────────────────────────────────────────────────────────
 
 
@@ -955,13 +1479,45 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_html(self, html: str) -> None:
-        body = html.encode()
-        self.send_response(200)
+    def _send_html(self, html_str: str, code: int = 200) -> None:
+        body = html_str.encode()
+        self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_asset(self, path: str) -> None:
+        """Serve a file under compute/outputs/<name>/audit/ for /assets/<name>/...
+
+        The only filesystem-exposed route. Guards against path traversal by
+        resolving the target and asserting it stays within the run's audit dir.
+        """
+        rel = urllib.parse.unquote(path[len("/assets/") :])
+        parts = rel.split("/", 1)
+        if len(parts) != 2 or not parts[1]:
+            self.send_error(404)
+            return
+        name, subpath = parts
+        base = (OUTPUTS / name / "audit").resolve()
+        try:
+            target = (base / subpath).resolve()
+        except (OSError, ValueError):
+            self.send_error(404)
+            return
+        if base != target and base not in target.parents:
+            self.send_error(403)
+            return
+        if not target.is_file():
+            self.send_error(404)
+            return
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
@@ -971,8 +1527,39 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(_list_runs())
         elif path == "/api/payloads":
             self._send_json(_list_payloads())
+        elif path == "/api/catalogs":
+            self._send_json(_list_catalogs())
         elif path == "/api/health":
             self._send_json({"ok": True, "hec_configured": HEC_ENV.is_file()})
+        elif path.startswith("/api/run/"):
+            name = urllib.parse.unquote(path[len("/api/run/") :]).strip("/")
+            run = _get_run(name) if name else None
+            if run is None:
+                self._send_json({"error": "no such run"}, 404)
+            else:
+                self._send_json(run)
+        elif path.startswith("/run/"):
+            name = urllib.parse.unquote(path[len("/run/") :]).strip("/")
+            if not name:
+                self.send_error(404)
+                return
+            body, code = _render_run_detail_html(name)
+            self._send_html(body, code)
+        elif path.startswith("/assets/"):
+            self._serve_asset(path)
+        elif path.startswith("/api/audit/"):
+            name = urllib.parse.unquote(path[len("/api/audit/") :]).strip("/")
+            if not name:
+                self.send_error(404)
+                return
+            self._send_json(_audit_summary(name))
+        elif path.startswith("/audit/"):
+            name = urllib.parse.unquote(path[len("/audit/") :]).strip("/")
+            if not name:
+                self.send_error(404)
+                return
+            body, code = _render_audit_html(name)
+            self._send_html(body, code)
         else:
             self.send_error(404)
 
@@ -1031,6 +1618,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": err}, 400)
                     return
                 self._send_json({"stopped": stopped, "name": name})
+            elif path.startswith("/api/audit/") and path.endswith("/download"):
+                inner = path[len("/api/audit/") : -len("/download")]
+                name = urllib.parse.unquote(inner).strip("/")
+                if not name:
+                    self._send_json({"error": "missing name"}, 400)
+                    return
+                self._send_json(_start_audit_download(name))
             else:
                 self.send_error(404)
         except Exception as e:
