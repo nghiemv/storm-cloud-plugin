@@ -286,12 +286,12 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
     # any stale id from a prior run before relaunching.
     cidfile = run_dir / "container.id"
     cidfile.unlink(missing_ok=True)
-    # Write a minimal launch.json so audit.py's _known_runs() (which filters
+    # Write a minimal launch.json so app.py's _known_runs() (which filters
     # by launch.json presence) recognises CLI-launched runs the same way it
-    # recognises web.py-launched ones. catalog_id is the run name by default;
+    # recognises app.py-launched ones. catalog_id is the run name by default;
     # CC SDK plugin reads the real catalog_id from the S3 payload at runtime.
     # Record our own pid: this process IS the launcher the web UI monitors for
-    # liveness (web.py Popens us), and we overwrite the launch.json web.py
+    # liveness (app.py Popens us), and we overwrite the launch.json app.py
     # wrote — without this, the pid is lost and the UI marks every progressed
     # run "interrupted".
     (run_dir / "launch.json").write_text(
@@ -602,7 +602,7 @@ def cmd_test(args: list[str]) -> None:
 def cmd_web(args: list[str]) -> None:
     """Browser UI: browse S3 payloads, launch runs, watch progress.
 
-    Localhost-only. See web.py for the implementation.
+    Localhost-only. See app.py for the implementation.
     """
     import argparse as _ap
 
@@ -610,7 +610,7 @@ def cmd_web(args: list[str]) -> None:
     p.add_argument("--port", type=int, default=8744)
     p.add_argument("--host", default="127.0.0.1")
     opts = p.parse_args(args)
-    from web import serve
+    from app import serve
 
     serve(host=opts.host, port=opts.port)
 

@@ -199,13 +199,12 @@ through the longest step instead of freezing.
 (`/run/<name>` — per-step weighted breakdown + log tail) and an **Audit**
 view (`/audit/<name>` — DSS/grid/STAC integrity checks, maps, charts).
 Click *Download audit* to pull a catalog's artifacts from HEC S3 in the
-background, then *Audit* to view the report inline. This replaces the old
-separate `./audit.py serve` on `:8745`; that command now forwards here.
-`./audit.py download` / `./audit.py report` still work for offline static
-reports.
+background, then *Audit* to view the report inline.
 
-Single file (`web.py`, with audit logic imported from `audit.py`), stdlib
-only, binds to `127.0.0.1`. No auth.
+`app.py` is a single stdlib-only JSON API + static server — launching,
+monitoring, and audit (download + QA + report rendering) all live in it.
+All markup lives in `static/` (`index.html`, `style.css`, `app.js`, and the
+audit report template `report.html`). Binds to `127.0.0.1`. No auth.
 
 ## Publishing to Cloud Compute
 

@@ -1,38 +1,30 @@
 #!/usr/bin/env python3
-"""Audit storm-catalog outputs in HEC S3.
+"""storm-cloud-plugin web app: launch, monitor, and audit runs.
 
-Downloads each catalog's metadata + thumbnails to
-``compute/outputs/<name>/audit/`` and emits a static ``report.html`` per
-catalog. Per-catalog checks: DSS file counts, grid-file integrity, outlier
-DSS files (likely empty/partial), STAC item counts, storm date coverage,
-centroid containment in the transposition domain.
+A stdlib-only JSON API + static file server (no host pip installs). Browse S3
+payloads, launch/stop/resume runs against the local MinIO stack or HEC S3,
+watch weighted progress, and view rich per-catalog audit reports inline.
 
-Usage:
-    ./audit.py                              Download + report + serve for all known runs
-    ./audit.py download [NAME]              Just refresh artifacts from S3
-    ./audit.py report   [NAME]              (Re)generate report.html (no S3 round-trips)
-    ./audit.py serve [PORT] [--host HOST]   Open the reports in a browser via local HTTP
-                                            (default 127.0.0.1:8745; use --host 0.0.0.0
-                                            when browsing from another machine)
-
-Reads HEC S3 creds from compute/hec/env (same convention as run.py).
-
-stdlib only on the host except for ``mc`` (MinIO client) on PATH for fast
-recursive downloads — falls back to a Python S3 client if ``boto3`` is
-installed but ``mc`` isn't.
+Dashboard markup lives in static/ (index.html, style.css, app.js); the audit
+report template lives in static/report.html. Run via ``./run.py web``.
+Localhost-only, no auth.
 """
 
 from __future__ import annotations
 
-import csv
 import html
 import json
+import mimetypes
 import os
+import re
 import shutil
+import statistics
 import subprocess
 import sys
-import webbrowser
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -40,8 +32,10 @@ ROOT = Path(__file__).resolve().parent
 COMPUTE = ROOT / "compute"
 OUTPUTS = COMPUTE / "outputs"
 HEC_ENV = COMPUTE / "hec" / "env"
+RUN_PY = ROOT / "run.py"
+STATIC = ROOT / "static"  # dashboard + report markup (html/css/js)
 
-# Files to mirror from each catalog's S3 prefix.
+# Files to mirror from each catalog's S3 prefix when downloading an audit.
 _TOP_FILES = ("catalog.json", "catalog.grid")
 _EVENTS_FILES = (
     "collection.json",
@@ -52,10 +46,8 @@ _EVENTS_FILES = (
 )
 
 
-# ─── env / S3 plumbing ────────────────────────────────────────────────────────
-
-
 def _load_hec_env() -> None:
+    """Overlay compute/hec/env onto os.environ (existing vars win)."""
     if not HEC_ENV.is_file():
         return
     for line in HEC_ENV.read_text().splitlines():
@@ -64,6 +56,27 @@ def _load_hec_env() -> None:
             continue
         k, _, v = line.partition("=")
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def _safe_subdir(name: str) -> str:
+    """Filesystem-safe coercion for a compute/outputs/<name>/ subdir.
+
+    Must match run.py:_safe_subdir — the plugin writes progress.json to the
+    dir this names, so a divergence silently breaks progress visibility.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+    return cleaned or "run"
+
+
+def _read_json(p: Path) -> Any | None:
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 
 
 def _mc_available() -> bool:
@@ -485,7 +498,7 @@ def _audit(run_name: str) -> dict:
     # storm_start / storm_end. Anything off by >1 hour gets flagged.
     duration_mismatches: list[dict] = []
     if storm_duration:
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         for ev in events:
             s, e = ev.get("storm_start"), ev.get("storm_end")
@@ -1363,920 +1376,6 @@ def _build_svg_map(
     return "".join(parts), meta
 
 
-# ─── HTML report ──────────────────────────────────────────────────────────────
-
-_REPORT_TEMPLATE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Audit — __CATALOG_ID__</title>
-<style>
-  :root {
-    --bg: #f7f8fb; --card: #fff; --ink: #0f172a; --mute: #64748b;
-    --line: #e2e8f0; --accent: #1e3a5f; --accent2: #2563eb;
-    --ok: #059669; --warn: #d97706; --bad: #dc2626;
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
-                      sans-serif;
-         color: var(--ink); background: var(--bg); line-height: 1.45; }
-  header { background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
-           color: #fff; padding: 22px 28px; }
-  header h1 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
-  header .sub { font-size: 13px; opacity: 0.85; margin-top: 6px;
-                 font-variant-numeric: tabular-nums; }
-  header .nav { font-size: 12px; margin-top: 10px; }
-  header .nav a { color: #93c5fd; margin-right: 14px; text-decoration: none; }
-  header .nav a:hover { text-decoration: underline; }
-  main { max-width: 1400px; margin: 0 auto; padding: 22px 28px 60px; }
-  h2 { font-size: 13px; margin: 30px 0 10px; padding-bottom: 6px;
-       text-transform: uppercase; letter-spacing: 0.06em; color: var(--mute);
-       border-bottom: 1px solid var(--line); }
-  h2 .meta { font-weight: normal; text-transform: none; letter-spacing: 0;
-             color: var(--mute); font-size: 12px; margin-left: 8px; }
-
-  /* Summary cards */
-  .stats { display: grid; gap: 12px;
-           grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-           margin-bottom: 8px; }
-  .stat { background: var(--card); border: 1px solid var(--line);
-          padding: 12px 14px; border-radius: 8px;
-          box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
-  .stat .label { font-size: 10px; color: var(--mute); text-transform: uppercase;
-                 letter-spacing: 0.06em; }
-  .stat .value { font-size: 20px; font-weight: 700; margin-top: 4px;
-                 font-variant-numeric: tabular-nums; }
-  .stat .sub { font-size: 11px; color: var(--mute); margin-top: 2px; }
-  .stat.warn { border-color: #fcd34d; background: #fffbeb; }
-  .stat.warn .value { color: #b45309; }
-  .stat.ok { border-color: #6ee7b7; background: #ecfdf5; }
-  .stat.ok .value { color: #047857; }
-
-  /* Anomalies */
-  .anomaly { background: #fff5f5; border-left: 3px solid #ef4444;
-             padding: 10px 14px; border-radius: 4px; margin: 8px 0;
-             box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
-  .anomaly h3 { font-size: 13px; margin: 0 0 6px; color: #b91c1c; }
-  .anomaly code { background: #fff; padding: 1px 5px; border-radius: 3px;
-                  border: 1px solid #fecaca; font-size: 11px; }
-  .anomaly ul { margin: 6px 0 0; padding-left: 22px; font-size: 12px;
-                color: #475569; }
-
-  /* Data integrity */
-  .integrity { display: grid;
-               grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-               gap: 6px 14px; background: var(--card); border: 1px solid var(--line);
-               border-radius: 8px; padding: 10px 14px; margin-bottom: 6px;
-               box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
-  .integrity .row { display: flex; align-items: flex-start; gap: 8px;
-                     font-size: 12px; line-height: 1.4; padding: 2px 0; }
-  .integrity .ic { display: inline-block; width: 16px; flex: 0 0 16px;
-                    text-align: center; font-weight: 700; }
-  .integrity .ic.ok { color: #059669; }
-  .integrity .ic.warn { color: #d97706; }
-  .integrity .ic.bad { color: #dc2626; }
-  .integrity .row.bad .d { color: #991b1b; font-weight: 600; }
-
-  /* Domain section */
-  .domain-wrap { display: grid; gap: 16px; align-items: start;
-                  grid-template-columns: minmax(0, 1.8fr) minmax(220px, 1fr);
-                  margin-bottom: 8px; }
-  @media (max-width: 900px) { .domain-wrap { grid-template-columns: 1fr; } }
-  .domain-map { background: #0f172a; border-radius: 10px; overflow: hidden;
-                 box-shadow: 0 4px 14px rgba(15,23,42,0.15); }
-  .domain-svg { display: block; width: 100%; height: auto; }
-  .domain-side { display: flex; flex-direction: column; gap: 12px; }
-  .conus-card { background: #0f172a; border-radius: 10px; padding: 10px;
-                 box-shadow: 0 4px 14px rgba(15,23,42,0.15); }
-  .conus-card .conus-title { color: #94a3b8; font-size: 10px;
-                              text-transform: uppercase; letter-spacing: 0.06em;
-                              margin-bottom: 6px; padding: 0 4px; }
-  .conus-card .conus-inner { border-radius: 6px; overflow: hidden;
-                              background: #082f49; }
-  .conus-map { display: block; width: 100%; height: auto; }
-  .conus-legend { color: #cbd5e1; font-size: 11px; margin-top: 6px;
-                   padding: 0 4px; display: flex; gap: 12px; flex-wrap: wrap; }
-  .conus-legend .sw { display: inline-block; width: 10px; height: 10px;
-                       border-radius: 2px; vertical-align: middle;
-                       margin-right: 5px; }
-  .ws-card { background: #082f49; border-radius: 10px; padding: 10px;
-              box-shadow: 0 4px 14px rgba(15,23,42,0.15); }
-  .ws-card .t { color: #94a3b8; font-size: 10px; text-transform: uppercase;
-                 letter-spacing: 0.06em; margin-bottom: 6px; padding: 0 4px;
-                 display: flex; justify-content: space-between;
-                 align-items: baseline; }
-  .ws-card .t small { color: #cbd5e1; font-size: 10px;
-                       text-transform: none; letter-spacing: 0; }
-  .ws-card .ws-zoom { display: block; width: 100%; height: auto;
-                       border-radius: 6px; background: #082f49; }
-  .ws-card .metrics { display: grid; grid-template-columns: 1fr 1fr;
-                       gap: 8px; margin-top: 8px; padding: 0 4px;
-                       font-size: 11px; color: #cbd5e1;
-                       font-variant-numeric: tabular-nums; }
-  .ws-card .metrics .l { font-size: 9.5px; color: #64748b;
-                          text-transform: uppercase; letter-spacing: 0.06em; }
-  .ws-card .metrics .v { font-size: 13px; font-weight: 600;
-                          color: #f1f5f9; margin-top: 1px; }
-  .ws-card .metrics .v.warn { color: #fbbf24; }
-  .domain-stats { display: grid; gap: 8px; }
-  .domain-stat { background: var(--card); border: 1px solid var(--line);
-                  border-radius: 8px; padding: 9px 11px;
-                  border-left: 3px solid var(--accent2);
-                  box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
-  .domain-stat.t { border-left-color: #ea580c; }
-  .domain-stat.v { border-left-color: #22c55e; }
-  .domain-stat .l { font-size: 10px; color: var(--mute);
-                     text-transform: uppercase; letter-spacing: 0.06em; }
-  .domain-stat .a { font-size: 17px; font-weight: 700; margin-top: 2px;
-                     font-variant-numeric: tabular-nums; }
-  .domain-stat .e { font-size: 11px; color: var(--mute); margin-top: 2px;
-                     font-variant-numeric: tabular-nums; word-break: break-all; }
-
-  /* Map */
-  .map-wrap { position: relative; background: #0f172a; border-radius: 10px;
-              overflow: hidden; box-shadow: 0 4px 14px rgba(15,23,42,0.15);
-              margin-bottom: 8px; }
-  .map-svg { display: block; width: 100%; height: auto; }
-  .map-svg .dot { transition: r 120ms, fill-opacity 120ms; cursor: pointer; }
-  .map-svg .dot:hover { fill-opacity: 1; stroke: #fff; stroke-width: 1.2; }
-  .map-legend { position: absolute; top: 12px; right: 12px; color: #cbd5e1;
-                font-size: 11px; background: rgba(15,23,42,0.7);
-                padding: 8px 11px; border-radius: 6px;
-                border: 1px solid rgba(148,163,184,0.25); }
-  .map-legend .swatch { display: inline-block; width: 11px; height: 11px;
-                         border-radius: 2px; vertical-align: middle;
-                         margin-right: 6px; }
-  .map-legend .row { margin: 2px 0; }
-
-  /* Playback */
-  .play { display: grid; grid-template-columns: 220px 1fr; gap: 18px;
-          background: var(--card); border: 1px solid var(--line);
-          border-radius: 10px; padding: 14px; margin-bottom: 8px;
-          box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
-  .play .thumb-box { aspect-ratio: 1/1; background: #0f172a;
-                     border-radius: 6px; overflow: hidden; position: relative; }
-  .play .thumb-box img { width: 100%; height: 100%; object-fit: contain;
-                          background: #0f172a; cursor: zoom-in; }
-  .play .ctrl { font-variant-numeric: tabular-nums; }
-  .play .row1 { display: flex; align-items: center; gap: 10px;
-                margin-bottom: 6px; }
-  .play .btn { background: var(--accent2); color: #fff; border: 0;
-               padding: 7px 14px; border-radius: 999px; cursor: pointer;
-               font-size: 13px; font-weight: 600; }
-  .play .btn:hover { background: #1d4ed8; }
-  .play .btn.pause { background: var(--mute); }
-  .play .seek { flex: 1; -webkit-appearance: none; appearance: none;
-                background: linear-gradient(90deg, var(--accent2) 0%,
-                            var(--accent2) var(--pct, 0%),
-                            #e2e8f0 var(--pct, 0%), #e2e8f0 100%);
-                height: 5px; border-radius: 3px; outline: none; }
-  .play .seek::-webkit-slider-thumb { -webkit-appearance: none;
-                width: 14px; height: 14px; border-radius: 50%;
-                background: var(--accent2); cursor: pointer; }
-  .play .seek::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%;
-                                   background: var(--accent2); cursor: pointer;
-                                   border: 0; }
-  .play .label { font-size: 11px; text-transform: uppercase;
-                 letter-spacing: 0.06em; color: var(--mute); }
-  .play .now { font-size: 18px; font-weight: 700; margin-top: 2px;
-               font-variant-numeric: tabular-nums; }
-  .play .now small { font-size: 11px; font-weight: 500; color: var(--mute);
-                     margin-left: 6px; text-transform: uppercase;
-                     letter-spacing: 0.04em; }
-  .play .stats-row { display: grid; gap: 10px;
-                     grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
-                     margin-top: 10px; padding-top: 10px;
-                     border-top: 1px solid var(--line); }
-  .play .stats-row .label { display: block; }
-  .play .stats-row .val { font-size: 14px; font-weight: 600;
-                          font-variant-numeric: tabular-nums; }
-  .play .speed { font-size: 11px; padding: 4px 8px; border-radius: 4px;
-                 border: 1px solid var(--line); background: #fff;
-                 cursor: pointer; }
-  .play .dss-block { margin-top: 10px; padding-top: 10px;
-                     border-top: 1px solid var(--line); display: grid;
-                     gap: 5px; }
-  .play .dss-row { display: flex; align-items: center; gap: 10px;
-                    font-size: 12px; line-height: 1.4; }
-  .play .dss-row .k { width: 60px; flex: 0 0 60px; color: var(--mute);
-                       font-size: 10px; text-transform: uppercase;
-                       letter-spacing: 0.06em; }
-  .play .dss-row .v { font-variant-numeric: tabular-nums; }
-  .play .dss-row code.v { background: #f1f5f9; padding: 2px 6px;
-                           border-radius: 4px; font-size: 11px;
-                           color: #1e3a5f; }
-  .play .dss-row .path { font-size: 10.5px; word-break: break-all;
-                          flex: 1; min-width: 0; }
-  .play .dss-row .badge { font-size: 10.5px; padding: 1px 8px;
-                           border-radius: 999px; background: #ecfdf5;
-                           color: #047857; font-weight: 600; }
-  .play .dss-row .badge.warn { background: #fffbeb; color: #b45309; }
-  .play .dss-row .badge.bad { background: #fef2f2; color: #b91c1c; }
-  .bbox-toggle { font-size: 11px; padding: 3px 9px; border-radius: 999px;
-                  border: 1px solid var(--line); background: #fff;
-                  cursor: pointer; }
-  .bbox-toggle[aria-pressed="false"] { background: #f1f5f9; color: var(--mute); }
-
-  /* DSS size strip */
-  .dss-strip-wrap { background: var(--card); border: 1px solid var(--line);
-                     border-radius: 10px; padding: 14px;
-                     box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
-  .dss-strip { display: block; width: 100%; height: auto; }
-  .dss-strip .b { transition: fill-opacity 100ms, transform 100ms; cursor: pointer; }
-  .dss-strip .b:hover { fill-opacity: 1; }
-  .dss-strip .b.active { stroke: #facc15; stroke-width: 1.4; }
-  .dss-tip { position: fixed; pointer-events: none; background: #0f172a;
-              color: #f1f5f9; font-size: 11px; padding: 6px 10px;
-              border-radius: 5px; box-shadow: 0 6px 16px rgba(0,0,0,0.3);
-              display: none; z-index: 10000; white-space: nowrap;
-              font-variant-numeric: tabular-nums; }
-  .dss-strip-legend { font-size: 11px; margin-top: 8px; color: var(--mute);
-                       display: flex; gap: 14px; flex-wrap: wrap;
-                       align-items: center; }
-  .dss-strip-legend .sw { display: inline-block; width: 11px; height: 11px;
-                           border-radius: 2px; vertical-align: middle;
-                           margin-right: 5px; }
-
-  /* Top gallery */
-  .gallery { display: grid;
-             grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-             gap: 12px; }
-  .card { background: var(--card); border: 1px solid var(--line);
-          border-radius: 8px; overflow: hidden; cursor: pointer;
-          transition: transform 120ms, box-shadow 120ms; }
-  .card:hover { transform: translateY(-2px);
-                box-shadow: 0 6px 16px rgba(15,23,42,0.12); }
-  .card .thumb { aspect-ratio: 1/1; background: #0f172a; }
-  .card .thumb img { width: 100%; height: 100%; object-fit: contain; }
-  .card .body { padding: 8px 10px; }
-  .card .rank { font-size: 10px; color: var(--mute); text-transform: uppercase;
-                letter-spacing: 0.06em; }
-  .card .precip { font-size: 17px; font-weight: 700;
-                  font-variant-numeric: tabular-nums; }
-  .card .date { font-size: 11px; color: var(--mute); margin-top: 1px; }
-
-  /* Season + month strip */
-  .small-charts { display: grid; gap: 18px;
-                   grid-template-columns: 220px 1fr; align-items: start; }
-  @media (max-width: 700px) { .small-charts { grid-template-columns: 1fr; } }
-  .donut-wrap { background: var(--card); border: 1px solid var(--line);
-                border-radius: 10px; padding: 12px; }
-  .donut-wrap .title { font-size: 11px; color: var(--mute);
-                       text-transform: uppercase; letter-spacing: 0.06em;
-                       margin-bottom: 6px; }
-  .donut-legend { font-size: 12px; margin-top: 4px; }
-  .donut-legend .row { display: flex; justify-content: space-between;
-                        padding: 2px 0; }
-  .donut-legend .row .left { display: flex; align-items: center; gap: 6px; }
-  .donut-legend .row .left .sw { width: 10px; height: 10px; border-radius: 2px; }
-  .donut-legend .row .ct { font-variant-numeric: tabular-nums;
-                            color: var(--mute); }
-  .month-strip { background: var(--card); border: 1px solid var(--line);
-                  border-radius: 10px; padding: 14px; }
-  .month-strip .row { display: grid; grid-template-columns: repeat(12, 1fr);
-                       gap: 6px; align-items: end; height: 110px; }
-  .month-strip .bar { background: linear-gradient(180deg, #60a5fa, #2563eb);
-                       border-radius: 3px 3px 0 0; min-height: 2px;
-                       position: relative; }
-  .month-strip .bar:hover { background: linear-gradient(180deg, #facc15, #d97706); }
-  .month-strip .bar .ct { position: absolute; top: -16px; left: 0; right: 0;
-                           text-align: center; font-size: 10px;
-                           color: var(--mute);
-                           font-variant-numeric: tabular-nums; }
-  .month-strip .labels { display: grid; grid-template-columns: repeat(12, 1fr);
-                          gap: 6px; font-size: 10px; color: var(--mute);
-                          text-align: center; margin-top: 6px;
-                          text-transform: uppercase; }
-
-  /* Year strip */
-  .year-bars { display: flex; gap: 1px; align-items: flex-end;
-               height: 70px; background: var(--card); border: 1px solid var(--line);
-               padding: 8px 8px 20px; border-radius: 8px; position: relative; }
-  .year-bars .bar { background: linear-gradient(180deg, #60a5fa, #1e3a5f);
-                    min-width: 4px; flex: 1 1 auto; border-radius: 2px 2px 0 0;
-                    position: relative; }
-  .year-bars .bar:hover { background: linear-gradient(180deg, #facc15, #d97706); }
-  .year-bars .bar span { position: absolute; bottom: -16px; left: 0; right: 0;
-                          font-size: 9px; text-align: center; color: var(--mute);
-                          font-variant-numeric: tabular-nums; }
-
-  /* Table */
-  table { width: 100%; border-collapse: collapse; font-size: 12px;
-          background: var(--card); border: 1px solid var(--line);
-          border-radius: 8px; overflow: hidden; }
-  th, td { padding: 6px 10px; text-align: left;
-           border-bottom: 1px solid var(--line); }
-  th { background: #f1f5f9; cursor: pointer; user-select: none;
-       position: sticky; top: 0; font-weight: 600;
-       text-transform: uppercase; font-size: 11px; letter-spacing: 0.04em;
-       color: var(--mute); }
-  th:hover { background: #e2e8f0; }
-  th[data-key]::after { content: ' ⇅'; opacity: 0.3; }
-  th[data-key].asc::after { content: ' ↑'; opacity: 1; color: var(--accent2); }
-  th[data-key].desc::after { content: ' ↓'; opacity: 1; color: var(--accent2); }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  tr.outlier { background: #fef2f2; }
-  tr.outlier td:first-child { box-shadow: inset 3px 0 0 #dc2626; }
-  tr:hover { background: #f8fafc; }
-  tr.active-row { background: #fef3c7 !important; }
-  img.thumb { height: 36px; width: 36px; object-fit: contain; background: #0f172a;
-              border-radius: 3px; cursor: pointer;
-              transition: transform 120ms; }
-  img.thumb:hover { transform: scale(1.4); }
-
-  /* Modal */
-  #modal { display: none; position: fixed; inset: 0;
-           background: rgba(15,23,42,0.92); z-index: 9999; cursor: pointer;
-           backdrop-filter: blur(2px); }
-  #modal img { max-width: 92vw; max-height: 88vh; margin: 4vh auto 0;
-               display: block; background: #0f172a; padding: 8px;
-               border-radius: 6px; }
-  #modal .caption { color: #f1f5f9; text-align: center; margin-top: 14px;
-                    font-size: 14px; font-variant-numeric: tabular-nums; }
-
-  .controls { font-size: 12px; margin: 8px 0; display: flex; gap: 10px;
-              align-items: center; }
-  .controls input { font-size: 12px; padding: 5px 8px; width: 240px;
-                     border: 1px solid var(--line); border-radius: 4px; }
-
-  @keyframes pulse { 0%, 100% { r: 7; opacity: 1; }
-                     50% { r: 14; opacity: 0.4; } }
-  #active-dot.playing { animation: pulse 1s ease-in-out infinite; }
-</style>
-</head>
-<body>
-<header>
-  <h1>__TITLE__</h1>
-  <div class="sub">__SUBTITLE__</div>
-  <div class="nav">__NAV_LINKS__</div>
-</header>
-<main>
-
-<h2>Summary</h2>
-<div class="stats">__SUMMARY_STATS__</div>
-
-__ANOMALIES_HTML__
-
-<h2>Data Integrity <span class="meta">cross-checks proving file contents match their labels</span></h2>
-<div class="integrity">__INTEGRITY_HTML__</div>
-
-<h2>Hydrologic Domain <span class="meta">watershed (blue), transposition region (orange hatched), valid sub-region (green) · CONUS overview right</span></h2>
-<div class="domain-wrap">
-  <div class="domain-map">__DOMAIN_SVG__</div>
-  <div class="domain-side">
-    <div class="conus-card">
-      <div class="conus-title">CONUS context</div>
-      <div class="conus-inner">__CONUS_SVG__</div>
-      <div class="conus-legend">
-        <span><span class="sw" style="background:#2563eb"></span>watershed</span>
-        <span><span class="sw" style="background:#ea580c"></span>transposition</span>
-      </div>
-    </div>
-    __WS_ZOOM_CARD__
-    __DOMAIN_STATS__
-  </div>
-</div>
-
-<h2>Storm Map <span class="meta">same geometry · 460 storms colored by mean precip · click a dot or row to focus</span></h2>
-<div class="map-wrap">
-  __SVG_MAP__
-</div>
-
-<h2>Storm Playback <span class="meta">__N_EVENTS__ events sorted chronologically</span></h2>
-<div class="play">
-  <div class="thumb-box">
-    <img id="play-thumb" src="" alt="" onclick="showModal(this.src, document.getElementById('play-caption').textContent)">
-  </div>
-  <div class="ctrl">
-    <div class="row1">
-      <button class="btn" id="play-btn">▶ Play</button>
-      <input class="seek" id="play-seek" type="range" min="0" max="0" value="0">
-      <select class="speed" id="play-speed">
-        <option value="800">1×</option>
-        <option value="400">2×</option>
-        <option value="200" selected>5×</option>
-        <option value="100">10×</option>
-        <option value="40">25×</option>
-      </select>
-    </div>
-    <div class="label">Storm <span id="play-pos">0</span>/<span id="play-total">0</span></div>
-    <div class="now" id="play-caption">—</div>
-    <div class="stats-row">
-      <div><span class="label">Item</span><span class="val" id="play-id">—</span></div>
-      <div><span class="label">Season</span><span class="val" id="play-season">—</span></div>
-      <div><span class="label">Mean</span><span class="val" id="play-mean">—</span></div>
-      <div><span class="label">Min</span><span class="val" id="play-min">—</span></div>
-      <div><span class="label">Max</span><span class="val" id="play-max">—</span></div>
-      <div><span class="label">DSS size</span><span class="val" id="play-dss">—</span></div>
-    </div>
-    <div class="dss-block">
-      <div class="dss-row">
-        <span class="k">DSS file</span>
-        <code class="v" id="play-dssfile">—</code>
-        <span class="badge" id="play-dur">—</span>
-      </div>
-      <div class="dss-row">
-        <span class="k">Window</span>
-        <span class="v" id="play-window">—</span>
-      </div>
-      <div class="dss-row">
-        <span class="k">Bbox</span>
-        <span class="v" id="play-bbox">—</span>
-        <button class="bbox-toggle" id="bbox-toggle" type="button" aria-pressed="true">Hide on map</button>
-      </div>
-      <div class="dss-row">
-        <span class="k">Precip</span>
-        <code class="v path" id="play-precip">—</code>
-      </div>
-      <div class="dss-row">
-        <span class="k">Temp</span>
-        <code class="v path" id="play-temp">—</code>
-      </div>
-    </div>
-  </div>
-</div>
-
-<h2>DSS Files <span class="meta">__N_DSS__ files · hover bars for detail · click to focus</span></h2>
-<div class="dss-strip-wrap">__DSS_STRIP__</div>
-
-<h2>Top 12 Events <span class="meta">by mean precipitation</span></h2>
-<div class="gallery" id="gallery">__GALLERY_HTML__</div>
-
-<h2>Seasonality</h2>
-<div class="small-charts">
-  <div class="donut-wrap">
-    <div class="title">By Season</div>
-    __SEASON_DONUT__
-    <div class="donut-legend">__SEASON_LEGEND__</div>
-  </div>
-  <div class="month-strip">
-    <div class="row">__MONTH_BARS__</div>
-    <div class="labels">__MONTH_LABELS__</div>
-  </div>
-</div>
-
-<h2>Year Distribution</h2>
-<div class="year-bars">__YEAR_BARS__</div>
-
-<h2>All Events <span class="meta">click a header to sort, thumbnail to enlarge, row to focus on map</span></h2>
-<div class="controls">
-  Filter:
-  <input id="filter" placeholder="date / season / id…">
-  Showing <span id="shown">__N_EVENTS__</span> rows
-</div>
-<table id="events">
-  <thead><tr>
-    <th data-key="id" data-type="num">Item ID</th>
-    <th data-key="storm_start" data-type="str">Storm Start (UTC)</th>
-    <th data-key="season" data-type="str">Season</th>
-    <th data-key="mean" data-type="num">Mean (in)</th>
-    <th data-key="min" data-type="num">Min (in)</th>
-    <th data-key="max" data-type="num">Max (in)</th>
-    <th data-key="max_lat" data-type="num">Lat</th>
-    <th data-key="max_lon" data-type="num">Lon</th>
-    <th data-key="dss_size" data-type="num">DSS KiB</th>
-    <th>Thumb</th>
-  </tr></thead>
-  <tbody id="events-body"></tbody>
-</table>
-
-</main>
-
-<div id="modal" onclick="this.style.display='none'">
-  <img id="modal-img" src="" alt="">
-  <div class="caption" id="modal-caption"></div>
-</div>
-
-<script>
-const events = __EVENTS_JSON__;
-const dssSize = __DSS_SIZE_JSON__;
-const outliers = new Set(__OUTLIERS_JSON__);
-const mapMeta = __MAP_META_JSON__;
-const eventsPrefix = __EVENTS_PREFIX_JSON__;
-
-// ─── Map dot interactivity ───────────────────────────────────────────────
-const mapSvg = document.querySelector('.map-svg');
-const activeDot = document.getElementById('active-dot');
-const activeBbox = document.getElementById('active-bbox');
-const bboxToggle = document.getElementById('bbox-toggle');
-let bboxVisible = true;
-if (bboxToggle) {
-  bboxToggle.addEventListener('click', () => {
-    bboxVisible = !bboxVisible;
-    bboxToggle.setAttribute('aria-pressed', bboxVisible);
-    bboxToggle.textContent = bboxVisible ? 'Hide on map' : 'Show on map';
-    if (!bboxVisible && activeBbox) activeBbox.style.display = 'none';
-    else if (bboxVisible && activeBbox && activeBbox.dataset.pending) {
-      activeBbox.style.display = 'block';
-    }
-  });
-}
-
-function focusOnMap(eid) {
-  const pos = mapMeta.positions[eid];
-  if (pos && activeDot) {
-    activeDot.setAttribute('cx', pos[0]);
-    activeDot.setAttribute('cy', pos[1]);
-    activeDot.setAttribute('r', 8);
-    activeDot.style.display = 'block';
-  }
-  const bb = mapMeta.bboxes ? mapMeta.bboxes[eid] : null;
-  if (bb && activeBbox) {
-    activeBbox.setAttribute('x', bb[0]);
-    activeBbox.setAttribute('y', bb[1]);
-    activeBbox.setAttribute('width', bb[2]);
-    activeBbox.setAttribute('height', bb[3]);
-    activeBbox.dataset.pending = '1';
-    activeBbox.style.display = bboxVisible ? 'block' : 'none';
-  } else if (activeBbox) {
-    activeBbox.style.display = 'none';
-  }
-}
-
-if (mapSvg) {
-  mapSvg.addEventListener('click', e => {
-    const t = e.target;
-    if (t && t.classList.contains('dot')) {
-      const id = t.getAttribute('data-id');
-      scrubTo(events.findIndex(ev => String(ev.id) === id));
-    }
-  });
-}
-
-// ─── Storm playback ──────────────────────────────────────────────────────
-const byDate = events.slice().sort((a, b) =>
-  (a.storm_start || '').localeCompare(b.storm_start || '')
-);
-const seek = document.getElementById('play-seek');
-const playBtn = document.getElementById('play-btn');
-const speedSel = document.getElementById('play-speed');
-seek.max = Math.max(0, byDate.length - 1);
-document.getElementById('play-total').textContent = byDate.length;
-let playIdx = 0;
-let playTimer = null;
-
-function thumbUrl(ev) {
-  return `${eventsPrefix}/${ev.id}/${ev.id}.thumbnail.png`;
-}
-
-function scrubTo(i) {
-  if (i < 0 || i >= byDate.length) return;
-  playIdx = i;
-  const ev = byDate[i];
-  seek.value = i;
-  seek.style.setProperty('--pct', (i / (byDate.length - 1 || 1) * 100).toFixed(1) + '%');
-  document.getElementById('play-pos').textContent = i + 1;
-  document.getElementById('play-thumb').src = thumbUrl(ev);
-  document.getElementById('play-caption').textContent =
-    `${ev.storm_start || '—'}  ·  Item ${ev.id}  ·  ${(ev.mean ?? '—')} in mean`;
-  document.getElementById('play-id').textContent = ev.id;
-  document.getElementById('play-season').textContent = ev.season || '—';
-  document.getElementById('play-mean').textContent =
-    ev.mean != null ? ev.mean.toFixed(2) : '—';
-  document.getElementById('play-min').textContent =
-    ev.min != null ? ev.min.toFixed(2) : '—';
-  document.getElementById('play-max').textContent =
-    ev.max != null ? ev.max.toFixed(2) : '—';
-  const sz = dssSize[ev.id];
-  document.getElementById('play-dss').textContent =
-    sz != null ? `${Math.round(sz / 1024)} KiB` : '—';
-
-  // DSS details
-  document.getElementById('play-dssfile').textContent = ev.dss_file || '—';
-  const dur = document.getElementById('play-dur');
-  if (ev.actual_hours != null) {
-    const h = ev.actual_hours;
-    dur.textContent = `${h.toFixed(0)} hr`;
-    dur.className = 'badge';
-    if (expectedHours && Math.abs(h - expectedHours) > 1) {
-      dur.className = 'badge bad';
-      dur.textContent = `${h.toFixed(0)} hr (≠ ${expectedHours} hr)`;
-    }
-  } else {
-    dur.textContent = '—';
-    dur.className = 'badge warn';
-  }
-  document.getElementById('play-window').textContent =
-    ev.storm_start && ev.storm_end
-      ? `${ev.storm_start} → ${ev.storm_end}`
-      : (ev.storm_start || '—');
-  const bb = ev.bbox;
-  document.getElementById('play-bbox').textContent = bb
-    ? `lon ${bb[0].toFixed(2)} → ${bb[2].toFixed(2)},  lat ${bb[1].toFixed(2)} → ${bb[3].toFixed(2)}`
-    : '—';
-  document.getElementById('play-precip').textContent = ev.precip_pathname || '— missing —';
-  document.getElementById('play-precip').className = 'v path' + (ev.precip_pathname ? '' : ' missing');
-  document.getElementById('play-temp').textContent = ev.temp_pathname || '— missing —';
-  document.getElementById('play-temp').className = 'v path' + (ev.temp_pathname ? '' : ' missing');
-
-  focusOnMap(String(ev.id));
-
-  // strip highlight
-  document.querySelectorAll('.dss-strip .b.active').forEach(b => b.classList.remove('active'));
-  const sb = document.querySelector(`.dss-strip .b[data-id="${ev.id}"]`);
-  if (sb) sb.classList.add('active');
-
-  // highlight active table row
-  document.querySelectorAll('tr.active-row').forEach(r => r.classList.remove('active-row'));
-  const r = document.querySelector(`tr[data-id="${ev.id}"]`);
-  if (r) r.classList.add('active-row');
-}
-
-const expectedHours = __EXPECTED_HOURS__;
-
-function stepPlay() {
-  scrubTo((playIdx + 1) % byDate.length);
-}
-
-function startPlay() {
-  if (playTimer) return;
-  const ms = parseInt(speedSel.value, 10) || 200;
-  playBtn.textContent = '⏸ Pause';
-  playBtn.classList.add('pause');
-  activeDot.classList.add('playing');
-  playTimer = setInterval(stepPlay, ms);
-}
-
-function stopPlay() {
-  if (!playTimer) return;
-  clearInterval(playTimer);
-  playTimer = null;
-  playBtn.textContent = '▶ Play';
-  playBtn.classList.remove('pause');
-  activeDot.classList.remove('playing');
-}
-
-playBtn.addEventListener('click', () => playTimer ? stopPlay() : startPlay());
-seek.addEventListener('input', e => { stopPlay(); scrubTo(parseInt(e.target.value, 10)); });
-speedSel.addEventListener('change', () => { if (playTimer) { stopPlay(); startPlay(); } });
-
-if (byDate.length) scrubTo(0);
-
-// ─── Events table ────────────────────────────────────────────────────────
-const tbody = document.getElementById('events-body');
-const shown = document.getElementById('shown');
-let sortKey = 'id', sortDir = 1, sortType = 'num';
-
-function row(ev) {
-  const sz = dssSize[ev.id] != null ? dssSize[ev.id] : null;
-  const szKi = sz != null ? Math.round(sz / 1024) : '';
-  const isOutlier = outliers.has(String(ev.id));
-  const tu = thumbUrl(ev);
-  return {
-    ev, isOutlier, szBytes: sz,
-    html: `<tr class="${isOutlier ? 'outlier' : ''}" data-id="${ev.id}">
-      <td class="num">${ev.id}</td>
-      <td>${ev.storm_start || ''}</td>
-      <td>${ev.season || ''}</td>
-      <td class="num">${ev.mean != null ? ev.mean.toFixed(2) : ''}</td>
-      <td class="num">${ev.min != null ? ev.min.toFixed(2) : ''}</td>
-      <td class="num">${ev.max != null ? ev.max.toFixed(2) : ''}</td>
-      <td class="num">${ev.max_lat != null ? ev.max_lat.toFixed(3) : ''}</td>
-      <td class="num">${ev.max_lon != null ? ev.max_lon.toFixed(3) : ''}</td>
-      <td class="num">${szKi}</td>
-      <td><img class="thumb" src="${tu}" alt="storm ${ev.id}" loading="lazy"
-               onclick="event.stopPropagation(); showModal('${tu}', 'Storm ${ev.id} — ${ev.storm_start}')"></td>
-    </tr>`
-  };
-}
-const allRows = events.map(row);
-
-function applySortIndicator() {
-  document.querySelectorAll('th[data-key]').forEach(th => {
-    th.classList.remove('asc', 'desc');
-    if (th.dataset.key === sortKey) th.classList.add(sortDir > 0 ? 'asc' : 'desc');
-  });
-}
-
-function render(filterText) {
-  const f = (filterText || '').toLowerCase();
-  let rows = allRows;
-  if (f) rows = rows.filter(r =>
-    String(r.ev.id).includes(f)
-    || (r.ev.storm_start || '').toLowerCase().includes(f)
-    || (r.ev.season || '').toLowerCase().includes(f)
-  );
-  rows = rows.slice().sort((a, b) => {
-    let av = sortKey === 'dss_size' ? a.szBytes : a.ev[sortKey];
-    let bv = sortKey === 'dss_size' ? b.szBytes : b.ev[sortKey];
-    if (sortType === 'num') {
-      av = av == null ? -Infinity : +av;
-      bv = bv == null ? -Infinity : +bv;
-    } else {
-      av = av || '';
-      bv = bv || '';
-    }
-    if (av < bv) return -1 * sortDir;
-    if (av > bv) return 1 * sortDir;
-    return 0;
-  });
-  tbody.innerHTML = rows.map(r => r.html).join('');
-  shown.textContent = rows.length;
-  applySortIndicator();
-}
-
-document.querySelectorAll('th[data-key]').forEach(th => {
-  th.addEventListener('click', () => {
-    const k = th.dataset.key;
-    if (sortKey === k) sortDir *= -1;
-    else { sortKey = k; sortDir = 1; sortType = th.dataset.type || 'str'; }
-    render(document.getElementById('filter').value);
-  });
-});
-document.getElementById('filter').addEventListener('input', e => render(e.target.value));
-
-tbody.addEventListener('click', e => {
-  const tr = e.target.closest('tr[data-id]');
-  if (!tr) return;
-  const i = byDate.findIndex(ev => String(ev.id) === tr.dataset.id);
-  if (i >= 0) { stopPlay(); scrubTo(i); }
-});
-
-render();
-
-// ─── Gallery click handlers ──────────────────────────────────────────────
-document.getElementById('gallery').addEventListener('click', e => {
-  const c = e.target.closest('.card[data-id]');
-  if (!c) return;
-  const i = byDate.findIndex(ev => String(ev.id) === c.dataset.id);
-  if (i >= 0) { stopPlay(); scrubTo(i); window.scrollTo({top: 0, behavior: 'smooth'}); }
-});
-
-// ─── DSS strip interactivity ─────────────────────────────────────────────
-const dssStrip = document.querySelector('.dss-strip');
-const dssTip = document.createElement('div');
-dssTip.className = 'dss-tip';
-document.body.appendChild(dssTip);
-if (dssStrip) {
-  const eventById = {};
-  for (const ev of events) eventById[String(ev.id)] = ev;
-  dssStrip.addEventListener('mouseover', e => {
-    const b = e.target.closest('.b[data-id]');
-    if (!b) return;
-    const ev = eventById[b.dataset.id];
-    if (!ev) return;
-    const sz = dssSize[ev.id];
-    const kib = sz != null ? Math.round(sz / 1024) : '—';
-    dssTip.innerHTML = `<b>Item ${ev.id}</b> · ${ev.storm_start || ''}` +
-      `<br>${kib} KiB · mean ${ev.mean != null ? ev.mean.toFixed(2) : '—'} in` +
-      (ev.is_outlier ? '<br><b style="color:#fca5a5">⚠ outlier</b>' : '');
-    dssTip.style.display = 'block';
-  });
-  dssStrip.addEventListener('mousemove', e => {
-    dssTip.style.left = (e.clientX + 12) + 'px';
-    dssTip.style.top = (e.clientY + 12) + 'px';
-  });
-  dssStrip.addEventListener('mouseout', () => { dssTip.style.display = 'none'; });
-  dssStrip.addEventListener('click', e => {
-    const b = e.target.closest('.b[data-id]');
-    if (!b) return;
-    const i = byDate.findIndex(ev => String(ev.id) === b.dataset.id);
-    if (i >= 0) { stopPlay(); scrubTo(i); }
-  });
-}
-
-// ─── Modal ───────────────────────────────────────────────────────────────
-function showModal(src, caption) {
-  document.getElementById('modal-img').src = src;
-  document.getElementById('modal-caption').textContent = caption;
-  document.getElementById('modal').style.display = 'block';
-}
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    document.getElementById('modal').style.display = 'none';
-    stopPlay();
-  }
-  if (e.key === ' ' && e.target === document.body) {
-    e.preventDefault();
-    playTimer ? stopPlay() : startPlay();
-  }
-  if (e.key === 'ArrowRight') { stopPlay(); scrubTo((playIdx + 1) % byDate.length); }
-  if (e.key === 'ArrowLeft') { stopPlay(); scrubTo((playIdx - 1 + byDate.length) % byDate.length); }
-});
-</script>
-</body>
-</html>
-"""
-
-
-def _index_html(runs: list[dict]) -> str:
-    """Landing page: one hero card per catalog with a top-storm thumbnail.
-
-    Card layout — thumbnail of the highest-mean event, key counts, and an
-    anomaly summary. Visual at-a-glance picker for which catalog to drill into.
-    """
-    cards: list[str] = []
-    for r in runs:
-        cid = r["catalog_id"]
-        attrs = r.get("attrs") or {}
-
-        # Pick the top event by mean precip as the cover image.
-        top_ev = None
-        for ev in r["events"]:
-            if isinstance(ev.get("mean"), (int, float)):
-                if top_ev is None or ev["mean"] > top_ev["mean"]:
-                    top_ev = ev
-        cover = (
-            f'{html.escape(r["run_name"])}/audit/events/'
-            f'{html.escape(str(top_ev["id"]))}/{html.escape(str(top_ev["id"]))}'
-            ".thumbnail.png"
-            if top_ev else ""
-        )
-
-        anoms = []
-        if r["outlier_dss"]:
-            anoms.append(f"{len(r['outlier_dss'])} outlier DSS")
-        if not r["grid_count_ok"]:
-            anoms.append(f"grid {r['n_grid']}/{r['expected_grid']}")
-        if r["out_of_box"]:
-            anoms.append(f"{len(r['out_of_box'])} out-of-bbox")
-        if anoms:
-            anomaly_html = (
-                '<div class="anom warn">⚠ ' + "; ".join(html.escape(a) for a in anoms)
-                + "</div>"
-            )
-        else:
-            anomaly_html = '<div class="anom ok">✓ clean</div>'
-
-        mean_min, mean_max = r["mean_range"]
-        mean_str = (
-            f"{mean_min:.1f}–{mean_max:.1f} in"
-            if isinstance(mean_min, (int, float)) else "—"
-        )
-
-        cards.append(
-            f'<a class="catalog-card" '
-            f'href="{html.escape(r["run_name"])}/audit/report.html">'
-            f'<div class="cover">'
-            + (
-                f'<img src="{cover}" alt="top storm in {html.escape(cid)}">'
-                if cover else ""
-            )
-            + f'<div class="duration">{attrs.get("storm_duration", "—")} hr</div>'
-            + "</div>"
-            f'<div class="body">'
-            f'<div class="cid">{html.escape(cid)}</div>'
-            f'<div class="metrics">'
-            f'<div><div class="n">{r["n_events"]}</div>'
-            f'<div class="l">events</div></div>'
-            f'<div><div class="n">{r["n_dss"]}</div>'
-            f'<div class="l">DSS</div></div>'
-            f'<div><div class="n">{r["n_grid"]}</div>'
-            f'<div class="l">grid</div></div>'
-            f'</div>'
-            f'<div class="precip-range">{mean_str} mean precip</div>'
-            f'{anomaly_html}'
-            f'</div></a>'
-        )
-
-    return (
-        "<!doctype html><html><head><meta charset=utf-8>"
-        "<title>Storm Catalog Audit Index</title>"
-        "<style>"
-        ":root{--ink:#0f172a;--mute:#64748b;--line:#e2e8f0;"
-        "--ok:#059669;--warn:#d97706;--bad:#dc2626}"
-        "*{box-sizing:border-box}body{margin:0;font-family:-apple-system,"
-        "BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;color:var(--ink);"
-        "background:#f7f8fb;line-height:1.45}"
-        "header{background:linear-gradient(135deg,#0f172a,#1e3a5f);color:#fff;"
-        "padding:24px 28px}"
-        "header h1{margin:0;font-size:22px}"
-        "header .sub{font-size:13px;opacity:.85;margin-top:4px}"
-        "main{max-width:1300px;margin:0 auto;padding:24px 28px 60px}"
-        ".grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}"
-        ".catalog-card{display:block;background:#fff;border:1px solid var(--line);"
-        "border-radius:12px;overflow:hidden;text-decoration:none;color:var(--ink);"
-        "box-shadow:0 2px 6px rgba(15,23,42,.05);transition:transform 150ms,box-shadow 150ms}"
-        ".catalog-card:hover{transform:translateY(-3px);"
-        "box-shadow:0 10px 22px rgba(15,23,42,.12)}"
-        ".cover{position:relative;aspect-ratio:16/9;background:#0f172a;overflow:hidden}"
-        ".cover img{width:100%;height:100%;object-fit:cover;opacity:.92}"
-        ".cover .duration{position:absolute;top:10px;right:10px;"
-        "background:rgba(15,23,42,.78);color:#fff;font-size:11px;padding:3px 9px;"
-        "border-radius:999px;letter-spacing:.04em}"
-        ".body{padding:14px 16px}"
-        ".cid{font-size:15px;font-weight:700;margin-bottom:10px}"
-        ".metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;"
-        "margin-bottom:10px}"
-        ".metrics .n{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}"
-        ".metrics .l{font-size:10px;color:var(--mute);text-transform:uppercase;"
-        "letter-spacing:.06em;margin-top:1px}"
-        ".precip-range{font-size:12px;color:var(--mute);margin-bottom:8px}"
-        ".anom{font-size:12px;padding:6px 10px;border-radius:6px;font-weight:600}"
-        ".anom.ok{background:#ecfdf5;color:#047857}"
-        ".anom.warn{background:#fffbeb;color:#b45309}"
-        "</style></head><body>"
-        "<header>"
-        "<h1>Storm Catalog Audit</h1>"
-        f'<div class="sub">{len(runs)} catalog(s) · click a card to open the report</div>'
-        "</header>"
-        '<main><div class="grid">'
-        + "".join(cards) +
-        "</div></main></body></html>"
-    )
-
-
 def _stat_html(label: str, value: str, *, warn: bool = False, ok: bool = False) -> str:
     cls = "stat" + (" warn" if warn else " ok" if ok else "")
     return (
@@ -2310,7 +1409,7 @@ def _build_season_donut(events: list[dict]) -> tuple[str, str]:
     ]
 
     cx, cy, r_outer, r_inner = 90, 90, 75, 48
-    parts = [f'<svg viewBox="0 0 180 180" style="width:100%;max-width:180px;display:block;margin:auto">']
+    parts = ['<svg viewBox="0 0 180 180" style="width:100%;max-width:180px;display:block;margin:auto">']
 
     # Background ring
     parts.append(
@@ -2513,20 +1612,14 @@ def _build_gallery(events: list[dict], events_prefix: str, k: int = 12) -> str:
     return "".join(cards)
 
 
-def _build_report(
-    run_name: str, audit: dict, all_runs: list[dict], http_mode: bool = False
-) -> Path | str:
-    """Render a catalog's audit report.
+def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
+    """Render a catalog's audit report as an HTML string.
 
-    File mode (default): write ``audit/report.html`` with relative asset URLs
-    and return the path — used by ``./audit.py report`` for offline sharing.
-
-    HTTP mode: return the HTML string with absolute URLs rooted at the unified
-    web app's routes (``/assets/<name>/...`` thumbnails, ``/audit/<other>`` nav)
-    so ``web.py`` can serve the same report inline without writing a file.
+    Asset URLs are absolute, rooted at the app's routes (``/assets/<name>/...``
+    thumbnails, ``/audit/<other>`` nav) so the server serves it inline.
     """
     audit_dir = OUTPUTS / run_name / "audit"
-    events_prefix = f"/assets/{run_name}/events" if http_mode else "events"
+    events_prefix = f"/assets/{run_name}/events"
 
     # Stats
     progress = audit.get("progress") or {}
@@ -2817,20 +1910,12 @@ def _build_report(
         audit["events"], dss_size_by_id, audit["median_dss_bytes"]
     )
 
-    if http_mode:
-        nav_links = " ".join(
-            f'<a href="/audit/{html.escape(r["run_name"])}">{html.escape(r["catalog_id"])}</a>'
-            for r in all_runs
-            if r["run_name"] != run_name
-        )
-        nav_links = '<a href="/">Index</a> ' + nav_links
-    else:
-        nav_links = " ".join(
-            f'<a href="../../{r["run_name"]}/audit/report.html">{html.escape(r["catalog_id"])}</a>'
-            for r in all_runs
-            if r["run_name"] != run_name
-        )
-        nav_links = '<a href="../../audit-index.html">Index</a> ' + nav_links
+    nav_links = " ".join(
+        f'<a href="/audit/{html.escape(r["run_name"])}">{html.escape(r["catalog_id"])}</a>'
+        for r in all_runs
+        if r["run_name"] != run_name
+    )
+    nav_links = '<a href="/">Index</a> ' + nav_links
 
     # Pull the manifest's free-form description if cached. For these catalogs
     # the description encodes design intent ("maximizes over 1000 sq mi
@@ -2890,172 +1975,1197 @@ def _build_report(
         "__MAP_META_JSON__": json.dumps(map_meta),
         "__EVENTS_PREFIX_JSON__": json.dumps(events_prefix),
     }
-    report_html = _REPORT_TEMPLATE
+    report_html = (STATIC / "report.html").read_text(encoding="utf-8")
     for k, v in repl.items():
         report_html = report_html.replace(k, v)
 
-    if http_mode:
-        return report_html
-    out_path = audit_dir / "report.html"
-    out_path.write_text(report_html, encoding="utf-8")
-    return out_path
+    return report_html
 
 
-def _read_json(p: Path) -> Any | None:
-    if not p.is_file():
+def _maybe_int(x: object) -> int | None:
+    """Coerce CC-SDK string-attr values to int. Payload attrs come over as
+    strings (CC convention), so storm_duration="48" needs unwrapping."""
+    if x is None:
         return None
     try:
-        return json.loads(p.read_text())
-    except (OSError, json.JSONDecodeError):
+        s = str(x).strip()
+        return int(s) if s else None
+    except (ValueError, TypeError):
         return None
 
 
-# ─── serve ────────────────────────────────────────────────────────────────────
+# ─── Analytical ETA model ────────────────────────────────────────────────────
+#
+# Pre-launch ETA is derived from payload-attribute analysis — NO history,
+# NO past-run measurements. The dominant cost in the pipeline is the
+# process-storms scan loop, which iterates once per date emitted by
+# ``generate_date_range(start, end, every_n_hours=check_every_n_hours)``
+# in stormhub/met/storm_catalog.py:1605. The other actions scale linearly
+# with ``top_n_events``.
+#
+# The per-unit-of-work constants below are coarse rules of thumb intended
+# to place the estimate in the right order of magnitude (minutes vs hours),
+# not to be precise. Once the run is in flight, the in-progress sub-loop's
+# measured rate (action_progress) refines the ETA — see _runtime_eta_s.
+
+_S_PER_SCAN_DATE = 0.5  # process-storms: one zarr window scan
+_S_PER_EVENT_ITEM = 5.0  # process-storms: per top-N storm item creation
+_S_PER_EVENT_DSS = 6.0  # convert-to-dss: per storm
+_S_PER_EVENT_GRID = 2.5  # create-grid-file: per storm
+_S_DOWNLOAD_FIXED = 10.0  # download-inputs: tiny geojson + config
+_S_UPLOAD_FIXED = 30.0  # upload-outputs: STAC + DSS sync to S3
+_S_OVERHEAD_FIXED = 15.0  # container start, plugin init, payload validate
 
 
-def _serve(port: int = 8745, host: str = "127.0.0.1") -> None:
-    os.chdir(OUTPUTS)
-    httpd = ThreadingHTTPServer((host, port), SimpleHTTPRequestHandler)
-    display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-    url = f"http://{display_host}:{port}/audit-index.html"
-    print(f"\nServing audit reports at {url}")
-    if host in ("0.0.0.0", "::"):
-        # When binding to all interfaces, surface the LAN-reachable URLs too —
-        # the user is most likely browsing from another machine on the LAN.
-        import socket
+def _work_units(attrs: dict) -> dict | None:
+    """Translate a payload's attrs into work-unit counts.
 
-        for addr in _lan_addrs():
-            print(f"  also reachable as http://{addr}:{port}/audit-index.html")
-        print(
-            "  (server is bound to all interfaces — anyone on the LAN can read these "
-            "reports. Stop with Ctrl-C when done.)"
-        )
-    print("Ctrl-C to stop.\n")
-    if host == "127.0.0.1":
-        # Only auto-open when bound to loopback — otherwise we're on a headless
-        # box and there's no local browser to spawn.
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down.")
-    finally:
-        httpd.server_close()
-
-
-def _lan_addrs() -> list[str]:
-    """LAN IPv4 addresses for this host, in a deterministic order. Skips
-    loopback, docker bridges, and link-local. Used by _serve() to print
-    every URL the user might reach the server on.
+    Returns None when required attrs are missing or unparseable — callers
+    should fall back to "no estimate".
     """
-    import socket
-
-    out = []
+    if not attrs:
+        return None
+    start = (attrs.get("start_date") or "").strip()
+    end = (attrs.get("end_date") or start).strip()
+    storm_dur = _maybe_int(attrs.get("storm_duration"))
+    top_n = _maybe_int(attrs.get("top_n_events"))
+    # CC payloads default check_every_n_hours to 24 in
+    # plugin/actions/process_storms.py:_storm_params.
+    check_every = _maybe_int(attrs.get("check_every_n_hours")) or 24
+    if not start or not storm_dur or not top_n:
+        return None
     try:
-        names = socket.getaddrinfo(
-            socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM
-        )
-        for n in names:
-            ip = n[4][0]
-            if ip.startswith(("127.", "172.17.", "172.18.", "169.254.")):
+        from datetime import datetime
+
+        d_start = datetime.fromisoformat(start)
+        d_end = datetime.fromisoformat(end) if end else d_start
+    except ValueError:
+        return None
+    span_h = max(0.0, (d_end - d_start).total_seconds() / 3600.0)
+    n_dates = int(span_h / check_every) + 1
+    return {
+        "n_dates": n_dates,
+        "n_events": top_n,
+        "storm_duration_h": storm_dur,
+        "check_every_n_hours": check_every,
+        "span_hours": span_h,
+    }
+
+
+def _predict_action_seconds(work: dict | None) -> dict[str, float]:
+    """Per-action predicted durations. Empty dict ⇒ no estimate."""
+    if not work:
+        return {}
+    n_dates = work["n_dates"]
+    n_events = work["n_events"]
+    return {
+        "download-inputs": _S_DOWNLOAD_FIXED,
+        "process-storms": (n_dates * _S_PER_SCAN_DATE + n_events * _S_PER_EVENT_ITEM),
+        "convert-to-dss": n_events * _S_PER_EVENT_DSS,
+        "create-grid-file": n_events * _S_PER_EVENT_GRID,
+        "upload-outputs": _S_UPLOAD_FIXED,
+    }
+
+
+def _predict_total_s(attrs: dict) -> float | None:
+    """Pre-launch total ETA from payload analysis. ``None`` when undecidable."""
+    breakdown = _predict_action_seconds(_work_units(attrs))
+    if not breakdown:
+        return None
+    return sum(breakdown.values()) + _S_OVERHEAD_FIXED
+
+
+# ─── duration-weighted step weights ──────────────────────────────────────────
+#
+# The pipeline's steps have wildly unequal durations — process-storms commonly
+# runs ~98% of total wall time (e.g. 1730s of 1753s on a real run) while
+# create-grid-file is milliseconds. Weighting each step as 1/N makes the bar
+# misrepresent true progress, so we weight by *seconds*. Weights come, in
+# priority order, from (1) historical medians measured on this machine, (2) the
+# analytic per-unit prediction, (3) a small floor so no step is weightless.
+
+_STEP_FLOOR_S = 2.0  # minimum weight so an unseen/instant step still shows
+_HIST_TTL_S = 10.0  # cache historical scan; the dashboard polls every 2s
+_hist_cache: dict = {"at": 0.0, "data": None}
+
+
+def _historical_step_seconds() -> dict[str, float]:
+    """Median completed-step durations learned from finished runs.
+
+    Scans every ``compute/outputs/*/progress.json`` that has a ``summary``
+    (i.e. completed) and returns ``{step_name: median_duration_s}`` for steps
+    with >=2 samples. Memoized with a short TTL so the 2s poll doesn't rescan.
+    """
+    now = time.time()
+    cached = _hist_cache["data"]
+    if cached is not None and now - _hist_cache["at"] < _HIST_TTL_S:
+        return cached
+    samples: dict[str, list[float]] = {}
+    if OUTPUTS.is_dir():
+        for run_dir in OUTPUTS.iterdir():
+            if not run_dir.is_dir():
                 continue
-            if ip not in out:
-                out.append(ip)
+            prog = _read_json(run_dir / "progress.json")
+            if not prog or not prog.get("summary"):
+                continue
+            for s in prog.get("completed_steps") or []:
+                nm, dur = s.get("name"), s.get("duration_s")
+                if nm and isinstance(dur, (int, float)) and dur >= 0:
+                    samples.setdefault(nm, []).append(float(dur))
+    medians = {nm: statistics.median(v) for nm, v in samples.items() if len(v) >= 2}
+    _hist_cache.update(at=now, data=medians)
+    return medians
+
+
+def weight_for_step(
+    name: str, attrs: dict | None, predicted: dict[str, float] | None = None
+) -> float:
+    """Resolve a step's weight in seconds: historical median > predicted > floor."""
+    hist = _historical_step_seconds()
+    if name in hist:
+        return max(_STEP_FLOOR_S, hist[name])
+    if predicted is None:
+        predicted = _predict_action_seconds(_work_units(attrs or {}))
+    if predicted.get(name, 0) > 0:
+        return max(_STEP_FLOOR_S, predicted[name])
+    return _STEP_FLOOR_S
+
+
+def _step_weights(plan: list[str], attrs: dict | None) -> dict[str, float]:
+    """{step_name: weight_seconds} for every step in the run's plan."""
+    predicted = _predict_action_seconds(_work_units(attrs or {}))
+    return {nm: weight_for_step(nm, attrs, predicted) for nm in plan}
+
+
+def _within_step_frac(run: dict, cs: dict, cur_weight: float) -> float:
+    """0..1 fraction of the current step complete.
+
+    ``action_progress`` is keyed by step name, so we look up the current step
+    directly (not "freshest across all labels", which could surface a prior
+    completed step's 100%). Falls back to a time-based estimate (in-step
+    elapsed / expected step seconds, capped 0.95) so long steps without
+    sub-progress reporting still advance. Phase 3 supplies a real fraction for
+    process-storms via launch.log.
+    """
+    cur = cs.get("name")
+    now = time.time()
+    a = (run.get("action_progress") or {}).get(cur) if cur else None
+    if a:
+        ts = a.get("updated_at") or 0
+        if ts and now - ts <= 120:
+            return max(0.0, min(100.0, a.get("pct") or 0)) / 100.0
+    started = cs.get("started_at")
+    if started and cur_weight > 0:
+        return min(0.95, max(0.0, now - started) / cur_weight)
+    return 0.0
+
+
+def _runtime_eta_s(run: dict, attrs: dict | None) -> float | None:
+    """Live ETA for a running run.
+
+    Composition:
+      completed steps → actual durations
+      current step    → live sub-loop ETA when available; else analytic
+                        minus time spent in this step so far
+      future steps    → analytic predictions
+
+    Returns ``None`` when there's no analytic baseline AND no live signal.
+    """
+    plan = run.get("plan") or []
+    completed = {s["name"] for s in run.get("completed_steps", [])}
+    cs = run.get("current_step")
+    if not plan:
+        # No plan recorded — fall back to the pre-launch analytic estimate.
+        breakdown = _predict_action_seconds(_work_units(attrs or {}))
+        if not breakdown:
+            return None
+        total = sum(breakdown.values()) + _S_OVERHEAD_FIXED
+        return max(0.0, total - (run.get("elapsed_s") or 0.0))
+
+    weights = _step_weights(plan, attrs)
+    if not cs:
+        # Pre-step or post-summary: remaining = total weight minus elapsed.
+        total = sum(weights.values())
+        return max(0.0, total - (run.get("elapsed_s") or 0.0))
+
+    current_name = cs.get("name")
+    cur_w = weights.get(current_name, 0.0)
+    eta = 0.0
+
+    # Current step: prefer a live measured ETA; else weight × remaining fraction.
+    live = _live_current_step_eta(run.get("action_progress") or {})
+    if live is not None:
+        eta += live
+    else:
+        within = _within_step_frac(run, cs, cur_w)
+        eta += max(0.0, cur_w * (1.0 - within))
+
+    # Future steps: every planned step not yet completed and not current.
+    for name, w in weights.items():
+        if name == current_name or name in completed:
+            continue
+        eta += w
+    return eta
+
+
+def _live_current_step_eta(action_progress: dict) -> float | None:
+    """Pick freshest non-stale, non-complete action_progress eta_s."""
+    now = time.time()
+    best = None
+    for _label, a in action_progress.items():
+        ts = a.get("updated_at")
+        if not ts or now - ts > 120:
+            continue
+        if (a.get("pct") or 0) >= 100:
+            continue
+        if best is None or ts > best.get("updated_at", 0):
+            best = a
+    if best is None:
+        return None
+    eta = best.get("eta_s")
+    if eta is None or eta == float("inf"):
+        return None
+    return float(eta)
+
+
+def _pid_alive(pid: int | None) -> bool:
+    """POSIX + Windows ``os.kill(pid, 0)`` is a no-op that only checks reachability."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we can't signal it — still counts as alive.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _derive_status(progress: dict | None, launch: dict | None) -> str:
+    """Status precedence: done > interrupted > failed > running > starting > unknown.
+
+    ``interrupted`` (made real progress, then lost the launcher — e.g. a
+    machine reboot or a Stop) is distinguished from ``failed`` (launcher
+    died before any step started, usually a docker / env error). The two
+    look identical to the user but call for different remediations: a
+    Retry on the interrupted run resumes via the plugin's disk-level
+    idempotency, while a Retry on the failed run needs the underlying
+    docker/env issue fixed first.
+    """
+    if progress and progress.get("summary"):
+        return "done"
+    launcher_alive = _pid_alive((launch or {}).get("pid"))
+    if launch and not launcher_alive:
+        # Launcher died. If progress.json has any step state (in flight or
+        # completed), the run made real progress and can be resumed.
+        made_progress = bool(
+            progress
+            and (progress.get("current_step") or progress.get("completed_steps"))
+        )
+        return "interrupted" if made_progress else "failed"
+    if progress and progress.get("current_step"):
+        return "running"
+    if launch:
+        return "starting"
+    if progress:
+        # progress.json exists but no current_step and no summary — a stale
+        # initial snapshot. Treat as unknown rather than guessing.
+        return "unknown"
+    return "unknown"
+
+
+def _has_run_output(run_dir: Path) -> bool:
+    """A run dir without launch/progress markers might still be a completed
+    run from a CLI invocation. Recognize it by the presence of any file or
+    subdir — stormhub leaves ``config.json``, catalog dirs, DSS files, etc.
+    """
+    try:
+        for _ in run_dir.iterdir():
+            return True
     except OSError:
         pass
-    return out
+    return False
 
 
-# ─── CLI dispatch ─────────────────────────────────────────────────────────────
+def _tail_bytes(path: Path, n: int = 65536) -> str:
+    """Decode the last ``n`` bytes of a file (bounded read for large logs)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - n))
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
-def _do_download(targets: list[str]) -> None:
-    _load_hec_env()
-    for t in targets:
-        print(f"\n=== Downloading {t} ===")
-        _download_run(t)
+def _tail_log(path: Path, max_lines: int = 12) -> str:
+    """Read the last ``max_lines`` of a log file for surfacing failure context."""
+    text = _tail_bytes(path)
+    if not text:
+        return ""
+    return "\n".join(text.splitlines()[-max_lines:])
 
 
-def _do_report(targets: list[str]) -> None:
-    all_runs: list[dict] = []
-    for t in targets:
-        audit_dir = OUTPUTS / t / "audit"
-        if not audit_dir.is_dir():
-            print(f"  skip {t}: no audit/ — run `./audit.py download {t}` first")
+# Process-storms (the dominant step) runs the cumsum scan, which doesn't write
+# progress.json action_progress but DOES log per-year completion to launch.log:
+#   [cumsum-scan] dispatching 47 years ...
+#   [cumsum-scan] year=1979 done (completed=184, skipped=0) — 1/47 years in 29.5s
+# Parsing these gives the only real sub-progress for the step that otherwise
+# freezes the bar through ~98% of the run. Bracket-anchored to tolerate the
+# leading "<ts> [INFO] " logging prefix.
+_CUMSUM_YEAR_RE = re.compile(r"\[cumsum-scan\] year=\d+ done .*?(\d+)/(\d+) years")
+_CUMSUM_DISPATCH_RE = re.compile(r"\[cumsum-scan\] dispatching (\d+) years")
+
+
+def _scan_launch_log(run_dir: Path, step_started: float | None = None) -> dict | None:
+    """Synthesize a process-storms action_progress entry from launch.log.
+
+    Returns an entry shaped like progress.json's action_progress values
+    ({done,total,pct,rate,eta_s,updated_at}) or None when no year count is
+    determinable yet. Used only for a running process-storms step.
+    """
+    text = _tail_bytes(run_dir / "launch.log")
+    if not text:
+        return None
+    years_total = None
+    for m in _CUMSUM_DISPATCH_RE.finditer(text):
+        years_total = int(m.group(1))
+    last_year = None
+    for m in _CUMSUM_YEAR_RE.finditer(text):
+        last_year = m
+    years_done = 0
+    if last_year:
+        years_done = int(last_year.group(1))
+        years_total = years_total or int(last_year.group(2))
+    if not years_total:
+        return None
+    pct = 100.0 * years_done / years_total
+    entry = {
+        "done": years_done,
+        "total": years_total,
+        "pct": round(pct, 1),
+        "rate": None,
+        "eta_s": None,
+        "updated_at": time.time(),
+    }
+    if step_started and years_done > 0:
+        elapsed = max(0.0, time.time() - step_started)
+        if elapsed > 0:
+            rate = years_done / elapsed  # years/sec
+            entry["rate"] = rate
+            entry["eta_s"] = (years_total - years_done) / rate if rate > 0 else None
+    return entry
+
+
+def _list_runs() -> list[dict]:
+    if not OUTPUTS.is_dir():
+        return []
+    runs: list[dict] = []
+    entries = sorted(OUTPUTS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    for run_dir in entries:
+        if not run_dir.is_dir():
             continue
-        a = _audit(t)
-        all_runs.append(a)
-    if not all_runs:
-        return
-    for a in all_runs:
-        path = _build_report(a["run_name"], a, all_runs)
-        print(f"  ✓ wrote {path.relative_to(ROOT)}")
-    index_path = OUTPUTS / "audit-index.html"
-    index_path.write_text(_index_html(all_runs), encoding="utf-8")
-    print(f"  ✓ wrote {index_path.relative_to(ROOT)}")
+        progress = _read_json(run_dir / "progress.json")
+        launch = _read_json(run_dir / "launch.json")
+        has_output = _has_run_output(run_dir)
+        if progress is None and launch is None and not has_output:
+            continue
+        status = _derive_status(progress, launch)
+        if status == "unknown" and has_output and progress is None and launch is None:
+            # Legacy CLI run: no markers but the dir holds plugin output.
+            # Surface it as "done" so the user can re-run from the UI.
+            status = "done"
+        attrs = (launch or {}).get("payload_attrs") or {}
+        rec = {
+            "name": run_dir.name,
+            "status": status,
+            "started_at": (progress or {}).get("started_at")
+            or (launch or {}).get("launched_at"),
+            "elapsed_s": (progress or {}).get("elapsed_s"),
+            "current_step": (progress or {}).get("current_step"),
+            "summary": (progress or {}).get("summary"),
+            "plan": (progress or {}).get("plan", []),
+            "action_progress": (progress or {}).get("action_progress", {}),
+            "completed_steps": (progress or {}).get("completed_steps", []),
+            # Used by the Re-run button. None when we don't know the
+            # payload UUID (legacy CLI run without launch.json).
+            "payload_uuid": (launch or {}).get("payload_uuid"),
+            "predicted_total_s": _predict_total_s(attrs),
+            # Audit availability so the dashboard can link/trigger audits.
+            "has_audit": _has_audit(run_dir.name),
+        }
+        dljob = _download_jobs.get(run_dir.name)
+        if dljob and dljob.get("state") == "running":
+            rec["audit_downloading"] = True
+        if status == "running":
+            # The cumsum process-storms step emits no action_progress; derive
+            # its real sub-progress from launch.log's per-year lines and inject
+            # a synthetic entry so the weighted bar + ETA pick it up naturally.
+            cs = rec.get("current_step") or {}
+            if (
+                cs.get("name") == "process-storms"
+                and "process-storms" not in rec["action_progress"]
+            ):
+                scan = _scan_launch_log(run_dir, cs.get("started_at"))
+                if scan:
+                    rec["action_progress"] = {
+                        **rec["action_progress"],
+                        "process-storms": scan,
+                    }
+            rec["eta_s"] = _runtime_eta_s(rec, attrs)
+            rec["overall_pct"] = _overall_pct(rec, attrs)
+        if status in ("failed", "interrupted"):
+            rec["error_tail"] = _tail_log(run_dir / "launch.log")
+        runs.append(rec)
+    return runs
 
 
-def main() -> None:
-    argv = sys.argv[1:]
-    if argv and argv[0] in ("-h", "--help", "help"):
-        print(__doc__)
-        return
+def _overall_pct(run: dict, attrs: dict | None = None) -> float | None:
+    """Fraction of the pipeline complete, 0..100 — weighted by step duration.
 
-    if not argv:
-        targets = _known_runs()
-        if not targets:
-            print("No runs found in compute/outputs/.", file=sys.stderr)
-            sys.exit(1)
-        _do_download(targets)
-        _do_report(targets)
-        _serve()
-        return
+    Each step contributes its weight (historical median seconds, else analytic
+    prediction, else a floor) rather than 1/N, so the bar tracks true cost.
+    A run where process-storms is 98% of the time will show ~98% of the bar
+    devoted to that step instead of a misleading 20%.
+    """
+    cs = run.get("current_step") or {}
+    plan = run.get("plan") or []
+    if not plan:
+        # No plan — fall back to the coarse step counter.
+        i, n = cs.get("i"), cs.get("n")
+        if not n:
+            return None
+        return round(min(1.0, max(0.0, (max(1, i or 1) - 1) / n)) * 100, 1)
 
-    cmd = argv[0]
-    rest = argv[1:]
+    weights = _step_weights(plan, attrs)
+    total = sum(weights.values()) or 1.0
+    completed = {s.get("name") for s in run.get("completed_steps", [])}
+    done_weight = sum(w for nm, w in weights.items() if nm in completed)
+    cur = cs.get("name")
+    cur_w = weights.get(cur, 0.0) if cur else 0.0
+    within = _within_step_frac(run, cs, cur_w) if cur else 0.0
+    overall = (done_weight + within * cur_w) / total
+    return round(min(1.0, max(0.0, overall)) * 100, 1)
 
-    if cmd == "download":
-        targets = rest or _known_runs()
-        _do_download(targets)
-        return
-    if cmd == "report":
-        targets = rest or _known_runs()
-        _do_report(targets)
-        return
-    if cmd == "serve":
-        host = "127.0.0.1"
-        port = 8745
-        i = 0
-        while i < len(rest):
-            tok = rest[i]
-            if tok == "--host" and i + 1 < len(rest):
-                host = rest[i + 1]
-                i += 2
-            elif tok.isdigit():
-                port = int(tok)
-                i += 1
-            else:
-                print(f"unrecognized arg: {tok}", file=sys.stderr)
-                sys.exit(2)
-        # Auditing is now part of the unified web app (./run.py web, :8744),
-        # which serves reports inline at /audit/<name>. Forward there instead
-        # of standing up a second static server on :8745.
-        print(
-            "note: audit reports are now served by the unified web app. "
-            f"Forwarding to ./run.py web on port {8744 if port == 8745 else port}.",
-            file=sys.stderr,
+
+# ─── HEC S3 payload listing ──────────────────────────────────────────────────
+
+
+def _list_payloads() -> dict:
+    """Three distinct response shapes — the UI picks branches off them:
+    {"state": "unconfigured"}              — no env file yet
+    {"state": "error",  "detail": "..."}   — env present, listing failed
+    {"state": "ok",     "payloads": [...]} — listing succeeded (may be empty)
+
+    Each payload dict carries uuid, mtime, and (for parseable payloads)
+    catalog_id, catalog_description, start_date, end_date, storm_duration,
+    top_n_events. See plugin/cli.py:_cmd_list_payloads.
+    """
+    if not HEC_ENV.is_file():
+        return {"state": "unconfigured"}
+    r = subprocess.run(
+        [sys.executable, str(RUN_PY), "hec", "list", "--json"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    if r.returncode != 0:
+        return {"state": "error", "detail": (r.stderr or r.stdout).strip()}
+    try:
+        payloads = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError as e:
+        return {"state": "error", "detail": f"could not parse list output: {e}"}
+    # Augment each payload with an analytical ETA derived from its attrs.
+    for p in payloads:
+        p["predicted_s"] = _predict_total_s(p)
+    return {"state": "ok", "payloads": payloads}
+
+
+# ─── launching ───────────────────────────────────────────────────────────────
+
+
+# Cross-platform process detachment: POSIX uses setsid, Windows uses
+# DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP so the child survives the
+# parent's exit and isn't bound to its console.
+if sys.platform == "win32":
+    _DETACH_KWARGS: dict = {
+        "creationflags": (
+            subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+        ),
+    }
+else:
+    _DETACH_KWARGS = {"start_new_session": True}
+
+
+def _launch(
+    args: list[str],
+    name: str,
+    *,
+    payload_uuid: str | None = None,
+    payload_attrs: dict | None = None,
+) -> str:
+    """Detach a run in the background.
+
+    Writes ``launch.json`` BEFORE Popen so the UI sees the launch even if
+    the process dies in its first millisecond (the dead PID still tells us
+    it failed). Stdout/stderr stream to ``launch.log``.
+    """
+    safe = _safe_subdir(name)
+    run_dir = OUTPUTS / safe
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # Clear stale progress.json from prior runs in this dir so the UI doesn't
+    # show a stale "done"/"current_step" until the new run writes its own.
+    (run_dir / "progress.json").unlink(missing_ok=True)
+    log_file = (run_dir / "launch.log").open("ab", buffering=0)
+    proc = subprocess.Popen(
+        args,
+        cwd=str(ROOT),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        **_DETACH_KWARGS,
+    )
+    (run_dir / "launch.json").write_text(
+        json.dumps(
+            {
+                "launched_at": time.time(),
+                "args": args,
+                "pid": proc.pid,
+                "payload_uuid": payload_uuid,
+                "payload_attrs": payload_attrs or {},
+            }
         )
-        from web import serve as _web_serve
+    )
+    return safe
 
-        _web_serve(host=host, port=(8744 if port == 8745 else port))
-        return
-    print(f"Unknown command: {cmd}", file=sys.stderr)
-    print(__doc__, file=sys.stderr)
-    sys.exit(2)
+
+def _launch_local() -> str:
+    return _launch([sys.executable, str(RUN_PY)], "quick-test")
+
+
+def _launch_hec(
+    uuid: str,
+    name: str | None = None,
+    *,
+    payload_attrs: dict | None = None,
+) -> str:
+    target = _safe_subdir(name or uuid)
+    args = [sys.executable, str(RUN_PY), "hec", uuid]
+    if target != uuid:
+        args.append(target)
+    return _launch(args, target, payload_uuid=uuid, payload_attrs=payload_attrs)
+
+
+def _stop(run_name: str) -> tuple[bool, str | None]:
+    """Gracefully stop a running compute. Returns ``(stopped, error)``.
+
+    Strategy: ``docker stop`` the container via its cidfile so the plugin's
+    SIGTERM handler unwinds the current action and exits cleanly,
+    preserving on-disk state for resume. Falls back to looking up the
+    container by label if the cidfile is missing (older runs, manual
+    deletion).
+    """
+    safe = _safe_subdir(run_name)
+    run_dir = OUTPUTS / safe
+    cidfile = run_dir / "container.id"
+    container_id: str | None = None
+    if cidfile.is_file():
+        try:
+            container_id = cidfile.read_text().strip() or None
+        except OSError:
+            container_id = None
+    if not container_id:
+        # Fallback: locate by label set in run.py:_run_hec_job.
+        r = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-q",
+                "--filter",
+                f"label=storm-cloud-run={safe}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        container_id = (r.stdout or "").strip().splitlines()[0:1]
+        container_id = container_id[0] if container_id else None
+    if not container_id:
+        return False, "no running container found for this run"
+    # docker stop sends SIGTERM, waits up to --timeout seconds, then SIGKILLs.
+    # Give the plugin enough time to finish the current AORC date scan
+    # iteration and write its final progress.json before falling back to
+    # SIGKILL.
+    r = subprocess.run(
+        ["docker", "stop", "--timeout", "30", container_id],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        # "No such container" is fine — the container already exited (e.g.,
+        # finished or was stopped by another path). Treat as success.
+        msg = (r.stderr or r.stdout or "").strip()
+        if "No such container" in msg:
+            return True, None
+        return False, msg or "docker stop failed"
+    return True, None
+
+
+def _rerun(run_name: str) -> tuple[str | None, str | None]:
+    """Re-launch the run at ``compute/outputs/<run_name>/``.
+
+    Returns ``(name, error)``. Idempotent plugin actions skip work already
+    on disk, so the practical effect is "resume". Refuses if a launcher is
+    still alive or if we don't know the payload UUID.
+    """
+    run_dir = OUTPUTS / _safe_subdir(run_name)
+    launch = _read_json(run_dir / "launch.json")
+    if launch is None:
+        return None, f"no launch.json in {run_dir.name} — can't determine payload"
+    if _pid_alive(launch.get("pid")):
+        return None, "run is still active — stop it before re-running"
+    uuid = launch.get("payload_uuid")
+    if not uuid:
+        return None, "launch.json has no payload_uuid (legacy run)"
+    # Carry forward the stashed payload attrs so post-resume ETA stays valid.
+    attrs = launch.get("payload_attrs") or {}
+    return _launch_hec(uuid, run_name, payload_attrs=attrs), None
+
+
+# ─── audit integration (download + render reports inline) ───────────────────
+
+
+def _has_audit(name: str) -> bool:
+    return (OUTPUTS / name / "audit").is_dir()
+
+
+def _audit_nav_runs() -> list[dict]:
+    """Lightweight {run_name, catalog_id} list for report nav links — avoids a
+    full ``_audit()`` per run (the report's nav loop only needs these two)."""
+    runs = []
+    for r in _known_runs():
+        if _has_audit(r):
+            runs.append({"run_name": r, "catalog_id": _catalog_id_for(r)})
+    return runs
+
+
+def _render_audit_html(name: str) -> tuple[str, int]:
+    """(html, status) for GET /audit/<name>."""
+    if not _has_audit(name):
+        body = (
+            "<!doctype html><meta charset=utf-8>"
+            f"<title>Audit — {html.escape(name)}</title>"
+            "<body style='font-family:system-ui;max-width:640px;margin:4rem auto'>"
+            f"<h1>{html.escape(name)}</h1>"
+            "<p>No audit artifacts downloaded yet for this catalog.</p>"
+            "<p>Use the <b>Download audit</b> button on the dashboard to fetch "
+            "them, then reload.</p><p><a href='/'>← back</a></p></body>"
+        )
+        return body, 200
+    try:
+        a = _audit(name)
+        report = _build_report(name, a, _audit_nav_runs())
+        return report, 200
+    except Exception as e:  # noqa: BLE001 — surface render errors to the page
+        return (
+            f"<!doctype html><meta charset=utf-8><h1>Audit render error</h1>"
+            f"<pre>{html.escape(repr(e))}</pre><p><a href='/'>← back</a></p>",
+            500,
+        )
+
+
+def _audit_summary(name: str) -> dict:
+    """Compact JSON summary for GET /api/audit/<name>."""
+    if not _has_audit(name):
+        return {"name": name, "state": "not-downloaded"}
+    try:
+        a = _audit(name)
+    except Exception as e:  # noqa: BLE001
+        return {"name": name, "state": "error", "error": repr(e)}
+    n_anomalies = (
+        len(a.get("outlier_dss") or [])
+        + len(a.get("grid_without_dss") or [])
+        + len(a.get("out_of_box") or [])
+        + len(a.get("duration_mismatches") or [])
+    )
+    summary = {
+        "name": name,
+        "state": "downloaded",
+        "catalog_id": a.get("catalog_id"),
+        "n_events": a.get("n_events"),
+        "n_dss": a.get("n_dss"),
+        "top_n": a.get("top_n"),
+        "n_anomalies": n_anomalies,
+    }
+    # Overlay an in-flight download job, if any.
+    job = _download_jobs.get(name)
+    if job and job.get("state") == "running":
+        summary["download"] = "running"
+    return summary
+
+
+# ─── background audit download ───────────────────────────────────────────────
+#
+# Downloading a catalog's audit artifacts (~600 MB of prefixes via mc) must not
+# block the request thread. We run it in a daemon thread and expose status via
+# /api/audit/<name>; the dashboard polls and flips the button to "Downloading…".
+
+_download_jobs: dict[str, dict] = {}
+_download_lock = threading.Lock()
+
+
+def _start_audit_download(name: str) -> dict:
+    with _download_lock:
+        existing = _download_jobs.get(name)
+        if existing and existing.get("state") == "running":
+            return existing
+        job = {"state": "running", "started_at": time.time(), "error": None}
+        _download_jobs[name] = job
+
+    def _worker() -> None:
+        try:
+            _load_hec_env()
+            _download_run(name)
+            result = {"state": "done", "started_at": job["started_at"], "error": None}
+        except Exception as e:  # noqa: BLE001 — surface to the dashboard
+            result = {
+                "state": "error",
+                "started_at": job["started_at"],
+                "error": repr(e),
+            }
+        with _download_lock:
+            _download_jobs[name] = result
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return job
+
+
+# ─── unified S3-centric catalog discovery ────────────────────────────────────
+
+
+# Top-level S3 prefixes that are infrastructure, not storm catalogs.
+_NON_CATALOG_PREFIXES = {
+    "manifests",
+    "aorc-cache",
+    "aorc-cache-conus",
+    "diagnostic-throughput",
+}
+
+
+def _s3_output_catalogs() -> tuple[set[str], str | None]:
+    """Catalog ids that have an output prefix in S3. Best-effort: one `mc ls`
+    of the bucket root, infrastructure prefixes filtered out. Returns
+    (catalog_ids, note) where note explains why the set is empty/partial."""
+    try:
+        _load_hec_env()
+        lines = _mc_ls_lines("")
+    except Exception as e:  # noqa: BLE001 — mc/alias may be absent; degrade
+        return set(), f"S3 output listing unavailable: {e}"
+    cids = set()
+    for ln in lines:
+        tok = ln.split()[-1] if ln.split() else ""
+        name = tok.rstrip("/")
+        if name and name not in _NON_CATALOG_PREFIXES:
+            cids.add(name)
+    return cids, None
+
+
+def _list_catalogs() -> dict:
+    """Unified, S3-centric catalog list keyed by catalog_id.
+
+    Merges three sources: S3 manifest payloads (launchable), local runs
+    (compute/outputs, with live progress), and S3 output prefixes (auditable
+    even without a local run). HEC S3 is the source of truth for what exists;
+    local progress is overlaid for runs executing on this machine.
+    """
+    by_cid: dict[str, dict] = {}
+
+    def rec(cid: str) -> dict:
+        return by_cid.setdefault(
+            cid,
+            {
+                "catalog_id": cid,
+                "uuid": None,
+                "attrs": {},
+                "predicted_s": None,
+                "local_run": None,
+                "s3_outputs": False,
+                "audit": "none",
+            },
+        )
+
+    payloads = _list_payloads()
+    pstate = payloads.get("state")
+    if pstate == "ok":
+        for p in payloads.get("payloads", []):
+            cid = p.get("catalog_id") or p.get("uuid")
+            if not cid:
+                continue
+            r = rec(cid)
+            r["uuid"] = p.get("uuid")
+            r["predicted_s"] = p.get("predicted_s")
+            r["attrs"] = {
+                k: p.get(k)
+                for k in (
+                    "catalog_id",
+                    "catalog_description",
+                    "start_date",
+                    "end_date",
+                    "storm_duration",
+                    "top_n_events",
+                )
+                if p.get(k) is not None
+            }
+
+    for run in _list_runs():
+        cid = _catalog_id_for(run["name"])
+        r = rec(cid)
+        r["local_run"] = run
+        if not r["uuid"] and run.get("payload_uuid"):
+            r["uuid"] = run["payload_uuid"]
+        if _has_audit(run["name"]):
+            r["audit"] = "downloaded"
+
+    s3_cids, s3_note = _s3_output_catalogs()
+    for cid in s3_cids:
+        r = rec(cid)
+        r["s3_outputs"] = True
+        if r["audit"] == "none":
+            r["audit"] = "available"  # outputs exist in S3, can download to audit
+
+    # Sort: active runs first, then by catalog_id.
+    def _key(r: dict) -> tuple:
+        lr = r.get("local_run") or {}
+        active = 0 if lr.get("status") == "running" else 1
+        return (active, r["catalog_id"].lower())
+
+    return {
+        "state": pstate,
+        "catalogs": sorted(by_cid.values(), key=_key),
+        "s3_note": s3_note,
+    }
+
+
+def _get_run(name: str) -> dict | None:
+    for r in _list_runs():
+        if r["name"] == name:
+            return r
+    return None
+
+
+def _step_breakdown(run: dict, attrs: dict | None) -> list[dict]:
+    """Per-step rows for the detail view: name, weight%, state, duration/eta."""
+    plan = run.get("plan") or []
+    if not plan:
+        return []
+    weights = _step_weights(plan, attrs)
+    total = sum(weights.values()) or 1.0
+    completed = {s.get("name"): s for s in run.get("completed_steps", [])}
+    cur = (run.get("current_step") or {}).get("name")
+    rows = []
+    for nm in plan:
+        w = weights.get(nm, 0.0)
+        if nm in completed:
+            state, detail = "done", f"{completed[nm].get('duration_s', 0):.1f}s"
+        elif nm == cur:
+            ap = (run.get("action_progress") or {}).get(nm) or {}
+            if ap.get("total"):
+                state = "running"
+                detail = f"{ap.get('done', 0)}/{ap['total']}"
+            else:
+                state, detail = "running", "…"
+        else:
+            state, detail = "pending", f"~{w:.0f}s"
+        rows.append(
+            {"name": nm, "weight_pct": round(100 * w / total, 1), "state": state, "detail": detail}
+        )
+    return rows
+
+
+def _render_run_detail_html(name: str) -> tuple[str, int]:
+    run = _get_run(name)
+    if not run:
+        return (
+            f"<!doctype html><meta charset=utf-8><h1>{html.escape(name)}</h1>"
+            "<p>No such run.</p><p><a href='/'>← back</a></p>",
+            404,
+        )
+    attrs = {}  # detail view reuses run's recorded plan/progress; attrs optional
+    lj = _read_json(OUTPUTS / name / "launch.json") or {}
+    attrs = lj.get("payload_attrs") or {}
+    rows = _step_breakdown(run, attrs)
+    pct = run.get("overall_pct")
+    eta = run.get("eta_s")
+    bar_rows = "".join(
+        f"<tr class='st-{r['state']}'><td>{html.escape(r['name'])}</td>"
+        f"<td style='text-align:right'>{r['weight_pct']}%</td>"
+        f"<td>{r['state']}</td><td>{html.escape(str(r['detail']))}</td></tr>"
+        for r in rows
+    )
+    log_tail = html.escape(_tail_log(OUTPUTS / name / "launch.log", 40))
+    audit_link = (
+        f"<a href='/audit/{html.escape(name)}'>View audit report →</a>"
+        if _has_audit(name)
+        else "<span class='muted'>No audit downloaded</span>"
+    )
+    body = f"""<!doctype html><meta charset=utf-8>
+<title>{html.escape(name)} — run detail</title>
+<style>
+ body{{font-family:system-ui,sans-serif;max-width:880px;margin:2rem auto;padding:0 1rem;color:#1f2937}}
+ h1{{margin-bottom:.2rem}} .muted{{color:#6b7280}}
+ .bar{{height:14px;background:#e5e7eb;border-radius:7px;overflow:hidden;margin:.6rem 0}}
+ .bar>div{{height:100%;background:#2563eb}}
+ table{{border-collapse:collapse;width:100%;margin-top:1rem}}
+ td,th{{padding:.4rem .6rem;border-bottom:1px solid #eee;text-align:left}}
+ tr.st-done td{{color:#16a34a}} tr.st-running td{{font-weight:600;color:#2563eb}}
+ tr.st-pending td{{color:#9ca3af}}
+ pre{{background:#0b1021;color:#d6e2ff;padding:1rem;border-radius:8px;overflow:auto;font-size:12px;line-height:1.4}}
+</style>
+<p><a href="/">← dashboard</a></p>
+<h1>{html.escape(name)}</h1>
+<p class="muted">status: <b>{html.escape(run.get('status') or '?')}</b>
+ · {audit_link}</p>
+<div class="bar"><div style="width:{pct or 0}%"></div></div>
+<p>{(str(pct) + '% complete') if pct is not None else ''}
+ {('· ETA ' + _fmt_dur(eta)) if eta else ''}</p>
+<table><thead><tr><th>step</th><th style='text-align:right'>weight</th>
+ <th>state</th><th>detail</th></tr></thead><tbody>{bar_rows}</tbody></table>
+<h3>Recent log</h3><pre>{log_tail}</pre>
+"""
+    return body, 200
+
+
+def _fmt_dur(s: float | None) -> str:
+    if not s or s <= 0:
+        return "—"
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
+# ─── HTTP layer ──────────────────────────────────────────────────────────────
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, data, code: int = 200) -> None:
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html_str: str, code: int = 200) -> None:
+        body = html_str.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_asset(self, path: str) -> None:
+        """Serve a file under compute/outputs/<name>/audit/ for /assets/<name>/...
+
+        The only filesystem-exposed route. Guards against path traversal by
+        resolving the target and asserting it stays within the run's audit dir.
+        """
+        rel = urllib.parse.unquote(path[len("/assets/") :])
+        parts = rel.split("/", 1)
+        if len(parts) != 2 or not parts[1]:
+            self.send_error(404)
+            return
+        name, subpath = parts
+        base = (OUTPUTS / name / "audit").resolve()
+        try:
+            target = (base / subpath).resolve()
+        except (OSError, ValueError):
+            self.send_error(404)
+            return
+        if base != target and base not in target.parents:
+            self.send_error(403)
+            return
+        if not target.is_file():
+            self.send_error(404)
+            return
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_static(self, path: str) -> None:
+        """Serve a dashboard asset from static/ for /static/<file>.
+
+        Same path-traversal guard as _serve_asset. Sent with ``no-store`` so
+        an edited style.css/app.js is never served stale from the browser
+        cache during development.
+        """
+        rel = urllib.parse.unquote(path[len("/static/") :])
+        base = STATIC.resolve()
+        try:
+            target = (base / rel).resolve()
+        except (OSError, ValueError):
+            self.send_error(404)
+            return
+        if base != target and base not in target.parents:
+            self.send_error(403)
+            return
+        if not target.is_file():
+            self.send_error(404)
+            return
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            try:
+                self._send_html((STATIC / "index.html").read_text(encoding="utf-8"))
+            except OSError:
+                self._send_html("<h1>static/index.html missing</h1>", 500)
+        elif path.startswith("/static/"):
+            self._serve_static(path)
+        elif path == "/api/runs":
+            self._send_json(_list_runs())
+        elif path == "/api/payloads":
+            self._send_json(_list_payloads())
+        elif path == "/api/catalogs":
+            self._send_json(_list_catalogs())
+        elif path == "/api/health":
+            self._send_json({"ok": True, "hec_configured": HEC_ENV.is_file()})
+        elif path.startswith("/api/run/"):
+            name = urllib.parse.unquote(path[len("/api/run/") :]).strip("/")
+            run = _get_run(name) if name else None
+            if run is None:
+                self._send_json({"error": "no such run"}, 404)
+            else:
+                self._send_json(run)
+        elif path.startswith("/run/"):
+            name = urllib.parse.unquote(path[len("/run/") :]).strip("/")
+            if not name:
+                self.send_error(404)
+                return
+            body, code = _render_run_detail_html(name)
+            self._send_html(body, code)
+        elif path.startswith("/assets/"):
+            self._serve_asset(path)
+        elif path.startswith("/api/audit/"):
+            name = urllib.parse.unquote(path[len("/api/audit/") :]).strip("/")
+            if not name:
+                self.send_error(404)
+                return
+            self._send_json(_audit_summary(name))
+        elif path.startswith("/audit/"):
+            name = urllib.parse.unquote(path[len("/audit/") :]).strip("/")
+            if not name:
+                self.send_error(404)
+                return
+            body, code = _render_audit_html(name)
+            self._send_html(body, code)
+        else:
+            self.send_error(404)
+
+    def do_POST(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        try:
+            if path == "/api/launch/local":
+                self._send_json({"name": _launch_local()})
+            elif path == "/api/launch/hec":
+                data = json.loads(body or b"{}")
+                uuid = data.get("uuid")
+                if not uuid:
+                    self._send_json({"error": "missing uuid"}, 400)
+                    return
+                attrs = data.get("attrs") or {}
+                # ``catalog-prefix`` entries don't have a manifests/<uuid>/payload
+                # yet — promote them first. ``run.py hec promote`` shells out to
+                # plugin.cli inside Docker and is idempotent, so calling it for
+                # an already-promoted catalog is a cheap no-op.
+                catalog_key = data.get("catalog_key")
+                if data.get("source") == "catalog-prefix" and catalog_key:
+                    r = subprocess.run(
+                        [sys.executable, str(RUN_PY), "hec", "promote", catalog_key],
+                        capture_output=True, text=True, cwd=ROOT,
+                    )
+                    if r.returncode != 0:
+                        self._send_json(
+                            {"error": f"promote failed: {(r.stderr or r.stdout).strip()}"},
+                            500,
+                        )
+                        return
+                self._send_json(
+                    {"name": _launch_hec(uuid, data.get("name"), payload_attrs=attrs)}
+                )
+            elif path == "/api/launch/rerun":
+                data = json.loads(body or b"{}")
+                name = data.get("name")
+                if not name:
+                    self._send_json({"error": "missing name"}, 400)
+                    return
+                new_name, err = _rerun(name)
+                if err:
+                    self._send_json({"error": err}, 400)
+                    return
+                self._send_json({"name": new_name})
+            elif path == "/api/stop":
+                data = json.loads(body or b"{}")
+                name = data.get("name")
+                if not name:
+                    self._send_json({"error": "missing name"}, 400)
+                    return
+                stopped, err = _stop(name)
+                if err:
+                    self._send_json({"error": err}, 400)
+                    return
+                self._send_json({"stopped": stopped, "name": name})
+            elif path.startswith("/api/audit/") and path.endswith("/download"):
+                inner = path[len("/api/audit/") : -len("/download")]
+                name = urllib.parse.unquote(inner).strip("/")
+                if not name:
+                    self._send_json({"error": "missing name"}, 400)
+                    return
+                self._send_json(_start_audit_download(name))
+            else:
+                self.send_error(404)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def log_message(self, fmt: str, *args) -> None:
+        sys.stderr.write("[web] " + (fmt % args) + "\n")
+
+
+def serve(*, host: str = "127.0.0.1", port: int = 8744) -> None:
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    srv = ThreadingHTTPServer((host, port), Handler)
+    print(f"web UI: http://{host}:{port}/  (Ctrl-C to stop)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        srv.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    p = argparse.ArgumentParser(prog="./app.py")
+    p.add_argument("--port", type=int, default=8744)
+    p.add_argument("--host", default="127.0.0.1")
+    opts = p.parse_args()
+    serve(host=opts.host, port=opts.port)
