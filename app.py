@@ -1808,6 +1808,16 @@ def _list_payloads() -> dict:
         payloads = json.loads(r.stdout or "[]")
     except json.JSONDecodeError as e:
         return {"state": "error", "detail": f"could not parse list output: {e}"}
+    # Annotate each payload with any existing local run for its catalog, so the
+    # UI offers "Run" only for catalogs never run — an already-run catalog is
+    # managed from Recent runs, not one-click re-launched from here.
+    runs_by_name = {r["name"]: r["status"] for r in _list_runs()}
+    for p in payloads:
+        cid = p.get("catalog_id")
+        nm = _safe_subdir(cid) if cid else None
+        if nm and nm in runs_by_name:
+            p["run_name"] = nm
+            p["run_status"] = runs_by_name[nm]
     return {"state": "ok", "payloads": payloads}
 
 

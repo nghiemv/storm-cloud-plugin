@@ -100,6 +100,20 @@ async function renderPayloads() {
     const badge = isUnpromoted
       ? ` <span class="meta" title="will be promoted to manifests/ on first Run">[catalog-prefix]</span>`
       : "";
+    // Offer Run only for catalogs with no local run. Anything already run
+    // (done/running/failed/interrupted) links to its row in Recent runs —
+    // launching here would recompute a finished catalog or orphan a resumable
+    // one. Re-running deliberately is still possible via `./run.py hec <uuid>`.
+    let action;
+    if (!p.run_status) {
+      action = `<button onclick="launchHec(this, ${uuidArg}, ${cidArg}, ${attrsArg}, ${sourceArg}, ${catKeyArg})">Run</button>`;
+    } else {
+      const rn = encodeURIComponent(p.run_name);
+      const label = p.run_status === "done" ? "done ✓"
+                  : (p.run_status === "running" || p.run_status === "starting") ? "running…"
+                  : p.run_status;
+      action = `<a class="btnlink" href="/run/${rn}" title="already run — manage from Recent runs">${esc(label)}</a>`;
+    }
     return `
       <div class="row">
         <div class="left">
@@ -108,7 +122,7 @@ async function renderPayloads() {
           ${facts ? `<div class="meta">${esc(facts)}</div>` : ""}
           <div class="meta uuid">${esc(p.uuid)}</div>
         </div>
-        <button onclick="launchHec(this, ${uuidArg}, ${cidArg}, ${attrsArg}, ${sourceArg}, ${catKeyArg})">Run</button>
+        ${action}
       </div>
     `;
   }).join("");
@@ -277,6 +291,7 @@ async function downloadAudit(btn, name) {
 }
 
 async function launchHec(btn, uuid, catalogId, attrs, source, catalogKey) {
+  if (!confirm(`Launch ${catalogId || uuid}? This starts a compute run.`)) return;
   btn.disabled = true;
   btn.textContent = source === "catalog-prefix" ? "Promoting…" : "Launching…";
   try {
