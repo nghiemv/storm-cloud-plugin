@@ -1164,218 +1164,6 @@ def _build_domain_section(
     return "".join(parts), stats
 
 
-def _color_for_precip(val: float, vmin: float, vmax: float) -> str:
-    """Sequential viridis-like ramp (5 stops). Returns #RRGGBB.
-
-    Used to color event dots by mean precipitation so the eye picks out the
-    biggest storms instantly — a single color is the wrong choice when we have
-    460 dots all jumbled together.
-    """
-    if vmax <= vmin:
-        t = 0.5
-    else:
-        t = max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
-    stops = [
-        (0.0, (68, 1, 84)),     # deep purple
-        (0.25, (59, 82, 139)),  # blue
-        (0.5, (33, 145, 140)),  # teal
-        (0.75, (94, 201, 98)),  # green
-        (1.0, (253, 231, 37)),  # yellow
-    ]
-    for i in range(len(stops) - 1):
-        t0, c0 = stops[i]
-        t1, c1 = stops[i + 1]
-        if t <= t1:
-            f = (t - t0) / (t1 - t0) if t1 > t0 else 0
-            r = int(c0[0] + (c1[0] - c0[0]) * f)
-            g = int(c0[1] + (c1[1] - c0[1]) * f)
-            b = int(c0[2] + (c1[2] - c0[2]) * f)
-            return f"#{r:02x}{g:02x}{b:02x}"
-    return "#fde725"
-
-
-def _build_svg_map(
-    watershed: dict | None,
-    transposition: dict | None,
-    transposition_valid: dict | None,
-    events: list[dict],
-    width: int = 900,
-) -> tuple[str, dict]:
-    """Build an inline-SVG map for the report.
-
-    Returns (svg_markup, meta). meta carries per-event projected positions and
-    color stops so the playback JS can re-use them without re-projecting.
-    """
-    pts: list[tuple[float, float]] = []
-    for f in (watershed, transposition, transposition_valid):
-        g = _feature_geom(f)
-        if g:
-            _walk_coords(g.get("coordinates"), pts)
-    for ev in events:
-        lon, lat = ev.get("max_lon"), ev.get("max_lat")
-        if lon is not None and lat is not None:
-            pts.append((float(lon), float(lat)))
-
-    if not pts:
-        return ("<div class='map-empty'>No geometry available.</div>", {})
-
-    lons = [p[0] for p in pts]
-    lats = [p[1] for p in pts]
-    bbox = (min(lons), min(lats), max(lons), max(lats))
-    project, (w, h) = _projector(bbox, width=width)
-
-    parts = [
-        f'<svg class="map-svg" viewBox="0 0 {w} {h}" '
-        f'preserveAspectRatio="xMidYMid meet" '
-        f'xmlns="http://www.w3.org/2000/svg" role="img" '
-        f'aria-label="storm map">',
-        # Subtle background gradient so empty map regions don't look broken.
-        '<defs>'
-        '<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">'
-        '<stop offset="0%" stop-color="#0f172a"/>'
-        '<stop offset="100%" stop-color="#1e293b"/>'
-        '</linearGradient>'
-        '<filter id="glow"><feGaussianBlur stdDeviation="2.5" result="b"/>'
-        '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/>'
-        '</feMerge></filter>'
-        '</defs>',
-        f'<rect width="{w}" height="{h}" fill="url(#bg)"/>',
-    ]
-
-    # Graticule — light lat/lon grid every ~1° for spatial reference
-    import math
-    lon_min, lat_min, lon_max, lat_max = bbox
-    span = max(lon_max - lon_min, lat_max - lat_min)
-    step = 0.25 if span < 2 else (0.5 if span < 5 else 1.0)
-    g_lat = math.floor(lat_min / step) * step
-    while g_lat <= lat_max:
-        x0, y0 = project(lon_min, g_lat)
-        x1, y1 = project(lon_max, g_lat)
-        parts.append(
-            f'<line x1="{x0:.1f}" y1="{y0:.1f}" x2="{x1:.1f}" y2="{y1:.1f}" '
-            f'stroke="#334155" stroke-width="0.5" opacity="0.5"/>'
-        )
-        g_lat += step
-    g_lon = math.floor(lon_min / step) * step
-    while g_lon <= lon_max:
-        x0, y0 = project(g_lon, lat_min)
-        x1, y1 = project(g_lon, lat_max)
-        parts.append(
-            f'<line x1="{x0:.1f}" y1="{y0:.1f}" x2="{x1:.1f}" y2="{y1:.1f}" '
-            f'stroke="#334155" stroke-width="0.5" opacity="0.5"/>'
-        )
-        g_lon += step
-
-    # Transposition domain (orange dashed) — biggest area, drawn first
-    d = _geom_to_path_d(_feature_geom(transposition), project)
-    if d:
-        parts.append(
-            f'<path d="{d}" fill="#ea580c" fill-opacity="0.07" '
-            f'stroke="#ea580c" stroke-width="2" stroke-dasharray="6 4"/>'
-        )
-
-    # Valid-transposition region (green, lower-opacity fill)
-    d = _geom_to_path_d(_feature_geom(transposition_valid), project)
-    if d:
-        parts.append(
-            f'<path d="{d}" fill="#16a34a" fill-opacity="0.10" '
-            f'stroke="#22c55e" stroke-width="1"/>'
-        )
-
-    # Watershed (blue solid)
-    d = _geom_to_path_d(_feature_geom(watershed), project)
-    if d:
-        parts.append(
-            f'<path d="{d}" fill="#2563eb" fill-opacity="0.22" '
-            f'stroke="#60a5fa" stroke-width="2"/>'
-        )
-
-    # Event dots — sized & colored by mean precip; tag each dot with its event id
-    means = [ev["mean"] for ev in events if isinstance(ev.get("mean"), (int, float))]
-    vmin = min(means) if means else 0.0
-    vmax = max(means) if means else 1.0
-    dots_g = ['<g class="dots">']
-    positions: dict[str, list[float]] = {}
-    colors: dict[str, str] = {}
-    bboxes_svg: dict[str, list[float]] = {}
-    for ev in events:
-        lon, lat = ev.get("max_lon"), ev.get("max_lat")
-        if lon is None or lat is None:
-            continue
-        mean = ev.get("mean") if isinstance(ev.get("mean"), (int, float)) else vmin
-        x, y = project(float(lon), float(lat))
-        r = 3.0 + 5.0 * ((mean - vmin) / (vmax - vmin) if vmax > vmin else 0.5)
-        color = _color_for_precip(float(mean), vmin, vmax)
-        eid = str(ev.get("id"))
-        positions[eid] = [round(x, 1), round(y, 1)]
-        colors[eid] = color
-        # Pre-project the DSS bounding box so JS can drop a rectangle on the
-        # map without re-implementing the projection.
-        ebb = ev.get("bbox")
-        if isinstance(ebb, list) and len(ebb) == 4:
-            x0, y0 = project(ebb[0], ebb[3])  # NW = (lon_min, lat_max)
-            x1, y1 = project(ebb[2], ebb[1])  # SE = (lon_max, lat_min)
-            bboxes_svg[eid] = [
-                round(min(x0, x1), 1), round(min(y0, y1), 1),
-                round(abs(x1 - x0), 1), round(abs(y1 - y0), 1),
-            ]
-        dots_g.append(
-            f'<circle class="dot" data-id="{html.escape(eid)}" '
-            f'cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}" '
-            f'fill="{color}" fill-opacity="0.78" '
-            f'stroke="#0b1220" stroke-width="0.6"/>'
-        )
-    dots_g.append("</g>")
-    parts.extend(dots_g)
-
-    # Active-event highlight (pulse) drawn on top, hidden by default
-    parts.append(
-        '<rect id="active-bbox" x="0" y="0" width="0" height="0" '
-        'fill="#facc15" fill-opacity="0.08" stroke="#facc15" '
-        'stroke-width="1.5" stroke-dasharray="4 3" style="display:none" '
-        'pointer-events="none"/>'
-    )
-    parts.append(
-        '<circle id="active-dot" cx="0" cy="0" r="0" fill="none" '
-        'stroke="#facc15" stroke-width="2.5" filter="url(#glow)" '
-        'style="display:none"/>'
-    )
-
-    # Legend (color ramp) bottom-left
-    legend_w = 180
-    legend_h = 10
-    lx = 18
-    ly = h - 30
-    parts.append(
-        f'<g class="legend" transform="translate({lx},{ly})">'
-        '<defs><linearGradient id="ramp" x1="0" x2="1">'
-        '<stop offset="0%" stop-color="#440154"/>'
-        '<stop offset="25%" stop-color="#3b528b"/>'
-        '<stop offset="50%" stop-color="#21918c"/>'
-        '<stop offset="75%" stop-color="#5ec962"/>'
-        '<stop offset="100%" stop-color="#fde725"/>'
-        '</linearGradient></defs>'
-        f'<rect width="{legend_w}" height="{legend_h}" fill="url(#ramp)" rx="2"/>'
-        f'<text x="0" y="-4" fill="#cbd5e1" font-size="10">mean precip (in)</text>'
-        f'<text x="0" y="{legend_h + 12}" fill="#cbd5e1" font-size="10">'
-        f'{vmin:.1f}</text>'
-        f'<text x="{legend_w}" y="{legend_h + 12}" fill="#cbd5e1" '
-        f'font-size="10" text-anchor="end">{vmax:.1f}</text>'
-        "</g>"
-    )
-
-    parts.append("</svg>")
-    meta = {
-        "positions": positions,
-        "colors": colors,
-        "bboxes": bboxes_svg,
-        "viewbox": [w, h],
-        "vmin": vmin,
-        "vmax": vmax,
-    }
-    return "".join(parts), meta
-
-
 def _stat_html(label: str, value: str, *, warn: bool = False, ok: bool = False) -> str:
     cls = "stat" + (" warn" if warn else " ok" if ok else "")
     return (
@@ -1545,9 +1333,6 @@ def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
         for r in integrity_rows
     )
 
-    svg_map, map_meta = _build_svg_map(
-        watershed, transposition, transposition_valid, audit["events"]
-    )
     domain_svg, domain_stats = _build_domain_section(
         watershed, transposition, transposition_valid
     )
@@ -1707,7 +1492,6 @@ def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
         "__CONUS_SVG__": conus_svg,
         "__WS_ZOOM_CARD__": ws_zoom_card,
         "__DOMAIN_STATS__": domain_stats_html,
-        "__SVG_MAP__": svg_map,
         "__N_EVENTS__": str(audit["n_events"]),
         "__N_DSS__": str(audit["n_dss"]),
         "__EXPECTED_HOURS__": json.dumps(audit["storm_duration"] or None),
@@ -1715,7 +1499,11 @@ def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
         "__EVENTS_JSON__": json.dumps(audit["events"]),
         "__DSS_SIZE_JSON__": json.dumps(dss_size_by_id),
         "__OUTLIERS_JSON__": json.dumps(outlier_ids),
-        "__MAP_META_JSON__": json.dumps(map_meta),
+        "__WATERSHED_GEOM_JSON__": json.dumps(_feature_geom(watershed)),
+        "__TRANSPOSITION_GEOM_JSON__": json.dumps(_feature_geom(transposition)),
+        "__TRANSPOSITION_VALID_GEOM_JSON__": json.dumps(
+            _feature_geom(transposition_valid)
+        ),
         "__EVENTS_PREFIX_JSON__": json.dumps(events_prefix),
     }
     report_html = (STATIC / "report.html").read_text(encoding="utf-8")

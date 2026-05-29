@@ -373,7 +373,7 @@ __ANOMALIES_HTML__
 
 <h2>Storm Map <span class="meta">same geometry · 460 storms colored by mean precip · click a dot or row to focus</span></h2>
 <div class="map-wrap">
-  __SVG_MAP__
+  <div id="map-container"></div>
 </div>
 
 <h2>Storm Playback <span class="meta">__N_EVENTS__ events sorted chronologically</span></h2>
@@ -486,8 +486,11 @@ const events = __EVENTS_JSON__;
 const dssSize = __DSS_SIZE_JSON__;
 const median = __MEDIAN_DSS__;
 const outliers = new Set(__OUTLIERS_JSON__);
-const mapMeta = __MAP_META_JSON__;
 const eventsPrefix = __EVENTS_PREFIX_JSON__;
+const watershedGeom = __WATERSHED_GEOM_JSON__;
+const transpositionGeom = __TRANSPOSITION_GEOM_JSON__;
+const transpositionValidGeom = __TRANSPOSITION_VALID_GEOM_JSON__;
+const mapMeta = buildMap('map-container');  // injects the .map-svg, returns positions/bboxes
 
 // ─── Map dot interactivity ───────────────────────────────────────────────
 const mapSvg = document.querySelector('.map-svg');
@@ -788,6 +791,130 @@ document.addEventListener('keydown', e => {
   if (e.key === 'ArrowRight') { stopPlay(); scrubTo((playIdx + 1) % byDate.length); }
   if (e.key === 'ArrowLeft') { stopPlay(); scrubTo((playIdx - 1 + byDate.length) % byDate.length); }
 });
+
+// ─── SVG map (rendered client-side from geometry + events) ───────────────────
+function r1(v) { return Math.round(v * 10) / 10; }
+
+function projector(bbox, width, padPct = 0.06) {
+  let [lonMin, latMin, lonMax, latMax] = bbox;
+  const padLon = (lonMax - lonMin) * padPct || 0.05;
+  const padLat = (latMax - latMin) * padPct || 0.05;
+  lonMin -= padLon; lonMax += padLon; latMin -= padLat; latMax += padLat;
+  const centerLat = (latMin + latMax) / 2, k = Math.cos(centerLat * Math.PI / 180);
+  const lonSpan = (lonMax - lonMin) * k || 1e-6, latSpan = (latMax - latMin) || 1e-6;
+  const height = Math.max(1, Math.round(width * (latSpan / lonSpan)));
+  const project = (lon, lat) => [(lon - lonMin) * k / lonSpan * width, (latMax - lat) / latSpan * height];
+  return { project, w: width, h: height };
+}
+
+function ringToD(ring, project) {
+  const pts = [];
+  for (const c of ring) {
+    if (!(Array.isArray(c) && c.length >= 2)) continue;
+    const [x, y] = project(+c[0], +c[1]);
+    pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+  }
+  return pts.length ? 'M' + pts.join('L') + 'Z' : '';
+}
+
+function geomToPathD(geom, project) {
+  if (!geom) return '';
+  const coords = geom.coordinates;
+  if (geom.type === 'Polygon') return (coords || []).map(r => ringToD(r, project)).join(' ');
+  if (geom.type === 'MultiPolygon')
+    return (coords || []).map(poly => poly.map(r => ringToD(r, project)).join(' ')).join(' ');
+  return '';
+}
+
+function walkCoords(obj, out) {
+  if (Array.isArray(obj)) {
+    if (obj.length >= 2 && typeof obj[0] === 'number' && typeof obj[1] === 'number')
+      out.push([+obj[0], +obj[1]]);
+    else for (const el of obj) walkCoords(el, out);
+  } else if (obj && typeof obj === 'object') {
+    for (const v of Object.values(obj)) walkCoords(v, out);
+  }
+}
+
+function colorForPrecip(val, vmin, vmax) {
+  const t = vmax <= vmin ? 0.5 : Math.max(0, Math.min(1, (val - vmin) / (vmax - vmin)));
+  const stops = [[0, [68, 1, 84]], [0.25, [59, 82, 139]], [0.5, [33, 145, 140]], [0.75, [94, 201, 98]], [1, [253, 231, 37]]];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [t0, c0] = stops[i], [t1, c1] = stops[i + 1];
+    if (t <= t1) {
+      const f = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+      const r = Math.trunc(c0[0] + (c1[0] - c0[0]) * f);
+      const g = Math.trunc(c0[1] + (c1[1] - c0[1]) * f);
+      const b = Math.trunc(c0[2] + (c1[2] - c0[2]) * f);
+      return '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
+    }
+  }
+  return '#fde725';
+}
+
+function buildMap(containerId) {
+  const el = document.getElementById(containerId);
+  const pts = [];
+  for (const g of [watershedGeom, transpositionGeom, transpositionValidGeom])
+    if (g) walkCoords(g.coordinates, pts);
+  for (const ev of events)
+    if (ev.max_lon != null && ev.max_lat != null) pts.push([+ev.max_lon, +ev.max_lat]);
+  if (!pts.length) { if (el) el.innerHTML = "<div class='map-empty'>No geometry available.</div>"; return {}; }
+
+  const lons = pts.map(p => p[0]), lats = pts.map(p => p[1]);
+  const bbox = [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
+  const { project, w, h } = projector(bbox, 900);
+
+  const parts = [
+    `<svg class="map-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="storm map">`,
+    '<defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0f172a"/><stop offset="100%" stop-color="#1e293b"/></linearGradient><filter id="glow"><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>',
+    `<rect width="${w}" height="${h}" fill="url(#bg)"/>`,
+  ];
+  const [lonMin, latMin, lonMax, latMax] = bbox;
+  const span = Math.max(lonMax - lonMin, latMax - latMin);
+  const step = span < 2 ? 0.25 : (span < 5 ? 0.5 : 1.0);
+  for (let gLat = Math.floor(latMin / step) * step; gLat <= latMax; gLat += step) {
+    const [x0, y0] = project(lonMin, gLat), [x1, y1] = project(lonMax, gLat);
+    parts.push(`<line x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}" stroke="#334155" stroke-width="0.5" opacity="0.5"/>`);
+  }
+  for (let gLon = Math.floor(lonMin / step) * step; gLon <= lonMax; gLon += step) {
+    const [x0, y0] = project(gLon, latMin), [x1, y1] = project(gLon, latMax);
+    parts.push(`<line x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}" stroke="#334155" stroke-width="0.5" opacity="0.5"/>`);
+  }
+  let d = geomToPathD(transpositionGeom, project);
+  if (d) parts.push(`<path d="${d}" fill="#ea580c" fill-opacity="0.07" stroke="#ea580c" stroke-width="2" stroke-dasharray="6 4"/>`);
+  d = geomToPathD(transpositionValidGeom, project);
+  if (d) parts.push(`<path d="${d}" fill="#16a34a" fill-opacity="0.10" stroke="#22c55e" stroke-width="1"/>`);
+  d = geomToPathD(watershedGeom, project);
+  if (d) parts.push(`<path d="${d}" fill="#2563eb" fill-opacity="0.22" stroke="#60a5fa" stroke-width="2"/>`);
+
+  const means = events.filter(ev => typeof ev.mean === 'number').map(ev => ev.mean);
+  const vmin = means.length ? Math.min(...means) : 0.0, vmax = means.length ? Math.max(...means) : 1.0;
+  const positions = {}, colors = {}, bboxes = {};
+  parts.push('<g class="dots">');
+  for (const ev of events) {
+    if (ev.max_lon == null || ev.max_lat == null) continue;
+    const mean = typeof ev.mean === 'number' ? ev.mean : vmin;
+    const [x, y] = project(+ev.max_lon, +ev.max_lat);
+    const r = 3.0 + 5.0 * (vmax > vmin ? (mean - vmin) / (vmax - vmin) : 0.5);
+    const color = colorForPrecip(mean, vmin, vmax), eid = String(ev.id);
+    positions[eid] = [r1(x), r1(y)]; colors[eid] = color;
+    const ebb = ev.bbox;
+    if (Array.isArray(ebb) && ebb.length === 4) {
+      const [x0, y0] = project(ebb[0], ebb[3]), [x1, y1] = project(ebb[2], ebb[1]);
+      bboxes[eid] = [r1(Math.min(x0, x1)), r1(Math.min(y0, y1)), r1(Math.abs(x1 - x0)), r1(Math.abs(y1 - y0))];
+    }
+    parts.push(`<circle class="dot" data-id="${esc(eid)}" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r.toFixed(1)}" fill="${color}" fill-opacity="0.78" stroke="#0b1220" stroke-width="0.6"/>`);
+  }
+  parts.push('</g>');
+  parts.push('<rect id="active-bbox" x="0" y="0" width="0" height="0" fill="#facc15" fill-opacity="0.08" stroke="#facc15" stroke-width="1.5" stroke-dasharray="4 3" style="display:none" pointer-events="none"/>');
+  parts.push('<circle id="active-dot" cx="0" cy="0" r="0" fill="none" stroke="#facc15" stroke-width="2.5" filter="url(#glow)" style="display:none"/>');
+  const legendW = 180, legendH = 10, lx = 18, ly = h - 30;
+  parts.push(`<g class="legend" transform="translate(${lx},${ly})"><defs><linearGradient id="ramp" x1="0" x2="1"><stop offset="0%" stop-color="#440154"/><stop offset="25%" stop-color="#3b528b"/><stop offset="50%" stop-color="#21918c"/><stop offset="75%" stop-color="#5ec962"/><stop offset="100%" stop-color="#fde725"/></linearGradient></defs><rect width="${legendW}" height="${legendH}" fill="url(#ramp)" rx="2"/><text x="0" y="-4" fill="#cbd5e1" font-size="10">mean precip (in)</text><text x="0" y="${legendH + 12}" fill="#cbd5e1" font-size="10">${vmin.toFixed(1)}</text><text x="${legendW}" y="${legendH + 12}" fill="#cbd5e1" font-size="10" text-anchor="end">${vmax.toFixed(1)}</text></g>`);
+  parts.push('</svg>');
+  if (el) el.innerHTML = parts.join('');
+  return { positions, colors, bboxes, viewbox: [w, h], vmin, vmax };
+}
 
 // ─── Summary charts (rendered client-side from `events`) ─────────────────────
 function esc(s) {
