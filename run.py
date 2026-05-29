@@ -290,10 +290,15 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
     # by launch.json presence) recognises CLI-launched runs the same way it
     # recognises web.py-launched ones. catalog_id is the run name by default;
     # CC SDK plugin reads the real catalog_id from the S3 payload at runtime.
+    # Record our own pid: this process IS the launcher the web UI monitors for
+    # liveness (web.py Popens us), and we overwrite the launch.json web.py
+    # wrote — without this, the pid is lost and the UI marks every progressed
+    # run "interrupted".
     (run_dir / "launch.json").write_text(
         json.dumps(
             {
                 "launched_at": _time.time(),
+                "pid": os.getpid(),
                 "args": list(sys.argv),
                 "payload_uuid": uuid,
                 "payload_attrs": {"catalog_id": name},
