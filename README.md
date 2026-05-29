@@ -187,16 +187,14 @@ time. Reads from `compute/outputs/<name>/progress.json` (auto-refreshes every
 process — doesn't kill the run; logs land in
 `compute/outputs/<name>/launch.log`.
 
-**Progress is duration-weighted.** Each pipeline step contributes to the bar
-in proportion to its real cost (learned from past runs' measured durations,
-falling back to an analytic estimate), not 1/N. Since `process-storms`
-typically dominates (~98% of wall time), the bar reflects that instead of
-jumping a flat 20% per step. The `process-storms` sub-progress is read live
-from `launch.log`'s cumsum-scan year counts, so the bar advances smoothly
-through the longest step instead of freezing.
+**Progress tracks the current step's sub-loop.** The bar is completed-steps
+plus the in-flight fraction of the current step, and ETA extrapolates from
+elapsed time. The dominant `process-storms` step has no native sub-progress,
+so its fraction is read live from `launch.log`'s cumsum-scan year counts —
+the bar advances smoothly through the longest step instead of freezing.
 
 **Auditing is built in.** Each completed run has a **Details** view
-(`/run/<name>` — per-step weighted breakdown + log tail) and an **Audit**
+(`/run/<name>` — per-step breakdown + log tail) and an **Audit**
 view (`/audit/<name>` — DSS/grid/STAC integrity checks, maps, charts).
 Click *Download audit* to pull a catalog's artifacts from HEC S3 in the
 background, then *Audit* to view the report inline.

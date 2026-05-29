@@ -18,7 +18,6 @@ import mimetypes
 import os
 import re
 import shutil
-import statistics
 import subprocess
 import sys
 import threading
@@ -1523,240 +1522,29 @@ def _maybe_int(x: object) -> int | None:
         return int(s) if s else None
     except (ValueError, TypeError):
         return None
-
-
-# ─── Analytical ETA model ────────────────────────────────────────────────────
-#
-# Pre-launch ETA is derived from payload-attribute analysis — NO history,
-# NO past-run measurements. The dominant cost in the pipeline is the
-# process-storms scan loop, which iterates once per date emitted by
-# ``generate_date_range(start, end, every_n_hours=check_every_n_hours)``
-# in stormhub/met/storm_catalog.py:1605. The other actions scale linearly
-# with ``top_n_events``.
-#
-# The per-unit-of-work constants below are coarse rules of thumb intended
-# to place the estimate in the right order of magnitude (minutes vs hours),
-# not to be precise. Once the run is in flight, the in-progress sub-loop's
-# measured rate (action_progress) refines the ETA — see _runtime_eta_s.
-
-_S_PER_SCAN_DATE = 0.5  # process-storms: one zarr window scan
-_S_PER_EVENT_ITEM = 5.0  # process-storms: per top-N storm item creation
-_S_PER_EVENT_DSS = 6.0  # convert-to-dss: per storm
-_S_PER_EVENT_GRID = 2.5  # create-grid-file: per storm
-_S_DOWNLOAD_FIXED = 10.0  # download-inputs: tiny geojson + config
-_S_UPLOAD_FIXED = 30.0  # upload-outputs: STAC + DSS sync to S3
-_S_OVERHEAD_FIXED = 15.0  # container start, plugin init, payload validate
-
-
-def _work_units(attrs: dict) -> dict | None:
-    """Translate a payload's attrs into work-unit counts.
-
-    Returns None when required attrs are missing or unparseable — callers
-    should fall back to "no estimate".
-    """
-    if not attrs:
-        return None
-    start = (attrs.get("start_date") or "").strip()
-    end = (attrs.get("end_date") or start).strip()
-    storm_dur = _maybe_int(attrs.get("storm_duration"))
-    top_n = _maybe_int(attrs.get("top_n_events"))
-    # CC payloads default check_every_n_hours to 24 in
-    # plugin/actions/process_storms.py:_storm_params.
-    check_every = _maybe_int(attrs.get("check_every_n_hours")) or 24
-    if not start or not storm_dur or not top_n:
-        return None
-    try:
-        from datetime import datetime
-
-        d_start = datetime.fromisoformat(start)
-        d_end = datetime.fromisoformat(end) if end else d_start
-    except ValueError:
-        return None
-    span_h = max(0.0, (d_end - d_start).total_seconds() / 3600.0)
-    n_dates = int(span_h / check_every) + 1
-    return {
-        "n_dates": n_dates,
-        "n_events": top_n,
-        "storm_duration_h": storm_dur,
-        "check_every_n_hours": check_every,
-        "span_hours": span_h,
-    }
-
-
-def _predict_action_seconds(work: dict | None) -> dict[str, float]:
-    """Per-action predicted durations. Empty dict ⇒ no estimate."""
-    if not work:
-        return {}
-    n_dates = work["n_dates"]
-    n_events = work["n_events"]
-    return {
-        "download-inputs": _S_DOWNLOAD_FIXED,
-        "process-storms": (n_dates * _S_PER_SCAN_DATE + n_events * _S_PER_EVENT_ITEM),
-        "convert-to-dss": n_events * _S_PER_EVENT_DSS,
-        "create-grid-file": n_events * _S_PER_EVENT_GRID,
-        "upload-outputs": _S_UPLOAD_FIXED,
-    }
-
-
-def _predict_total_s(attrs: dict) -> float | None:
-    """Pre-launch total ETA from payload analysis. ``None`` when undecidable."""
-    breakdown = _predict_action_seconds(_work_units(attrs))
-    if not breakdown:
-        return None
-    return sum(breakdown.values()) + _S_OVERHEAD_FIXED
-
-
-# ─── duration-weighted step weights ──────────────────────────────────────────
-#
-# The pipeline's steps have wildly unequal durations — process-storms commonly
-# runs ~98% of total wall time (e.g. 1730s of 1753s on a real run) while
-# create-grid-file is milliseconds. Weighting each step as 1/N makes the bar
-# misrepresent true progress, so we weight by *seconds*. Weights come, in
-# priority order, from (1) historical medians measured on this machine, (2) the
-# analytic per-unit prediction, (3) a small floor so no step is weightless.
-
-_STEP_FLOOR_S = 2.0  # minimum weight so an unseen/instant step still shows
 _HIST_TTL_S = 10.0  # cache historical scan; the dashboard polls every 2s
 _hist_cache: dict = {"at": 0.0, "data": None}
 
 
-def _historical_step_seconds() -> dict[str, float]:
-    """Median completed-step durations learned from finished runs.
-
-    Scans every ``compute/outputs/*/progress.json`` that has a ``summary``
-    (i.e. completed) and returns ``{step_name: median_duration_s}`` for steps
-    with >=2 samples. Memoized with a short TTL so the 2s poll doesn't rescan.
+def _within_step_frac(run: dict) -> float:
+    """0..1 fraction of the current step complete, from its action_progress
+    sub-loop (keyed by step name). 0 when no fresh sub-progress is reported.
     """
-    now = time.time()
-    cached = _hist_cache["data"]
-    if cached is not None and now - _hist_cache["at"] < _HIST_TTL_S:
-        return cached
-    samples: dict[str, list[float]] = {}
-    if OUTPUTS.is_dir():
-        for run_dir in OUTPUTS.iterdir():
-            if not run_dir.is_dir():
-                continue
-            prog = _read_json(run_dir / "progress.json")
-            if not prog or not prog.get("summary"):
-                continue
-            for s in prog.get("completed_steps") or []:
-                nm, dur = s.get("name"), s.get("duration_s")
-                if nm and isinstance(dur, (int, float)) and dur >= 0:
-                    samples.setdefault(nm, []).append(float(dur))
-    medians = {nm: statistics.median(v) for nm, v in samples.items() if len(v) >= 2}
-    _hist_cache.update(at=now, data=medians)
-    return medians
-
-
-def weight_for_step(
-    name: str, attrs: dict | None, predicted: dict[str, float] | None = None
-) -> float:
-    """Resolve a step's weight in seconds: historical median > predicted > floor."""
-    hist = _historical_step_seconds()
-    if name in hist:
-        return max(_STEP_FLOOR_S, hist[name])
-    if predicted is None:
-        predicted = _predict_action_seconds(_work_units(attrs or {}))
-    if predicted.get(name, 0) > 0:
-        return max(_STEP_FLOOR_S, predicted[name])
-    return _STEP_FLOOR_S
-
-
-def _step_weights(plan: list[str], attrs: dict | None) -> dict[str, float]:
-    """{step_name: weight_seconds} for every step in the run's plan."""
-    predicted = _predict_action_seconds(_work_units(attrs or {}))
-    return {nm: weight_for_step(nm, attrs, predicted) for nm in plan}
-
-
-def _within_step_frac(run: dict, cs: dict, cur_weight: float) -> float:
-    """0..1 fraction of the current step complete.
-
-    ``action_progress`` is keyed by step name, so we look up the current step
-    directly (not "freshest across all labels", which could surface a prior
-    completed step's 100%). Falls back to a time-based estimate (in-step
-    elapsed / expected step seconds, capped 0.95) so long steps without
-    sub-progress reporting still advance. Phase 3 supplies a real fraction for
-    process-storms via launch.log.
-    """
-    cur = cs.get("name")
-    now = time.time()
+    cur = (run.get("current_step") or {}).get("name")
     a = (run.get("action_progress") or {}).get(cur) if cur else None
-    if a:
-        ts = a.get("updated_at") or 0
-        if ts and now - ts <= 120:
-            return max(0.0, min(100.0, a.get("pct") or 0)) / 100.0
-    started = cs.get("started_at")
-    if started and cur_weight > 0:
-        return min(0.95, max(0.0, now - started) / cur_weight)
+    if a and a.get("updated_at") and time.time() - a["updated_at"] <= 120:
+        return max(0.0, min(100.0, a.get("pct") or 0)) / 100.0
     return 0.0
 
 
-def _runtime_eta_s(run: dict, attrs: dict | None) -> float | None:
-    """Live ETA for a running run.
-
-    Composition:
-      completed steps → actual durations
-      current step    → live sub-loop ETA when available; else analytic
-                        minus time spent in this step so far
-      future steps    → analytic predictions
-
-    Returns ``None`` when there's no analytic baseline AND no live signal.
-    """
-    plan = run.get("plan") or []
-    completed = {s["name"] for s in run.get("completed_steps", [])}
-    cs = run.get("current_step")
-    if not plan:
-        # No plan recorded — fall back to the pre-launch analytic estimate.
-        breakdown = _predict_action_seconds(_work_units(attrs or {}))
-        if not breakdown:
-            return None
-        total = sum(breakdown.values()) + _S_OVERHEAD_FIXED
-        return max(0.0, total - (run.get("elapsed_s") or 0.0))
-
-    weights = _step_weights(plan, attrs)
-    if not cs:
-        # Pre-step or post-summary: remaining = total weight minus elapsed.
-        total = sum(weights.values())
-        return max(0.0, total - (run.get("elapsed_s") or 0.0))
-
-    current_name = cs.get("name")
-    cur_w = weights.get(current_name, 0.0)
-    eta = 0.0
-
-    # Current step: prefer a live measured ETA; else weight × remaining fraction.
-    live = _live_current_step_eta(run.get("action_progress") or {})
-    if live is not None:
-        eta += live
-    else:
-        within = _within_step_frac(run, cs, cur_w)
-        eta += max(0.0, cur_w * (1.0 - within))
-
-    # Future steps: every planned step not yet completed and not current.
-    for name, w in weights.items():
-        if name == current_name or name in completed:
-            continue
-        eta += w
-    return eta
-
-
-def _live_current_step_eta(action_progress: dict) -> float | None:
-    """Pick freshest non-stale, non-complete action_progress eta_s."""
-    now = time.time()
-    best = None
-    for _label, a in action_progress.items():
-        ts = a.get("updated_at")
-        if not ts or now - ts > 120:
-            continue
-        if (a.get("pct") or 0) >= 100:
-            continue
-        if best is None or ts > best.get("updated_at", 0):
-            best = a
-    if best is None:
+def _runtime_eta_s(run: dict) -> float | None:
+    """Live ETA: extrapolate elapsed time over the completed fraction."""
+    pct = _overall_pct(run)
+    elapsed = run.get("elapsed_s") or 0.0
+    if not pct or pct <= 0 or elapsed <= 0:
         return None
-    eta = best.get("eta_s")
-    if eta is None or eta == float("inf"):
-        return None
-    return float(eta)
+    frac = pct / 100.0
+    return max(0.0, elapsed * (1.0 - frac) / frac)
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -1910,7 +1698,6 @@ def _list_runs() -> list[dict]:
             # Legacy CLI run: no markers but the dir holds plugin output.
             # Surface it as "done" so the user can re-run from the UI.
             status = "done"
-        attrs = (launch or {}).get("payload_attrs") or {}
         rec = {
             "name": run_dir.name,
             "status": status,
@@ -1925,7 +1712,6 @@ def _list_runs() -> list[dict]:
             # Used by the Re-run button. None when we don't know the
             # payload UUID (legacy CLI run without launch.json).
             "payload_uuid": (launch or {}).get("payload_uuid"),
-            "predicted_total_s": _predict_total_s(attrs),
             # Audit availability so the dashboard can link/trigger audits.
             "has_audit": _has_audit(run_dir.name),
         }
@@ -1947,39 +1733,26 @@ def _list_runs() -> list[dict]:
                         **rec["action_progress"],
                         "process-storms": scan,
                     }
-            rec["eta_s"] = _runtime_eta_s(rec, attrs)
-            rec["overall_pct"] = _overall_pct(rec, attrs)
+            rec["eta_s"] = _runtime_eta_s(rec)
+            rec["overall_pct"] = _overall_pct(rec)
         if status in ("failed", "interrupted"):
             rec["error_tail"] = _tail_log(run_dir / "launch.log")
         runs.append(rec)
     return runs
 
 
-def _overall_pct(run: dict, attrs: dict | None = None) -> float | None:
-    """Fraction of the pipeline complete, 0..100 — weighted by step duration.
+def _overall_pct(run: dict) -> float | None:
+    """Pipeline completion 0..100: (completed steps + current sub-fraction) / N.
 
-    Each step contributes its weight (historical median seconds, else analytic
-    prediction, else a floor) rather than 1/N, so the bar tracks true cost.
-    A run where process-storms is 98% of the time will show ~98% of the bar
-    devoted to that step instead of a misleading 20%.
+    Step-fraction model. The in-flight sub-loop (action_progress — including
+    the process-storms per-year scan injected in _list_runs) keeps the bar
+    moving smoothly through the long step, without a per-step weight table.
     """
     cs = run.get("current_step") or {}
-    plan = run.get("plan") or []
-    if not plan:
-        # No plan — fall back to the coarse step counter.
-        i, n = cs.get("i"), cs.get("n")
-        if not n:
-            return None
-        return round(min(1.0, max(0.0, (max(1, i or 1) - 1) / n)) * 100, 1)
-
-    weights = _step_weights(plan, attrs)
-    total = sum(weights.values()) or 1.0
-    completed = {s.get("name") for s in run.get("completed_steps", [])}
-    done_weight = sum(w for nm, w in weights.items() if nm in completed)
-    cur = cs.get("name")
-    cur_w = weights.get(cur, 0.0) if cur else 0.0
-    within = _within_step_frac(run, cs, cur_w) if cur else 0.0
-    overall = (done_weight + within * cur_w) / total
+    i, n = cs.get("i"), cs.get("n")
+    if not n:
+        return None
+    overall = ((max(1, i or 1) - 1) + _within_step_frac(run)) / n
     return round(min(1.0, max(0.0, overall)) * 100, 1)
 
 
@@ -2010,9 +1783,6 @@ def _list_payloads() -> dict:
         payloads = json.loads(r.stdout or "[]")
     except json.JSONDecodeError as e:
         return {"state": "error", "detail": f"could not parse list output: {e}"}
-    # Augment each payload with an analytical ETA derived from its attrs.
-    for p in payloads:
-        p["predicted_s"] = _predict_total_s(p)
     return {"state": "ok", "payloads": payloads}
 
 
@@ -2388,32 +2158,25 @@ def _get_run(name: str) -> dict | None:
     return None
 
 
-def _step_breakdown(run: dict, attrs: dict | None) -> list[dict]:
-    """Per-step rows for the detail view: name, weight%, state, duration/eta."""
+def _step_breakdown(run: dict) -> list[dict]:
+    """Per-step rows for the detail view: name, even weight%, state, detail."""
     plan = run.get("plan") or []
     if not plan:
         return []
-    weights = _step_weights(plan, attrs)
-    total = sum(weights.values()) or 1.0
+    pct = round(100 / len(plan), 1)
     completed = {s.get("name"): s for s in run.get("completed_steps", [])}
     cur = (run.get("current_step") or {}).get("name")
     rows = []
     for nm in plan:
-        w = weights.get(nm, 0.0)
         if nm in completed:
             state, detail = "done", f"{completed[nm].get('duration_s', 0):.1f}s"
         elif nm == cur:
             ap = (run.get("action_progress") or {}).get(nm) or {}
-            if ap.get("total"):
-                state = "running"
-                detail = f"{ap.get('done', 0)}/{ap['total']}"
-            else:
-                state, detail = "running", "…"
+            state = "running"
+            detail = f"{ap.get('done', 0)}/{ap['total']}" if ap.get("total") else "…"
         else:
-            state, detail = "pending", f"~{w:.0f}s"
-        rows.append(
-            {"name": nm, "weight_pct": round(100 * w / total, 1), "state": state, "detail": detail}
-        )
+            state, detail = "pending", "—"
+        rows.append({"name": nm, "weight_pct": pct, "state": state, "detail": detail})
     return rows
 
 
@@ -2425,10 +2188,7 @@ def _render_run_detail_html(name: str) -> tuple[str, int]:
             "<p>No such run.</p><p><a href='/'>← back</a></p>",
             404,
         )
-    attrs = {}  # detail view reuses run's recorded plan/progress; attrs optional
-    lj = _read_json(OUTPUTS / name / "launch.json") or {}
-    attrs = lj.get("payload_attrs") or {}
-    rows = _step_breakdown(run, attrs)
+    rows = _step_breakdown(run)
     pct = run.get("overall_pct")
     eta = run.get("eta_s")
     bar_rows = "".join(
