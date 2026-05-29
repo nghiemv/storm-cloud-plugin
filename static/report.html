@@ -431,7 +431,7 @@ __ANOMALIES_HTML__
 </div>
 
 <h2>DSS Files <span class="meta">__N_DSS__ files · hover bars for detail · click to focus</span></h2>
-<div class="dss-strip-wrap">__DSS_STRIP__</div>
+<div class="dss-strip-wrap" id="dss-strip-wrap"></div>
 
 <h2>Top 12 Events <span class="meta">by mean precipitation</span></h2>
 <div class="gallery" id="gallery"></div>
@@ -484,6 +484,7 @@ __ANOMALIES_HTML__
 <script>
 const events = __EVENTS_JSON__;
 const dssSize = __DSS_SIZE_JSON__;
+const median = __MEDIAN_DSS__;
 const outliers = new Set(__OUTLIERS_JSON__);
 const mapMeta = __MAP_META_JSON__;
 const eventsPrefix = __EVENTS_PREFIX_JSON__;
@@ -873,10 +874,61 @@ function renderGallery() {
   }).join('');
 }
 
+function renderDssStrip() {
+  const width = 1320, height = 130;
+  const ranked = [...events].sort((a, b) =>
+    (a.storm_start || '') < (b.storm_start || '') ? -1
+    : (a.storm_start || '') > (b.storm_start || '') ? 1 : 0);
+  const wrap = document.getElementById('dss-strip-wrap');
+  if (!ranked.length || !median) { wrap.innerHTML = '<div class="dss-empty">No DSS data.</div>'; return; }
+
+  const maxSz = Math.max(0, ...ranked.map(ev => dssSize[String(ev.id)] || 0)) || 1;
+  const n = ranked.length;
+  const padL = 40, padR = 20, padB = 26;
+  const plotW = width - padL - padR, plotH = height - padB;
+  const bw = Math.max(1.5, plotW / n - 0.5), step = plotW / n;
+
+  const parts = [`<svg class="dss-strip" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">`];
+  for (const [level, label, color] of [[median, 'median', '#94a3b8'], [Math.floor(median / 2), '50%', '#fca5a5']]) {
+    const y = plotH - (level / maxSz) * plotH;
+    parts.push(`<line x1="${padL}" y1="${y.toFixed(1)}" x2="${padL + plotW}" y2="${y.toFixed(1)}" stroke="${color}" stroke-width="0.8" stroke-dasharray="3 3"/><text x="${padL + plotW + 4}" y="${(y + 3).toFixed(1)}" fill="${color}" font-size="10">${label}</text>`);
+  }
+  for (const frac of [0.25, 0.5, 0.75, 1.0]) {
+    const y = plotH - frac * plotH, kib = Math.trunc((maxSz * frac) / 1024);
+    parts.push(`<text x="${padL - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end" fill="#94a3b8" font-size="10">${kib}</text>`);
+  }
+  parts.push(`<text x="6" y="${(plotH / 2).toFixed(1)}" fill="#94a3b8" font-size="10" transform="rotate(-90 12 ${(plotH / 2).toFixed(1)})">DSS size (KiB)</text>`);
+
+  ranked.forEach((ev, i) => {
+    const eid = String(ev.id), sz = dssSize[eid] || 0;
+    if (!sz) return;
+    const h = (sz / maxSz) * plotH, x = padL + i * step;
+    const color = ev.is_outlier ? '#dc2626' : sz < median * 0.8 ? '#f59e0b' : '#2563eb';
+    parts.push(`<rect class="b" data-id="${esc(eid)}" x="${x.toFixed(1)}" y="${(plotH - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${color}" fill-opacity="0.78"/>`);
+  });
+
+  const yearsSeen = [];
+  ranked.forEach((ev, i) => {
+    const ts = ev.storm_start || '';
+    if (ts.length >= 4 && /^\d{4}$/.test(ts.slice(0, 4))) {
+      const y = +ts.slice(0, 4);
+      if (!yearsSeen.length || y >= yearsSeen[yearsSeen.length - 1][0] + 5)
+        yearsSeen.push([y, padL + i * step + bw / 2]);
+    }
+  });
+  for (const [y, xpos] of yearsSeen)
+    parts.push(`<text x="${xpos.toFixed(1)}" y="${(height - 8).toFixed(1)}" text-anchor="middle" fill="#64748b" font-size="10">${y}</text>`);
+
+  parts.push('</svg>');
+  parts.push('<div class="dss-strip-legend"><span><span class="sw" style="background:#2563eb"></span>healthy (≥80% median)</span><span><span class="sw" style="background:#f59e0b"></span>small (50–80%)</span><span><span class="sw" style="background:#dc2626"></span>outlier (&lt;50%)</span><span>sorted chronologically · 1 bar per storm</span></div>');
+  wrap.innerHTML = parts.join('');
+}
+
 renderSeasonDonut();
 renderMonthBars();
 renderYearBars();
 renderGallery();
+renderDssStrip();
 </script>
 </body>
 </html>

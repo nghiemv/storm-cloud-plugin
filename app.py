@@ -1384,115 +1384,6 @@ def _stat_html(label: str, value: str, *, warn: bool = False, ok: bool = False) 
     )
 
 
-def _build_dss_strip(
-    events: list[dict],
-    dss_size_by_id: dict[str, int],
-    median_bytes: int,
-    width: int = 1320,
-    height: int = 130,
-) -> str:
-    """460 vertical bars, one per storm, height proportional to DSS size.
-
-    Sorted by storm date so the bars trace the catalog chronologically. Color
-    encodes health: red = outlier (<50% median), gold = small (<80% median),
-    blue = healthy. Bars are clickable + hoverable; the active storm gets a
-    yellow stroke.
-    """
-    ranked = sorted(
-        events, key=lambda e: (e.get("storm_start") or "")
-    )
-    if not ranked or not median_bytes:
-        return '<div class="dss-empty">No DSS data.</div>'
-
-    max_sz = max(
-        (dss_size_by_id.get(str(ev["id"]), 0) for ev in ranked), default=0
-    ) or 1
-    n = len(ranked)
-    pad_l, pad_r, pad_b = 40, 20, 26
-    plot_w = width - pad_l - pad_r
-    plot_h = height - pad_b
-    bw = max(1.5, plot_w / n - 0.5)
-    step = plot_w / n
-
-    parts = [
-        f'<svg class="dss-strip" viewBox="0 0 {width} {height}" '
-        f'preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">'
-    ]
-    # Threshold lines (median, 50% median = outlier cutoff)
-    for level, label, color in [
-        (median_bytes, "median", "#94a3b8"),
-        (median_bytes // 2, "50%", "#fca5a5"),
-    ]:
-        y = plot_h - (level / max_sz) * plot_h
-        parts.append(
-            f'<line x1="{pad_l}" y1="{y:.1f}" x2="{pad_l + plot_w}" y2="{y:.1f}" '
-            f'stroke="{color}" stroke-width="0.8" stroke-dasharray="3 3"/>'
-            f'<text x="{pad_l + plot_w + 4}" y="{y + 3:.1f}" '
-            f'fill="{color}" font-size="10">{label}</text>'
-        )
-
-    # Y-axis tick labels (KiB)
-    for frac in (0.25, 0.5, 0.75, 1.0):
-        y = plot_h - frac * plot_h
-        kib = int((max_sz * frac) / 1024)
-        parts.append(
-            f'<text x="{pad_l - 6}" y="{y + 3:.1f}" text-anchor="end" '
-            f'fill="#94a3b8" font-size="10">{kib}</text>'
-        )
-    parts.append(
-        f'<text x="6" y="{plot_h / 2:.1f}" fill="#94a3b8" font-size="10" '
-        f'transform="rotate(-90 12 {plot_h / 2:.1f})">DSS size (KiB)</text>'
-    )
-
-    for i, ev in enumerate(ranked):
-        eid = str(ev["id"])
-        sz = dss_size_by_id.get(eid, 0)
-        if not sz:
-            continue
-        h = (sz / max_sz) * plot_h
-        x = pad_l + i * step
-        if ev.get("is_outlier"):
-            color = "#dc2626"
-        elif sz < median_bytes * 0.8:
-            color = "#f59e0b"
-        else:
-            color = "#2563eb"
-        parts.append(
-            f'<rect class="b" data-id="{html.escape(eid)}" '
-            f'x="{x:.1f}" y="{plot_h - h:.1f}" '
-            f'width="{bw:.1f}" height="{h:.1f}" '
-            f'fill="{color}" fill-opacity="0.78"/>'
-        )
-
-    # X-axis year ticks — sample every ~5 years
-    years_seen: list[tuple[int, float]] = []
-    for i, ev in enumerate(ranked):
-        ts = ev.get("storm_start") or ""
-        if len(ts) >= 4 and ts[:4].isdigit():
-            y = int(ts[:4])
-            if not years_seen or y >= years_seen[-1][0] + 5:
-                years_seen.append((y, pad_l + i * step + bw / 2))
-    for y, xpos in years_seen:
-        parts.append(
-            f'<text x="{xpos:.1f}" y="{height - 8:.1f}" text-anchor="middle" '
-            f'fill="#64748b" font-size="10">{y}</text>'
-        )
-
-    parts.append("</svg>")
-    parts.append(
-        '<div class="dss-strip-legend">'
-        '<span><span class="sw" style="background:#2563eb"></span>healthy '
-        '(≥80% median)</span>'
-        '<span><span class="sw" style="background:#f59e0b"></span>small '
-        '(50–80%)</span>'
-        '<span><span class="sw" style="background:#dc2626"></span>outlier '
-        '(&lt;50%)</span>'
-        '<span>sorted chronologically · 1 bar per storm</span>'
-        "</div>"
-    )
-    return "".join(parts)
-
-
 def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
     """Render a catalog's audit report as an HTML string.
 
@@ -1767,9 +1658,6 @@ def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
         except (IndexError, ValueError):
             pass
 
-    dss_strip_html = _build_dss_strip(
-        audit["events"], dss_size_by_id, audit["median_dss_bytes"]
-    )
 
     nav_links = " ".join(
         f'<a href="/audit/{html.escape(r["run_name"])}">{html.escape(r["catalog_id"])}</a>'
@@ -1820,10 +1708,10 @@ def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
         "__WS_ZOOM_CARD__": ws_zoom_card,
         "__DOMAIN_STATS__": domain_stats_html,
         "__SVG_MAP__": svg_map,
-        "__DSS_STRIP__": dss_strip_html,
         "__N_EVENTS__": str(audit["n_events"]),
         "__N_DSS__": str(audit["n_dss"]),
         "__EXPECTED_HOURS__": json.dumps(audit["storm_duration"] or None),
+        "__MEDIAN_DSS__": json.dumps(audit["median_dss_bytes"]),
         "__EVENTS_JSON__": json.dumps(audit["events"]),
         "__DSS_SIZE_JSON__": json.dumps(dss_size_by_id),
         "__OUTLIERS_JSON__": json.dumps(outlier_ids),
