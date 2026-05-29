@@ -1384,99 +1384,6 @@ def _stat_html(label: str, value: str, *, warn: bool = False, ok: bool = False) 
     )
 
 
-_SEASON_COLORS = {
-    "Spring": "#22c55e",
-    "Summer": "#f59e0b",
-    "Fall":   "#dc2626",
-    "Autumn": "#dc2626",
-    "Winter": "#3b82f6",
-}
-
-
-def _build_season_donut(events: list[dict]) -> tuple[str, str]:
-    """SVG donut chart of event counts per season. Returns (svg, legend_html)."""
-    import math
-
-    counts: dict[str, int] = {}
-    for ev in events:
-        s = ev.get("season") or "Unknown"
-        counts[s] = counts.get(s, 0) + 1
-    total = sum(counts.values()) or 1
-    # Stable order: Winter → Spring → Summer → Fall (calendar)
-    order = ["Winter", "Spring", "Summer", "Fall", "Autumn", "Unknown"]
-    items = [(s, counts[s]) for s in order if s in counts] + [
-        (s, n) for s, n in counts.items() if s not in order
-    ]
-
-    cx, cy, r_outer, r_inner = 90, 90, 75, 48
-    parts = ['<svg viewBox="0 0 180 180" style="width:100%;max-width:180px;display:block;margin:auto">']
-
-    # Background ring
-    parts.append(
-        f'<circle cx="{cx}" cy="{cy}" r="{(r_outer + r_inner) / 2:.1f}" '
-        f'fill="none" stroke="#f1f5f9" stroke-width="{r_outer - r_inner}"/>'
-    )
-
-    angle = -math.pi / 2  # start at top
-    circumference = 2 * math.pi * ((r_outer + r_inner) / 2)
-    for s, n in items:
-        frac = n / total
-        color = _SEASON_COLORS.get(s, "#94a3b8")
-        seg_len = circumference * frac
-        # Use stroke-dasharray on a circle to draw the arc
-        rot_deg = (angle + math.pi / 2) * 180 / math.pi
-        parts.append(
-            f'<circle cx="{cx}" cy="{cy}" r="{(r_outer + r_inner) / 2:.1f}" '
-            f'fill="none" stroke="{color}" '
-            f'stroke-width="{r_outer - r_inner}" '
-            f'stroke-dasharray="{seg_len:.2f} {circumference - seg_len:.2f}" '
-            f'transform="rotate({rot_deg:.2f} {cx} {cy})"/>'
-        )
-        angle += 2 * math.pi * frac
-
-    parts.append(
-        f'<text x="{cx}" y="{cy - 4}" text-anchor="middle" '
-        f'font-size="22" font-weight="700" fill="#0f172a">{total}</text>'
-        f'<text x="{cx}" y="{cy + 14}" text-anchor="middle" '
-        f'font-size="10" fill="#64748b" text-transform="uppercase" '
-        f'letter-spacing="1">events</text>'
-    )
-    parts.append("</svg>")
-
-    legend_rows = []
-    for s, n in items:
-        color = _SEASON_COLORS.get(s, "#94a3b8")
-        pct = 100 * n / total
-        legend_rows.append(
-            f'<div class="row"><div class="left">'
-            f'<span class="sw" style="background:{color}"></span>'
-            f'<span>{html.escape(s)}</span></div>'
-            f'<span class="ct">{n} ({pct:.0f}%)</span></div>'
-        )
-    return "".join(parts), "".join(legend_rows)
-
-
-def _build_month_bars(events: list[dict]) -> tuple[str, str]:
-    """12 vertical bars showing event counts per calendar month."""
-    counts = [0] * 12
-    for ev in events:
-        ts = ev.get("storm_start") or ""
-        if len(ts) >= 7 and ts[5:7].isdigit():
-            counts[int(ts[5:7]) - 1] += 1
-    peak = max(counts) or 1
-    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    bars = []
-    for i, c in enumerate(counts):
-        h = round(95 * c / peak) if peak else 0
-        bars.append(
-            f'<div class="bar" style="height:{h}px" title="{months[i]}: {c} events">'
-            f'<span class="ct">{c if c else ""}</span></div>'
-        )
-    labels = "".join(f'<div>{m}</div>' for m in months)
-    return "".join(bars), labels
-
-
 def _build_dss_strip(
     events: list[dict],
     dss_size_by_id: dict[str, int],
@@ -1584,32 +1491,6 @@ def _build_dss_strip(
         "</div>"
     )
     return "".join(parts)
-
-
-def _build_gallery(events: list[dict], events_prefix: str, k: int = 12) -> str:
-    """Top-K events by mean precip → gallery cards with thumbnails."""
-    ranked = sorted(
-        (ev for ev in events if isinstance(ev.get("mean"), (int, float))),
-        key=lambda e: e["mean"],
-        reverse=True,
-    )[:k]
-    cards = []
-    for rank, ev in enumerate(ranked, 1):
-        eid = html.escape(str(ev["id"]))
-        date = (ev.get("storm_start") or "")[:10]
-        cards.append(
-            f'<div class="card" data-id="{eid}">'
-            f'<div class="thumb">'
-            f'<img src="{html.escape(events_prefix)}/{eid}/{eid}.thumbnail.png" '
-            f'alt="storm {eid}" loading="lazy">'
-            f'</div>'
-            f'<div class="body">'
-            f'<div class="rank">#{rank} · Item {eid}</div>'
-            f'<div class="precip">{ev["mean"]:.2f} in</div>'
-            f'<div class="date">{html.escape(date)} · {html.escape(ev.get("season") or "")}</div>'
-            f'</div></div>'
-        )
-    return "".join(cards)
 
 
 def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
@@ -1751,23 +1632,6 @@ def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
             f"<ul>{items}</ul></div>"
         )
 
-    # Year strip
-    years = audit["years"]
-    if years:
-        ymin, ymax = min(years), max(years)
-        peak = max(years.values()) or 1
-        bars = []
-        for y in range(ymin, ymax + 1):
-            count = years.get(y, 0)
-            h = int(round(56 * count / peak)) if peak else 0
-            label = str(y) if y % 5 == 0 else ""
-            bars.append(
-                f'<div class="bar" style="height:{h}px" '
-                f'title="{y}: {count} events"><span>{label}</span></div>'
-            )
-        year_bars_html = "".join(bars)
-    else:
-        year_bars_html = ""
 
     # Geometry payloads
     cid = audit["catalog_id"]
@@ -1903,9 +1767,6 @@ def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
         except (IndexError, ValueError):
             pass
 
-    season_svg, season_legend = _build_season_donut(audit["events"])
-    month_bars, month_labels = _build_month_bars(audit["events"])
-    gallery_html = _build_gallery(audit["events"], events_prefix)
     dss_strip_html = _build_dss_strip(
         audit["events"], dss_size_by_id, audit["median_dss_bytes"]
     )
@@ -1959,12 +1820,6 @@ def _build_report(run_name: str, audit: dict, all_runs: list[dict]) -> str:
         "__WS_ZOOM_CARD__": ws_zoom_card,
         "__DOMAIN_STATS__": domain_stats_html,
         "__SVG_MAP__": svg_map,
-        "__GALLERY_HTML__": gallery_html,
-        "__SEASON_DONUT__": season_svg,
-        "__SEASON_LEGEND__": season_legend,
-        "__MONTH_BARS__": month_bars,
-        "__MONTH_LABELS__": month_labels,
-        "__YEAR_BARS__": year_bars_html,
         "__DSS_STRIP__": dss_strip_html,
         "__N_EVENTS__": str(audit["n_events"]),
         "__N_DSS__": str(audit["n_dss"]),

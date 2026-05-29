@@ -434,23 +434,23 @@ __ANOMALIES_HTML__
 <div class="dss-strip-wrap">__DSS_STRIP__</div>
 
 <h2>Top 12 Events <span class="meta">by mean precipitation</span></h2>
-<div class="gallery" id="gallery">__GALLERY_HTML__</div>
+<div class="gallery" id="gallery"></div>
 
 <h2>Seasonality</h2>
 <div class="small-charts">
   <div class="donut-wrap">
     <div class="title">By Season</div>
-    __SEASON_DONUT__
-    <div class="donut-legend">__SEASON_LEGEND__</div>
+    <div id="season-donut"></div>
+    <div class="donut-legend" id="season-legend"></div>
   </div>
   <div class="month-strip">
-    <div class="row">__MONTH_BARS__</div>
-    <div class="labels">__MONTH_LABELS__</div>
+    <div class="row" id="month-bars"></div>
+    <div class="labels" id="month-labels"></div>
   </div>
 </div>
 
 <h2>Year Distribution</h2>
-<div class="year-bars">__YEAR_BARS__</div>
+<div class="year-bars" id="year-bars"></div>
 
 <h2>All Events <span class="meta">click a header to sort, thumbnail to enlarge, row to focus on map</span></h2>
 <div class="controls">
@@ -787,6 +787,96 @@ document.addEventListener('keydown', e => {
   if (e.key === 'ArrowRight') { stopPlay(); scrubTo((playIdx + 1) % byDate.length); }
   if (e.key === 'ArrowLeft') { stopPlay(); scrubTo((playIdx - 1 + byDate.length) % byDate.length); }
 });
+
+// ─── Summary charts (rendered client-side from `events`) ─────────────────────
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+const SEASON_COLORS = {
+  Spring: '#22c55e', Summer: '#f59e0b', Fall: '#dc2626',
+  Autumn: '#dc2626', Winter: '#3b82f6',
+};
+
+function renderSeasonDonut() {
+  const counts = {};
+  for (const ev of events) {
+    const s = ev.season || 'Unknown';
+    counts[s] = (counts[s] || 0) + 1;
+  }
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
+  const order = ['Winter', 'Spring', 'Summer', 'Fall', 'Autumn', 'Unknown'];
+  const items = order.filter(s => s in counts).map(s => [s, counts[s]])
+    .concat(Object.entries(counts).filter(([s]) => !order.includes(s)));
+
+  const cx = 90, cy = 90, rOuter = 75, rInner = 48, mid = (rOuter + rInner) / 2;
+  const sw = rOuter - rInner, circ = 2 * Math.PI * mid;
+  const parts = ['<svg viewBox="0 0 180 180" style="width:100%;max-width:180px;display:block;margin:auto">'];
+  parts.push(`<circle cx="${cx}" cy="${cy}" r="${mid.toFixed(1)}" fill="none" stroke="#f1f5f9" stroke-width="${sw}"/>`);
+  let angle = -Math.PI / 2;
+  for (const [s, n] of items) {
+    const frac = n / total, color = SEASON_COLORS[s] || '#94a3b8';
+    const segLen = circ * frac, rot = (angle + Math.PI / 2) * 180 / Math.PI;
+    parts.push(`<circle cx="${cx}" cy="${cy}" r="${mid.toFixed(1)}" fill="none" stroke="${color}" stroke-width="${sw}" stroke-dasharray="${segLen.toFixed(2)} ${(circ - segLen).toFixed(2)}" transform="rotate(${rot.toFixed(2)} ${cx} ${cy})"/>`);
+    angle += 2 * Math.PI * frac;
+  }
+  parts.push(`<text x="${cx}" y="${cy - 4}" text-anchor="middle" font-size="22" font-weight="700" fill="#0f172a">${total}</text><text x="${cx}" y="${cy + 14}" text-anchor="middle" font-size="10" fill="#64748b" letter-spacing="1">EVENTS</text></svg>`);
+  document.getElementById('season-donut').innerHTML = parts.join('');
+
+  document.getElementById('season-legend').innerHTML = items.map(([s, n]) => {
+    const color = SEASON_COLORS[s] || '#94a3b8', pct = (100 * n / total).toFixed(0);
+    return `<div class="row"><div class="left"><span class="sw" style="background:${color}"></span><span>${esc(s)}</span></div><span class="ct">${n} (${pct}%)</span></div>`;
+  }).join('');
+}
+
+function renderMonthBars() {
+  const counts = new Array(12).fill(0);
+  for (const ev of events) {
+    const ts = ev.storm_start || '';
+    if (ts.length >= 7 && /^\d\d$/.test(ts.slice(5, 7))) counts[+ts.slice(5, 7) - 1]++;
+  }
+  const peak = Math.max(...counts) || 1;
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  document.getElementById('month-bars').innerHTML = counts.map((c, i) =>
+    `<div class="bar" style="height:${Math.round(95 * c / peak)}px" title="${months[i]}: ${c} events"><span class="ct">${c || ''}</span></div>`).join('');
+  document.getElementById('month-labels').innerHTML = months.map(m => `<div>${m}</div>`).join('');
+}
+
+function renderYearBars() {
+  const counts = {};
+  for (const ev of events) {
+    const ts = ev.storm_start || '';
+    if (ts.length >= 4 && /^\d{4}$/.test(ts.slice(0, 4))) {
+      const y = +ts.slice(0, 4);
+      counts[y] = (counts[y] || 0) + 1;
+    }
+  }
+  const years = Object.keys(counts).map(Number);
+  if (!years.length) return;
+  const ymin = Math.min(...years), ymax = Math.max(...years);
+  const peak = Math.max(...Object.values(counts)) || 1;
+  const bars = [];
+  for (let y = ymin; y <= ymax; y++) {
+    const c = counts[y] || 0, h = Math.round(56 * c / peak);
+    bars.push(`<div class="bar" style="height:${h}px" title="${y}: ${c} events"><span>${y % 5 === 0 ? y : ''}</span></div>`);
+  }
+  document.getElementById('year-bars').innerHTML = bars.join('');
+}
+
+function renderGallery() {
+  const ranked = events.filter(ev => typeof ev.mean === 'number')
+    .sort((a, b) => b.mean - a.mean).slice(0, 12);
+  document.getElementById('gallery').innerHTML = ranked.map((ev, i) => {
+    const eid = esc(String(ev.id)), date = (ev.storm_start || '').slice(0, 10);
+    return `<div class="card" data-id="${eid}"><div class="thumb"><img src="${esc(eventsPrefix)}/${eid}/${eid}.thumbnail.png" alt="storm ${eid}" loading="lazy"></div><div class="body"><div class="rank">#${i + 1} · Item ${eid}</div><div class="precip">${ev.mean.toFixed(2)} in</div><div class="date">${esc(date)} · ${esc(ev.season || '')}</div></div></div>`;
+  }).join('');
+}
+
+renderSeasonDonut();
+renderMonthBars();
+renderYearBars();
+renderGallery();
 </script>
 </body>
 </html>
