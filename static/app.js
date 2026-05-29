@@ -191,14 +191,16 @@ async function renderRuns() {
     // HTML-escape the JSON-encoded name so its inner quotes don't break
     // the onclick attribute parse.
     const nameArg = esc(JSON.stringify(r.name));
+    // No action button for finished runs — re-running a completed catalog is
+    // rarely intended and an accidental click recomputes the whole thing. Only
+    // in-flight runs (Stop) and incomplete ones (Resume/Retry) get an action;
+    // a done run can still be re-launched from the HEC S3 payload list above.
     let actionBtn = "";
     if (r.status === "running" || r.status === "starting") {
       actionBtn = `<button class="secondary" onclick="stopRun(this, ${nameArg})">Stop</button>`;
     } else if ((r.status === "interrupted" || r.status === "failed") && r.payload_uuid) {
       const label = r.status === "interrupted" ? "Resume" : "Retry";
       actionBtn = `<button class="secondary" onclick="rerun(this, ${nameArg})">${label}</button>`;
-    } else if (r.status === "done" && r.payload_uuid) {
-      actionBtn = `<button class="secondary" onclick="rerun(this, ${nameArg})">Re-run</button>`;
     }
 
     // Audit action: view if downloaded, download if outputs likely exist,
@@ -300,6 +302,7 @@ async function launchHec(btn, uuid, catalogId, attrs, source, catalogKey) {
 }
 
 async function rerun(btn, name) {
+  if (!confirm(`Re-launch ${name}? This starts a new compute run.`)) return;
   btn.disabled = true;
   const orig = btn.textContent;
   btn.textContent = "Launching…";
