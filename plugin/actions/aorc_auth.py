@@ -3,7 +3,7 @@ private AORC cache.
 
 Upstream stormhub hard-codes ``s3fs.S3FileSystem(anon=True)`` for the
 sample-window read inside ``valid_spaces_item``. That works against NOAA's
-public bucket but 403s against our private ``s3://storm-cloud/aorc-cache``,
+public bucket but 403s against our private ``s3://storm-cloud/aorc-cache-conus``,
 so a fresh ``new_catalog`` call (Whitehorse, Christmas_Valley, anything
 without a cached ``catalog.json``) crashes during init.
 
