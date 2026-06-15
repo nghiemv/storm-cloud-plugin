@@ -30,38 +30,32 @@ import logging
 from typing import Any, Callable
 
 import numpy as np
-from affine import Affine
 from scipy.signal import fftconvolve
 from shapely.affinity import translate
 
 log = logging.getLogger(__name__)
 
 
-def vectorized_max_transpose(self, func: Callable | None = None) -> tuple:
-    """Drop-in replacement for ``Transpose.max_transpose``.
+def _best_shift_by_correlation(
+    np_data_array: np.ndarray,
+    watershed_mask_clipped: np.ndarray,
+    valid_shifts: list[tuple[int, int]],
+    row0: int,
+    col0: int,
+) -> tuple[tuple[int, int], float]:
+    """Return ``(best_shift, best_mean)`` over ``valid_shifts``.
 
-    Computes mean(precip × watershed_mask) at every (x_delta, y_delta)
-    in ``self.valid_shifts`` via one ``scipy.signal.correlate2d`` pass
-    instead of the upstream Python loop.
-
-    The return signature matches the original:
-    ``(translated_watershed_poly, affine_transform, results_from_func)``.
+    Pure NumPy/SciPy kernel — no geo deps — so it is importable and
+    unit-testable in CI without the Docker image. ``corr[i, j]`` is the
+    sum of ``data`` under the watershed mask placed at ``(i, j)``; the mean
+    is ``corr / mask_count``. At valid shifts no NaN cell sits under the
+    mask (``Transpose.valid_shifts`` guarantees this), so substituting 0
+    for NaN and dividing the sum by the cell count equals the upstream
+    ``nanmean`` loop — modulo C-vs-Python float-summation order (~1e-15).
     """
-    original_window_row_slice, original_window_col_slice = (
-        self.watershed_window.toslices()
-    )
-    row0 = original_window_row_slice.start
-    col0 = original_window_col_slice.start
-    h = original_window_row_slice.stop - row0
-    w = original_window_col_slice.stop - col0
+    data_for_corr = np.where(np.isfinite(np_data_array), np_data_array, 0.0)
 
-    # Replace NaN with 0 for the correlation. valid_shifts has already
-    # filtered out any position where a NaN cell falls under the
-    # watershed mask, so substituting 0 for NaN doesn't change the mean
-    # AT valid positions — it only affects positions we'll never index.
-    data_for_corr = np.where(np.isfinite(self.np_data_array), self.np_data_array, 0.0)
-
-    mask = self.watershed_mask_clipped.astype(np.float64)
+    mask = watershed_mask_clipped.astype(np.float64)
     mask_count = float(mask.sum())
     if mask_count == 0.0:
         raise ValueError(
@@ -82,9 +76,9 @@ def vectorized_max_transpose(self, func: Callable | None = None) -> tuple:
 
     # Walk the valid_shifts list and pick the argmax by mean. Same
     # tie-breaker as the upstream loop (strict >, first occurrence wins).
-    best_mean = None
+    best_mean: float | None = None
     best_shift: tuple[int, int] | None = None
-    for x_delta, y_delta in self.valid_shifts:
+    for x_delta, y_delta in valid_shifts:
         i = row0 + y_delta
         j = col0 + x_delta
         if not (0 <= i < corr.shape[0] and 0 <= j < corr.shape[1]):
@@ -96,6 +90,38 @@ def vectorized_max_transpose(self, func: Callable | None = None) -> tuple:
 
     if best_shift is None:
         raise ValueError("No valid shifts to maximize over")
+    return best_shift, best_mean
+
+
+def vectorized_max_transpose(self, func: Callable | None = None) -> tuple:
+    """Drop-in replacement for ``Transpose.max_transpose``.
+
+    Computes mean(precip × watershed_mask) at every (x_delta, y_delta)
+    in ``self.valid_shifts`` via one ``scipy.signal.correlate2d`` pass
+    instead of the upstream Python loop.
+
+    The return signature matches the original:
+    ``(translated_watershed_poly, affine_transform, results_from_func)``.
+    """
+    from affine import Affine
+
+    original_window_row_slice, original_window_col_slice = (
+        self.watershed_window.toslices()
+    )
+    row0 = original_window_row_slice.start
+    col0 = original_window_col_slice.start
+    h = original_window_row_slice.stop - row0
+    w = original_window_col_slice.stop - col0
+
+    # NaN handling and the correlation-vs-loop equivalence live in the pure
+    # kernel (unit-tested in test_vectorized_transpose.py).
+    best_shift, _ = _best_shift_by_correlation(
+        self.np_data_array,
+        self.watershed_mask_clipped,
+        self.valid_shifts,
+        row0,
+        col0,
+    )
 
     x_delta, y_delta = best_shift
     # Rebuild the masked array at the winning shift so ``func`` (the
