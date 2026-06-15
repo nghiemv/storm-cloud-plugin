@@ -24,13 +24,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
-      - run: ruff check src/
-      - run: ruff format --check src/
+      - run: pip install ruff==0.15.9
+      - run: ruff check run.py app.py plugin/
+      - run: ruff format --check run.py app.py plugin/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pyproj
+      - run: python -m pytest plugin/tests/ -v
 
   build:
     name: Build per-arch
-    needs: lint
+    needs: [lint, test]
     strategy:
       fail-fast: false
       matrix:
@@ -81,7 +91,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: compute/Dockerfile
           platforms: ${{ matrix.platforms }}
           push: ${{ github.event_name == 'release' }}
           tags: ${{ steps.meta.outputs.tags }}
