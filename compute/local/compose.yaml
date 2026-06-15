@@ -1,5 +1,13 @@
-# Local development infrastructure.
-# Usage: python run.py
+# Local dev stack for `./run.py` (run from repo root).
+# Spins up MinIO, seeds it from ./sample/, then runs the plugin.
+
+name: storm-cloud-plugin
+
+x-mc: &mc
+  image: minio/mc:latest
+  env_file: ./dev.env
+  volumes:
+    - ./sample:/sample
 
 services:
   minio:
@@ -9,7 +17,7 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"   # Web console: ccuser/ccpassword
-    env_file: test/local.env
+    env_file: ./dev.env
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
@@ -17,13 +25,10 @@ services:
       retries: 10
 
   minio-init:
-    image: minio/mc:latest
+    <<: *mc
     depends_on:
       minio:
         condition: service_healthy
-    env_file: test/local.env
-    volumes:
-      - ./test:/inputs
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
@@ -36,22 +41,19 @@ services:
       mc mb --ignore-existing local/$$CC_AWS_S3_BUCKET &&
       mc mb --ignore-existing local/$$FFRD_AWS_S3_BUCKET &&
 
-      mc put /inputs/transposition-domain.geojson local/$$FFRD_AWS_S3_BUCKET/$$FFRD_STORE_ROOT/$$FFRD_INPUT_PATH/transposition-domain.geojson &&
-      mc put /inputs/watershed-boundary.geojson local/$$FFRD_AWS_S3_BUCKET/$$FFRD_STORE_ROOT/$$FFRD_INPUT_PATH/watershed-boundary.geojson &&
+      mc put /sample/transposition-domain.geojson local/$$FFRD_AWS_S3_BUCKET/${FFRD_STORE_ROOT:-}/${FFRD_INPUT_PATH:-}/transposition-domain.geojson &&
+      mc put /sample/watershed-boundary.geojson local/$$FFRD_AWS_S3_BUCKET/${FFRD_STORE_ROOT:-}/${FFRD_INPUT_PATH:-}/watershed-boundary.geojson &&
 
       echo 'MinIO initialized.'
       "
 
   seed:
-    image: minio/mc:latest
+    <<: *mc
     depends_on:
       minio-init:
         condition: service_completed_successfully
-    env_file: test/local.env
-    volumes:
-      - ./test:/inputs
     environment:
-      PAYLOAD_FILE: ${PAYLOAD_FILE:-/inputs/examples/payload.json}
+      PAYLOAD_FILE: ${PAYLOAD_FILE:-/sample/payload.json}
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
@@ -61,15 +63,20 @@ services:
 
   storm-cloud-plugin:
     image: storm-cloud-plugin:latest
-    build: .
+    build:
+      context: ../..
+      dockerfile: compute/Dockerfile
     depends_on:
       seed:
         condition: service_completed_successfully
-    env_file: test/local.env
+    env_file: ./dev.env
     environment:
       CC_AWS_ENDPOINT: http://minio:9000
       FFRD_AWS_ENDPOINT: http://minio:9000
-    # Kill the container if it hangs (e.g. stormhub v0.5.0 deadlock).
-    # Override with: PLUGIN_TIMEOUT=7200 docker compose run ...
+    volumes:
+      # Bind-mount Local/ to the host so progress.json + DSS outputs
+      # land at compute/outputs/quick-test/ while the plugin runs.
+      - ../outputs/quick-test:/usr/src/app/Local
+    # Bound container shutdown so a hung run doesn't block compose down.
     stop_grace_period: 10s
     init: true

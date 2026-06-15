@@ -1,4 +1,4 @@
-"""Action: create-grid-file — Emit a HEC-HMS Grid Manager (.grid) file for the catalog.
+"""Action: create-grid-file — Emit a HEC-HMS Grid Manager (.grid) file.
 
 Uses the older verbose schema (Variant blocks, ``DSS File Name``/``DSS Pathname``,
 ``Reference Height``, ``Use Lookup Table``) so the file is consumable by HMS 4.x
@@ -15,10 +15,18 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterable
 
 from pyproj import Transformer
+
+from plugin.lib import (
+    RunContext,
+    check_failure_ratio,
+    dss_filename,
+    earliest_dss_paths,
+    parse_storm_datetime,
+)
+from plugin.progress import Progress
 
 log = logging.getLogger(__name__)
 
@@ -51,20 +59,10 @@ _ALBERS_CRS_WKT = (
 )
 
 
-def _parse_storm_datetime(item: Any) -> datetime | None:
-    """Replicates convert_to_dss._parse_storm_datetime to pair items with DSS files."""
-    try:
-        return datetime.strptime(item.id, "%Y-%m-%dT%H")
-    except ValueError:
-        return item.datetime if getattr(item, "datetime", None) else None
-
-
 def _centroid_lonlat(item: Any) -> tuple[float, float] | None:
     """Extract (lon, lat) from item.geometry (GeoJSON Point set in aorc.py:253)."""
     geom = getattr(item, "geometry", None)
-    if not isinstance(geom, dict):
-        return None
-    if geom.get("type") != "Point":
+    if not isinstance(geom, dict) or geom.get("type") != "Point":
         return None
     coords = geom.get("coordinates")
     if not (isinstance(coords, (list, tuple)) and len(coords) >= 2):
@@ -73,36 +71,6 @@ def _centroid_lonlat(item: Any) -> tuple[float, float] | None:
         return float(coords[0]), float(coords[1])
     except (TypeError, ValueError):
         return None
-
-
-def _earliest_dss_paths(dss_file: Path) -> tuple[str | None, str | None]:
-    """Return earliest PRECIPITATION and TEMPERATURE pathnames in a DSS file."""
-    from hecdss import HecDss  # runtime dep; not needed for pure-format tests
-
-    precip_path: str | None = None
-    temp_path: str | None = None
-    earliest_precip: datetime | None = None
-    earliest_temp: datetime | None = None
-
-    with HecDss(str(dss_file)) as dss:
-        for path_obj in dss.get_catalog():
-            path_str = str(path_obj)
-            parts = path_str.strip("/").split("/")
-            if len(parts) < 6:
-                continue
-            part_c = parts[2].upper()
-            try:
-                dt = datetime.strptime(parts[3], "%d%b%Y:%H%M")
-            except ValueError:
-                continue
-            if part_c == "PRECIPITATION":
-                if earliest_precip is None or dt < earliest_precip:
-                    precip_path, earliest_precip = path_str, dt
-            elif part_c == "TEMPERATURE":
-                if earliest_temp is None or dt < earliest_temp:
-                    temp_path, earliest_temp = path_str, dt
-
-    return precip_path, temp_path
 
 
 def _render_grid_block(
@@ -180,23 +148,79 @@ def build_grid_file(
     return "".join(out)
 
 
-def create_grid_file(ctx: dict[str, Any], action: Any) -> None:
-    payload = ctx["payload"]
-    local_root: Path = ctx["local_root"]
-    collection = ctx.get("collection")
-    storm_params = ctx.get("storm_params")
+def _build_entry(
+    *,
+    item: Any,
+    idx: int,
+    storm_duration: int,
+    dss_dir: Any,
+    entries: list[dict[str, Any]],
+    failed: list[str],
+) -> None:
+    """One iteration of the grid-file loop. Appends to entries or failed."""
+    storm_start = parse_storm_datetime(item)
+    if storm_start is None:
+        log.warning("Skipping item %s: unparseable datetime", item.id)
+        failed.append(item.id)
+        return
 
-    if collection is None or storm_params is None:
-        raise RuntimeError(
-            "create-grid-file requires ctx['collection'] and ctx['storm_params']; "
-            "ensure 'process-storms' ran earlier in the action list"
+    fname = dss_filename(storm_start, idx, storm_duration)
+    dss_path = dss_dir / fname
+
+    if not dss_path.exists():
+        log.warning("Skipping %s: %s not found", item.id, fname)
+        failed.append(item.id)
+        return
+
+    try:
+        precip_pn, temp_pn = earliest_dss_paths(dss_path)
+    except Exception as e:
+        log.error("Skipping %s: could not read DSS catalog (%s)", item.id, e)
+        failed.append(item.id)
+        return
+
+    if precip_pn is None and temp_pn is None:
+        log.warning("Skipping %s: no PRECIPITATION or TEMPERATURE paths", item.id)
+        failed.append(item.id)
+        return
+
+    lonlat = _centroid_lonlat(item)
+    if lonlat is None:
+        log.warning("No centroid for %s — emitting grid without Storm Center", item.id)
+
+    grid_base = fname[:-4]  # drop ".dss"
+    rel_dss = f"data/{fname}"
+
+    if precip_pn is not None:
+        entries.append(
+            {
+                "name": grid_base,
+                "grid_type": "Precipitation",
+                "dss_filename": rel_dss,
+                "dss_pathname": precip_pn,
+                "storm_center_lonlat": lonlat,
+            }
+        )
+    if temp_pn is not None:
+        entries.append(
+            {
+                "name": grid_base,
+                "grid_type": "Temperature",
+                "dss_filename": rel_dss,
+                "dss_pathname": temp_pn,
+                "storm_center_lonlat": lonlat,
+            }
         )
 
-    attrs = payload.attributes
-    catalog_id = attrs["catalog_id"]
-    storm_duration = storm_params["storm_duration"]
 
-    output_dir = local_root / catalog_id
+def create_grid_file(ctx: RunContext) -> None:
+    if ctx.storms is None:
+        raise RuntimeError("create-grid-file requires process-storms to have run first")
+
+    catalog_id = ctx.payload.attributes["catalog_id"]
+    storm_duration = ctx.storms.params["storm_duration"]
+
+    output_dir = ctx.local_root / catalog_id
     dss_dir = output_dir / "data"
     if not dss_dir.is_dir():
         raise FileNotFoundError(
@@ -208,7 +232,7 @@ def create_grid_file(ctx: dict[str, Any], action: Any) -> None:
         log.info("Skipping — %s already exists", grid_path)
         return
 
-    items = list(collection.get_all_items())
+    items = list(ctx.storms.collection.get_all_items())
     if not items:
         raise RuntimeError("No storm items in collection — nothing to grid")
 
@@ -219,77 +243,27 @@ def create_grid_file(ctx: dict[str, Any], action: Any) -> None:
 
     entries: list[dict[str, Any]] = []
     failed: list[str] = []
+    progress = Progress(total=len(items), label="create-grid-file")
 
     for idx, item in enumerate(items, start=1):
-        storm_start = _parse_storm_datetime(item)
-        if storm_start is None:
-            log.warning("Skipping item %s: unparseable datetime", item.id)
-            failed.append(item.id)
-            continue
-
-        date_str = storm_start.strftime("%Y%m%d")
-        rank_padded = str(idx).zfill(3)
-        dss_filename = f"{date_str}_{storm_duration}hr_st1_r{rank_padded}.dss"
-        dss_path = dss_dir / dss_filename
-
-        if not dss_path.exists():
-            log.warning("Skipping %s: %s not found", item.id, dss_filename)
-            failed.append(item.id)
-            continue
-
         try:
-            precip_pn, temp_pn = _earliest_dss_paths(dss_path)
-        except Exception as e:
-            log.error("Skipping %s: could not read DSS catalog (%s)", item.id, e)
-            failed.append(item.id)
-            continue
-
-        if precip_pn is None and temp_pn is None:
-            log.warning("Skipping %s: no PRECIPITATION or TEMPERATURE paths", item.id)
-            failed.append(item.id)
-            continue
-
-        lonlat = _centroid_lonlat(item)
-        if lonlat is None:
-            log.warning(
-                "No centroid for %s — emitting grid without Storm Center", item.id
+            _build_entry(
+                item=item,
+                idx=idx,
+                storm_duration=storm_duration,
+                dss_dir=dss_dir,
+                entries=entries,
+                failed=failed,
             )
+        finally:
+            progress.tick()
 
-        grid_base = dss_filename[:-4]  # drop ".dss"
-        rel_dss = f"data/{dss_filename}"
-
-        if precip_pn is not None:
-            entries.append(
-                {
-                    "name": grid_base,
-                    "grid_type": "Precipitation",
-                    "dss_filename": rel_dss,
-                    "dss_pathname": precip_pn,
-                    "storm_center_lonlat": lonlat,
-                }
-            )
-        if temp_pn is not None:
-            entries.append(
-                {
-                    "name": grid_base,
-                    "grid_type": "Temperature",
-                    "dss_filename": rel_dss,
-                    "dss_pathname": temp_pn,
-                    "storm_center_lonlat": lonlat,
-                }
-            )
-
-    total = len(items)
-    n_failed = len(failed)
-    if n_failed == total:
-        raise RuntimeError(
-            f"All {total} storms failed grid entry construction: {failed}"
-        )
-    if total > 0 and n_failed / total > MAX_FAILURE_RATIO:
-        raise RuntimeError(
-            f"Grid entry failure rate {n_failed}/{total} "
-            f"({n_failed / total:.0%}) exceeds threshold ({MAX_FAILURE_RATIO:.0%}): {failed}"
-        )
+    check_failure_ratio(
+        failed,
+        len(items),
+        label="grid entry construction",
+        max_ratio=MAX_FAILURE_RATIO,
+    )
 
     text = build_grid_file(
         entries,
@@ -303,5 +277,5 @@ def create_grid_file(ctx: dict[str, Any], action: Any) -> None:
         "Wrote %s (%d grid records, %d storms)",
         grid_path,
         len(entries),
-        total - n_failed,
+        len(items) - len(failed),
     )

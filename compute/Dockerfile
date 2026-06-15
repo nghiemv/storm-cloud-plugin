@@ -8,32 +8,32 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 
 WORKDIR /usr/src/app
 
-# StormHub submodule (editable install from lib/stormhub)
+# StormHub submodule (editable install from stormhub/)
 # Fail early with a clear message if the submodule wasn't initialized
-COPY lib/stormhub/pyproject.toml ./lib/stormhub/pyproject.toml
-RUN test -s lib/stormhub/pyproject.toml || \
-    (echo "ERROR: lib/stormhub is empty. Run: git submodule update --init" >&2 && exit 1)
-COPY lib/stormhub/stormhub ./lib/stormhub/stormhub
-COPY requirements.txt .
-COPY constraints.txt .
+COPY stormhub/pyproject.toml ./stormhub/pyproject.toml
+RUN test -s stormhub/pyproject.toml || \
+    (echo "ERROR: stormhub/ is empty. Run: git submodule update --init" >&2 && exit 1)
+COPY stormhub/stormhub ./stormhub/stormhub
+COPY compute/requirements.txt .
+COPY compute/constraints.txt .
 
 # Install Python packages
 RUN python3.12 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
     python3.12 -m pip install --no-cache-dir -c constraints.txt -r requirements.txt
 
-# Plugin source
-COPY src src
+# Plugin source (tests excluded by .dockerignore)
+COPY plugin plugin
 
 RUN chown -R stormhub:stormhub /usr/src/app
 USER stormhub
 
 # Cap intra-process thread fan-out so worker memory scales with worker count
-# only, not num_workers × cpu_count. See src/worker_sizing.py for context.
+# only, not num_workers × cpu_count. See plugin/workers.py for context.
 ENV DASK_SCHEDULER=synchronous \
     OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1
 
-ENTRYPOINT ["python3.12", "-u"]
-CMD ["src/plugin.py"]
+ENTRYPOINT ["python3.12", "-u", "-m"]
+CMD ["plugin"]
