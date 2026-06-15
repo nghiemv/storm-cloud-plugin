@@ -1,0 +1,1061 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Audit — __CATALOG_ID__</title>
+<style>
+  :root {
+    --bg: #f7f8fb; --card: #fff; --ink: #0f172a; --mute: #64748b;
+    --line: #e2e8f0; --accent: #1e3a5f; --accent2: #2563eb;
+    --ok: #059669; --warn: #d97706; --bad: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+                      sans-serif;
+         color: var(--ink); background: var(--bg); line-height: 1.45; }
+  header { background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
+           color: #fff; padding: 22px 28px; }
+  header h1 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
+  header .sub { font-size: 13px; opacity: 0.85; margin-top: 6px;
+                 font-variant-numeric: tabular-nums; }
+  header .nav { font-size: 12px; margin-top: 10px; }
+  header .nav a { color: #93c5fd; margin-right: 14px; text-decoration: none; }
+  header .nav a:hover { text-decoration: underline; }
+  main { max-width: 1400px; margin: 0 auto; padding: 22px 28px 60px; }
+  h2 { font-size: 13px; margin: 30px 0 10px; padding-bottom: 6px;
+       text-transform: uppercase; letter-spacing: 0.06em; color: var(--mute);
+       border-bottom: 1px solid var(--line); }
+  h2 .meta { font-weight: normal; text-transform: none; letter-spacing: 0;
+             color: var(--mute); font-size: 12px; margin-left: 8px; }
+
+  /* Summary cards */
+  .stats { display: grid; gap: 12px;
+           grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+           margin-bottom: 8px; }
+  .stat { background: var(--card); border: 1px solid var(--line);
+          padding: 12px 14px; border-radius: 8px;
+          box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
+  .stat .label { font-size: 10px; color: var(--mute); text-transform: uppercase;
+                 letter-spacing: 0.06em; }
+  .stat .value { font-size: 20px; font-weight: 700; margin-top: 4px;
+                 font-variant-numeric: tabular-nums; }
+  .stat .sub { font-size: 11px; color: var(--mute); margin-top: 2px; }
+  .stat.warn { border-color: #fcd34d; background: #fffbeb; }
+  .stat.warn .value { color: #b45309; }
+  .stat.ok { border-color: #6ee7b7; background: #ecfdf5; }
+  .stat.ok .value { color: #047857; }
+
+  /* Anomalies */
+  .anomaly { background: #fff5f5; border-left: 3px solid #ef4444;
+             padding: 10px 14px; border-radius: 4px; margin: 8px 0;
+             box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
+  .anomaly h3 { font-size: 13px; margin: 0 0 6px; color: #b91c1c; }
+  .anomaly code { background: #fff; padding: 1px 5px; border-radius: 3px;
+                  border: 1px solid #fecaca; font-size: 11px; }
+  .anomaly ul { margin: 6px 0 0; padding-left: 22px; font-size: 12px;
+                color: #475569; }
+
+  /* Data integrity */
+  .integrity { display: grid;
+               grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+               gap: 6px 14px; background: var(--card); border: 1px solid var(--line);
+               border-radius: 8px; padding: 10px 14px; margin-bottom: 6px;
+               box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
+  .integrity .row { display: flex; align-items: flex-start; gap: 8px;
+                     font-size: 12px; line-height: 1.4; padding: 2px 0; }
+  .integrity .ic { display: inline-block; width: 16px; flex: 0 0 16px;
+                    text-align: center; font-weight: 700; }
+  .integrity .ic.ok { color: #059669; }
+  .integrity .ic.warn { color: #d97706; }
+  .integrity .ic.bad { color: #dc2626; }
+  .integrity .row.bad .d { color: #991b1b; font-weight: 600; }
+
+  /* Domain section */
+  .domain-wrap { display: grid; gap: 16px; align-items: start;
+                  grid-template-columns: minmax(0, 1.8fr) minmax(220px, 1fr);
+                  margin-bottom: 8px; }
+  @media (max-width: 900px) { .domain-wrap { grid-template-columns: 1fr; } }
+  .domain-map { background: #0f172a; border-radius: 10px; overflow: hidden;
+                 box-shadow: 0 4px 14px rgba(15,23,42,0.15); }
+  .domain-svg { display: block; width: 100%; height: auto; }
+  .domain-side { display: flex; flex-direction: column; gap: 12px; }
+  .conus-card { background: #0f172a; border-radius: 10px; padding: 10px;
+                 box-shadow: 0 4px 14px rgba(15,23,42,0.15); }
+  .conus-card .conus-title { color: #94a3b8; font-size: 10px;
+                              text-transform: uppercase; letter-spacing: 0.06em;
+                              margin-bottom: 6px; padding: 0 4px; }
+  .conus-card .conus-inner { border-radius: 6px; overflow: hidden;
+                              background: #082f49; }
+  .conus-map { display: block; width: 100%; height: auto; }
+  .conus-legend { color: #cbd5e1; font-size: 11px; margin-top: 6px;
+                   padding: 0 4px; display: flex; gap: 12px; flex-wrap: wrap; }
+  .conus-legend .sw { display: inline-block; width: 10px; height: 10px;
+                       border-radius: 2px; vertical-align: middle;
+                       margin-right: 5px; }
+  .ws-card { background: #082f49; border-radius: 10px; padding: 10px;
+              box-shadow: 0 4px 14px rgba(15,23,42,0.15); }
+  .ws-card .t { color: #94a3b8; font-size: 10px; text-transform: uppercase;
+                 letter-spacing: 0.06em; margin-bottom: 6px; padding: 0 4px;
+                 display: flex; justify-content: space-between;
+                 align-items: baseline; }
+  .ws-card .t small { color: #cbd5e1; font-size: 10px;
+                       text-transform: none; letter-spacing: 0; }
+  .ws-card .ws-zoom { display: block; width: 100%; height: auto;
+                       border-radius: 6px; background: #082f49; }
+  .ws-card .metrics { display: grid; grid-template-columns: 1fr 1fr;
+                       gap: 8px; margin-top: 8px; padding: 0 4px;
+                       font-size: 11px; color: #cbd5e1;
+                       font-variant-numeric: tabular-nums; }
+  .ws-card .metrics .l { font-size: 9.5px; color: #64748b;
+                          text-transform: uppercase; letter-spacing: 0.06em; }
+  .ws-card .metrics .v { font-size: 13px; font-weight: 600;
+                          color: #f1f5f9; margin-top: 1px; }
+  .ws-card .metrics .v.warn { color: #fbbf24; }
+  .domain-stats { display: grid; gap: 8px; }
+  .domain-stat { background: var(--card); border: 1px solid var(--line);
+                  border-radius: 8px; padding: 9px 11px;
+                  border-left: 3px solid var(--accent2);
+                  box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
+  .domain-stat.t { border-left-color: #ea580c; }
+  .domain-stat.v { border-left-color: #22c55e; }
+  .domain-stat .l { font-size: 10px; color: var(--mute);
+                     text-transform: uppercase; letter-spacing: 0.06em; }
+  .domain-stat .a { font-size: 17px; font-weight: 700; margin-top: 2px;
+                     font-variant-numeric: tabular-nums; }
+  .domain-stat .e { font-size: 11px; color: var(--mute); margin-top: 2px;
+                     font-variant-numeric: tabular-nums; word-break: break-all; }
+
+  /* Map */
+  .map-wrap { position: relative; background: #0f172a; border-radius: 10px;
+              overflow: hidden; box-shadow: 0 4px 14px rgba(15,23,42,0.15);
+              margin-bottom: 8px; }
+  .map-svg { display: block; width: 100%; height: auto; }
+  .map-svg .dot { transition: r 120ms, fill-opacity 120ms; cursor: pointer; }
+  .map-svg .dot:hover { fill-opacity: 1; stroke: #fff; stroke-width: 1.2; }
+  .map-legend { position: absolute; top: 12px; right: 12px; color: #cbd5e1;
+                font-size: 11px; background: rgba(15,23,42,0.7);
+                padding: 8px 11px; border-radius: 6px;
+                border: 1px solid rgba(148,163,184,0.25); }
+  .map-legend .swatch { display: inline-block; width: 11px; height: 11px;
+                         border-radius: 2px; vertical-align: middle;
+                         margin-right: 6px; }
+  .map-legend .row { margin: 2px 0; }
+
+  /* Playback */
+  .play { display: grid; grid-template-columns: 220px 1fr; gap: 18px;
+          background: var(--card); border: 1px solid var(--line);
+          border-radius: 10px; padding: 14px; margin-bottom: 8px;
+          box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
+  .play .thumb-box { aspect-ratio: 1/1; background: #0f172a;
+                     border-radius: 6px; overflow: hidden; position: relative; }
+  .play .thumb-box img { width: 100%; height: 100%; object-fit: contain;
+                          background: #0f172a; cursor: zoom-in; }
+  .play .ctrl { font-variant-numeric: tabular-nums; }
+  .play .row1 { display: flex; align-items: center; gap: 10px;
+                margin-bottom: 6px; }
+  .play .btn { background: var(--accent2); color: #fff; border: 0;
+               padding: 7px 14px; border-radius: 999px; cursor: pointer;
+               font-size: 13px; font-weight: 600; }
+  .play .btn:hover { background: #1d4ed8; }
+  .play .btn.pause { background: var(--mute); }
+  .play .seek { flex: 1; -webkit-appearance: none; appearance: none;
+                background: linear-gradient(90deg, var(--accent2) 0%,
+                            var(--accent2) var(--pct, 0%),
+                            #e2e8f0 var(--pct, 0%), #e2e8f0 100%);
+                height: 5px; border-radius: 3px; outline: none; }
+  .play .seek::-webkit-slider-thumb { -webkit-appearance: none;
+                width: 14px; height: 14px; border-radius: 50%;
+                background: var(--accent2); cursor: pointer; }
+  .play .seek::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%;
+                                   background: var(--accent2); cursor: pointer;
+                                   border: 0; }
+  .play .label { font-size: 11px; text-transform: uppercase;
+                 letter-spacing: 0.06em; color: var(--mute); }
+  .play .now { font-size: 18px; font-weight: 700; margin-top: 2px;
+               font-variant-numeric: tabular-nums; }
+  .play .now small { font-size: 11px; font-weight: 500; color: var(--mute);
+                     margin-left: 6px; text-transform: uppercase;
+                     letter-spacing: 0.04em; }
+  .play .stats-row { display: grid; gap: 10px;
+                     grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+                     margin-top: 10px; padding-top: 10px;
+                     border-top: 1px solid var(--line); }
+  .play .stats-row .label { display: block; }
+  .play .stats-row .val { font-size: 14px; font-weight: 600;
+                          font-variant-numeric: tabular-nums; }
+  .play .speed { font-size: 11px; padding: 4px 8px; border-radius: 4px;
+                 border: 1px solid var(--line); background: #fff;
+                 cursor: pointer; }
+  .play .dss-block { margin-top: 10px; padding-top: 10px;
+                     border-top: 1px solid var(--line); display: grid;
+                     gap: 5px; }
+  .play .dss-row { display: flex; align-items: center; gap: 10px;
+                    font-size: 12px; line-height: 1.4; }
+  .play .dss-row .k { width: 60px; flex: 0 0 60px; color: var(--mute);
+                       font-size: 10px; text-transform: uppercase;
+                       letter-spacing: 0.06em; }
+  .play .dss-row .v { font-variant-numeric: tabular-nums; }
+  .play .dss-row code.v { background: #f1f5f9; padding: 2px 6px;
+                           border-radius: 4px; font-size: 11px;
+                           color: #1e3a5f; }
+  .play .dss-row .path { font-size: 10.5px; word-break: break-all;
+                          flex: 1; min-width: 0; }
+  .play .dss-row .badge { font-size: 10.5px; padding: 1px 8px;
+                           border-radius: 999px; background: #ecfdf5;
+                           color: #047857; font-weight: 600; }
+  .play .dss-row .badge.warn { background: #fffbeb; color: #b45309; }
+  .play .dss-row .badge.bad { background: #fef2f2; color: #b91c1c; }
+  .bbox-toggle { font-size: 11px; padding: 3px 9px; border-radius: 999px;
+                  border: 1px solid var(--line); background: #fff;
+                  cursor: pointer; }
+  .bbox-toggle[aria-pressed="false"] { background: #f1f5f9; color: var(--mute); }
+
+  /* DSS size strip */
+  .dss-strip-wrap { background: var(--card); border: 1px solid var(--line);
+                     border-radius: 10px; padding: 14px;
+                     box-shadow: 0 1px 2px rgba(15,23,42,0.04); }
+  .dss-strip { display: block; width: 100%; height: auto; }
+  .dss-strip .b { transition: fill-opacity 100ms, transform 100ms; cursor: pointer; }
+  .dss-strip .b:hover { fill-opacity: 1; }
+  .dss-strip .b.active { stroke: #facc15; stroke-width: 1.4; }
+  .dss-tip { position: fixed; pointer-events: none; background: #0f172a;
+              color: #f1f5f9; font-size: 11px; padding: 6px 10px;
+              border-radius: 5px; box-shadow: 0 6px 16px rgba(0,0,0,0.3);
+              display: none; z-index: 10000; white-space: nowrap;
+              font-variant-numeric: tabular-nums; }
+  .dss-strip-legend { font-size: 11px; margin-top: 8px; color: var(--mute);
+                       display: flex; gap: 14px; flex-wrap: wrap;
+                       align-items: center; }
+  .dss-strip-legend .sw { display: inline-block; width: 11px; height: 11px;
+                           border-radius: 2px; vertical-align: middle;
+                           margin-right: 5px; }
+
+  /* Top gallery */
+  .gallery { display: grid;
+             grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+             gap: 12px; }
+  .card { background: var(--card); border: 1px solid var(--line);
+          border-radius: 8px; overflow: hidden; cursor: pointer;
+          transition: transform 120ms, box-shadow 120ms; }
+  .card:hover { transform: translateY(-2px);
+                box-shadow: 0 6px 16px rgba(15,23,42,0.12); }
+  .card .thumb { aspect-ratio: 1/1; background: #0f172a; }
+  .card .thumb img { width: 100%; height: 100%; object-fit: contain; }
+  .card .body { padding: 8px 10px; }
+  .card .rank { font-size: 10px; color: var(--mute); text-transform: uppercase;
+                letter-spacing: 0.06em; }
+  .card .precip { font-size: 17px; font-weight: 700;
+                  font-variant-numeric: tabular-nums; }
+  .card .date { font-size: 11px; color: var(--mute); margin-top: 1px; }
+
+  /* Season + month strip */
+  .small-charts { display: grid; gap: 18px;
+                   grid-template-columns: 220px 1fr; align-items: start; }
+  @media (max-width: 700px) { .small-charts { grid-template-columns: 1fr; } }
+  .donut-wrap { background: var(--card); border: 1px solid var(--line);
+                border-radius: 10px; padding: 12px; }
+  .donut-wrap .title { font-size: 11px; color: var(--mute);
+                       text-transform: uppercase; letter-spacing: 0.06em;
+                       margin-bottom: 6px; }
+  .donut-legend { font-size: 12px; margin-top: 4px; }
+  .donut-legend .row { display: flex; justify-content: space-between;
+                        padding: 2px 0; }
+  .donut-legend .row .left { display: flex; align-items: center; gap: 6px; }
+  .donut-legend .row .left .sw { width: 10px; height: 10px; border-radius: 2px; }
+  .donut-legend .row .ct { font-variant-numeric: tabular-nums;
+                            color: var(--mute); }
+  .month-strip { background: var(--card); border: 1px solid var(--line);
+                  border-radius: 10px; padding: 14px; }
+  .month-strip .row { display: grid; grid-template-columns: repeat(12, 1fr);
+                       gap: 6px; align-items: end; height: 110px; }
+  .month-strip .bar { background: linear-gradient(180deg, #60a5fa, #2563eb);
+                       border-radius: 3px 3px 0 0; min-height: 2px;
+                       position: relative; }
+  .month-strip .bar:hover { background: linear-gradient(180deg, #facc15, #d97706); }
+  .month-strip .bar .ct { position: absolute; top: -16px; left: 0; right: 0;
+                           text-align: center; font-size: 10px;
+                           color: var(--mute);
+                           font-variant-numeric: tabular-nums; }
+  .month-strip .labels { display: grid; grid-template-columns: repeat(12, 1fr);
+                          gap: 6px; font-size: 10px; color: var(--mute);
+                          text-align: center; margin-top: 6px;
+                          text-transform: uppercase; }
+
+  /* Year strip */
+  .year-bars { display: flex; gap: 1px; align-items: flex-end;
+               height: 70px; background: var(--card); border: 1px solid var(--line);
+               padding: 8px 8px 20px; border-radius: 8px; position: relative; }
+  .year-bars .bar { background: linear-gradient(180deg, #60a5fa, #1e3a5f);
+                    min-width: 4px; flex: 1 1 auto; border-radius: 2px 2px 0 0;
+                    position: relative; }
+  .year-bars .bar:hover { background: linear-gradient(180deg, #facc15, #d97706); }
+  .year-bars .bar span { position: absolute; bottom: -16px; left: 0; right: 0;
+                          font-size: 9px; text-align: center; color: var(--mute);
+                          font-variant-numeric: tabular-nums; }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; font-size: 12px;
+          background: var(--card); border: 1px solid var(--line);
+          border-radius: 8px; overflow: hidden; }
+  th, td { padding: 6px 10px; text-align: left;
+           border-bottom: 1px solid var(--line); }
+  th { background: #f1f5f9; cursor: pointer; user-select: none;
+       position: sticky; top: 0; font-weight: 600;
+       text-transform: uppercase; font-size: 11px; letter-spacing: 0.04em;
+       color: var(--mute); }
+  th:hover { background: #e2e8f0; }
+  th[data-key]::after { content: ' ⇅'; opacity: 0.3; }
+  th[data-key].asc::after { content: ' ↑'; opacity: 1; color: var(--accent2); }
+  th[data-key].desc::after { content: ' ↓'; opacity: 1; color: var(--accent2); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.outlier { background: #fef2f2; }
+  tr.outlier td:first-child { box-shadow: inset 3px 0 0 #dc2626; }
+  tr:hover { background: #f8fafc; }
+  tr.active-row { background: #fef3c7 !important; }
+  img.thumb { height: 36px; width: 36px; object-fit: contain; background: #0f172a;
+              border-radius: 3px; cursor: pointer;
+              transition: transform 120ms; }
+  img.thumb:hover { transform: scale(1.4); }
+
+  /* Modal */
+  #modal { display: none; position: fixed; inset: 0;
+           background: rgba(15,23,42,0.92); z-index: 9999; cursor: pointer;
+           backdrop-filter: blur(2px); }
+  #modal img { max-width: 92vw; max-height: 88vh; margin: 4vh auto 0;
+               display: block; background: #0f172a; padding: 8px;
+               border-radius: 6px; }
+  #modal .caption { color: #f1f5f9; text-align: center; margin-top: 14px;
+                    font-size: 14px; font-variant-numeric: tabular-nums; }
+
+  .controls { font-size: 12px; margin: 8px 0; display: flex; gap: 10px;
+              align-items: center; }
+  .controls input { font-size: 12px; padding: 5px 8px; width: 240px;
+                     border: 1px solid var(--line); border-radius: 4px; }
+
+  @keyframes pulse { 0%, 100% { r: 7; opacity: 1; }
+                     50% { r: 14; opacity: 0.4; } }
+  #active-dot.playing { animation: pulse 1s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<header>
+  <h1>__TITLE__</h1>
+  <div class="sub">__SUBTITLE__</div>
+  <div class="nav">__NAV_LINKS__</div>
+</header>
+<main>
+
+<h2>Summary</h2>
+<div class="stats">__SUMMARY_STATS__</div>
+
+__ANOMALIES_HTML__
+
+<h2>Data Integrity <span class="meta">cross-checks proving file contents match their labels</span></h2>
+<div class="integrity">__INTEGRITY_HTML__</div>
+
+<h2>Hydrologic Domain <span class="meta">watershed (blue), transposition region (orange hatched), valid sub-region (green) · CONUS overview right</span></h2>
+<div class="domain-wrap">
+  <div class="domain-map">__DOMAIN_SVG__</div>
+  <div class="domain-side">
+    <div class="conus-card">
+      <div class="conus-title">CONUS context</div>
+      <div class="conus-inner">__CONUS_SVG__</div>
+      <div class="conus-legend">
+        <span><span class="sw" style="background:#2563eb"></span>watershed</span>
+        <span><span class="sw" style="background:#ea580c"></span>transposition</span>
+      </div>
+    </div>
+    __WS_ZOOM_CARD__
+    __DOMAIN_STATS__
+  </div>
+</div>
+
+<h2>Storm Map <span class="meta">same geometry · 460 storms colored by mean precip · click a dot or row to focus</span></h2>
+<div class="map-wrap">
+  <div id="map-container"></div>
+</div>
+
+<h2>Storm Playback <span class="meta">__N_EVENTS__ events sorted chronologically</span></h2>
+<div class="play">
+  <div class="thumb-box">
+    <img id="play-thumb" src="" alt="" onclick="showModal(this.src, document.getElementById('play-caption').textContent)">
+  </div>
+  <div class="ctrl">
+    <div class="row1">
+      <button class="btn" id="play-btn">▶ Play</button>
+      <input class="seek" id="play-seek" type="range" min="0" max="0" value="0">
+      <select class="speed" id="play-speed">
+        <option value="800">1×</option>
+        <option value="400">2×</option>
+        <option value="200" selected>5×</option>
+        <option value="100">10×</option>
+        <option value="40">25×</option>
+      </select>
+    </div>
+    <div class="label">Storm <span id="play-pos">0</span>/<span id="play-total">0</span></div>
+    <div class="now" id="play-caption">—</div>
+    <div class="stats-row">
+      <div><span class="label">Item</span><span class="val" id="play-id">—</span></div>
+      <div><span class="label">Season</span><span class="val" id="play-season">—</span></div>
+      <div><span class="label">Mean</span><span class="val" id="play-mean">—</span></div>
+      <div><span class="label">Min</span><span class="val" id="play-min">—</span></div>
+      <div><span class="label">Max</span><span class="val" id="play-max">—</span></div>
+      <div><span class="label">DSS size</span><span class="val" id="play-dss">—</span></div>
+    </div>
+    <div class="dss-block">
+      <div class="dss-row">
+        <span class="k">DSS file</span>
+        <code class="v" id="play-dssfile">—</code>
+        <span class="badge" id="play-dur">—</span>
+      </div>
+      <div class="dss-row">
+        <span class="k">Window</span>
+        <span class="v" id="play-window">—</span>
+      </div>
+      <div class="dss-row">
+        <span class="k">Bbox</span>
+        <span class="v" id="play-bbox">—</span>
+        <button class="bbox-toggle" id="bbox-toggle" type="button" aria-pressed="true">Hide on map</button>
+      </div>
+      <div class="dss-row">
+        <span class="k">Precip</span>
+        <code class="v path" id="play-precip">—</code>
+      </div>
+      <div class="dss-row">
+        <span class="k">Temp</span>
+        <code class="v path" id="play-temp">—</code>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2>DSS Files <span class="meta">__N_DSS__ files · hover bars for detail · click to focus</span></h2>
+<div class="dss-strip-wrap" id="dss-strip-wrap"></div>
+
+<h2>Top 12 Events <span class="meta">by mean precipitation</span></h2>
+<div class="gallery" id="gallery"></div>
+
+<h2>Seasonality</h2>
+<div class="small-charts">
+  <div class="donut-wrap">
+    <div class="title">By Season</div>
+    <div id="season-donut"></div>
+    <div class="donut-legend" id="season-legend"></div>
+  </div>
+  <div class="month-strip">
+    <div class="row" id="month-bars"></div>
+    <div class="labels" id="month-labels"></div>
+  </div>
+</div>
+
+<h2>Year Distribution</h2>
+<div class="year-bars" id="year-bars"></div>
+
+<h2>All Events <span class="meta">click a header to sort, thumbnail to enlarge, row to focus on map</span></h2>
+<div class="controls">
+  Filter:
+  <input id="filter" placeholder="date / season / id…">
+  Showing <span id="shown">__N_EVENTS__</span> rows
+</div>
+<table id="events">
+  <thead><tr>
+    <th data-key="id" data-type="num">Item ID</th>
+    <th data-key="storm_start" data-type="str">Storm Start (UTC)</th>
+    <th data-key="season" data-type="str">Season</th>
+    <th data-key="mean" data-type="num">Mean (in)</th>
+    <th data-key="min" data-type="num">Min (in)</th>
+    <th data-key="max" data-type="num">Max (in)</th>
+    <th data-key="max_lat" data-type="num">Lat</th>
+    <th data-key="max_lon" data-type="num">Lon</th>
+    <th data-key="dss_size" data-type="num">DSS KiB</th>
+    <th>Thumb</th>
+  </tr></thead>
+  <tbody id="events-body"></tbody>
+</table>
+
+</main>
+
+<div id="modal" onclick="this.style.display='none'">
+  <img id="modal-img" src="" alt="">
+  <div class="caption" id="modal-caption"></div>
+</div>
+
+<script>
+const events = __EVENTS_JSON__;
+const dssSize = __DSS_SIZE_JSON__;
+const median = __MEDIAN_DSS__;
+const outliers = new Set(__OUTLIERS_JSON__);
+const eventsPrefix = __EVENTS_PREFIX_JSON__;
+const watershedGeom = __WATERSHED_GEOM_JSON__;
+const transpositionGeom = __TRANSPOSITION_GEOM_JSON__;
+const transpositionValidGeom = __TRANSPOSITION_VALID_GEOM_JSON__;
+const mapMeta = buildMap('map-container');  // injects the .map-svg, returns positions/bboxes
+
+// ─── Map dot interactivity ───────────────────────────────────────────────
+const mapSvg = document.querySelector('.map-svg');
+const activeDot = document.getElementById('active-dot');
+const activeBbox = document.getElementById('active-bbox');
+const bboxToggle = document.getElementById('bbox-toggle');
+let bboxVisible = true;
+if (bboxToggle) {
+  bboxToggle.addEventListener('click', () => {
+    bboxVisible = !bboxVisible;
+    bboxToggle.setAttribute('aria-pressed', bboxVisible);
+    bboxToggle.textContent = bboxVisible ? 'Hide on map' : 'Show on map';
+    if (!bboxVisible && activeBbox) activeBbox.style.display = 'none';
+    else if (bboxVisible && activeBbox && activeBbox.dataset.pending) {
+      activeBbox.style.display = 'block';
+    }
+  });
+}
+
+function focusOnMap(eid) {
+  const pos = mapMeta.positions[eid];
+  if (pos && activeDot) {
+    activeDot.setAttribute('cx', pos[0]);
+    activeDot.setAttribute('cy', pos[1]);
+    activeDot.setAttribute('r', 8);
+    activeDot.style.display = 'block';
+  }
+  const bb = mapMeta.bboxes ? mapMeta.bboxes[eid] : null;
+  if (bb && activeBbox) {
+    activeBbox.setAttribute('x', bb[0]);
+    activeBbox.setAttribute('y', bb[1]);
+    activeBbox.setAttribute('width', bb[2]);
+    activeBbox.setAttribute('height', bb[3]);
+    activeBbox.dataset.pending = '1';
+    activeBbox.style.display = bboxVisible ? 'block' : 'none';
+  } else if (activeBbox) {
+    activeBbox.style.display = 'none';
+  }
+}
+
+if (mapSvg) {
+  mapSvg.addEventListener('click', e => {
+    const t = e.target;
+    if (t && t.classList.contains('dot')) {
+      const id = t.getAttribute('data-id');
+      scrubTo(events.findIndex(ev => String(ev.id) === id));
+    }
+  });
+}
+
+// ─── Storm playback ──────────────────────────────────────────────────────
+const byDate = events.slice().sort((a, b) =>
+  (a.storm_start || '').localeCompare(b.storm_start || '')
+);
+const seek = document.getElementById('play-seek');
+const playBtn = document.getElementById('play-btn');
+const speedSel = document.getElementById('play-speed');
+seek.max = Math.max(0, byDate.length - 1);
+document.getElementById('play-total').textContent = byDate.length;
+let playIdx = 0;
+let playTimer = null;
+
+function thumbUrl(ev) {
+  return `${eventsPrefix}/${ev.id}/${ev.id}.thumbnail.png`;
+}
+
+function scrubTo(i) {
+  if (i < 0 || i >= byDate.length) return;
+  playIdx = i;
+  const ev = byDate[i];
+  seek.value = i;
+  seek.style.setProperty('--pct', (i / (byDate.length - 1 || 1) * 100).toFixed(1) + '%');
+  document.getElementById('play-pos').textContent = i + 1;
+  document.getElementById('play-thumb').src = thumbUrl(ev);
+  document.getElementById('play-caption').textContent =
+    `${ev.storm_start || '—'}  ·  Item ${ev.id}  ·  ${(ev.mean ?? '—')} in mean`;
+  document.getElementById('play-id').textContent = ev.id;
+  document.getElementById('play-season').textContent = ev.season || '—';
+  document.getElementById('play-mean').textContent =
+    ev.mean != null ? ev.mean.toFixed(2) : '—';
+  document.getElementById('play-min').textContent =
+    ev.min != null ? ev.min.toFixed(2) : '—';
+  document.getElementById('play-max').textContent =
+    ev.max != null ? ev.max.toFixed(2) : '—';
+  const sz = dssSize[ev.id];
+  document.getElementById('play-dss').textContent =
+    sz != null ? `${Math.round(sz / 1024)} KiB` : '—';
+
+  // DSS details
+  document.getElementById('play-dssfile').textContent = ev.dss_file || '—';
+  const dur = document.getElementById('play-dur');
+  if (ev.actual_hours != null) {
+    const h = ev.actual_hours;
+    dur.textContent = `${h.toFixed(0)} hr`;
+    dur.className = 'badge';
+    if (expectedHours && Math.abs(h - expectedHours) > 1) {
+      dur.className = 'badge bad';
+      dur.textContent = `${h.toFixed(0)} hr (≠ ${expectedHours} hr)`;
+    }
+  } else {
+    dur.textContent = '—';
+    dur.className = 'badge warn';
+  }
+  document.getElementById('play-window').textContent =
+    ev.storm_start && ev.storm_end
+      ? `${ev.storm_start} → ${ev.storm_end}`
+      : (ev.storm_start || '—');
+  const bb = ev.bbox;
+  document.getElementById('play-bbox').textContent = bb
+    ? `lon ${bb[0].toFixed(2)} → ${bb[2].toFixed(2)},  lat ${bb[1].toFixed(2)} → ${bb[3].toFixed(2)}`
+    : '—';
+  document.getElementById('play-precip').textContent = ev.precip_pathname || '— missing —';
+  document.getElementById('play-precip').className = 'v path' + (ev.precip_pathname ? '' : ' missing');
+  document.getElementById('play-temp').textContent = ev.temp_pathname || '— missing —';
+  document.getElementById('play-temp').className = 'v path' + (ev.temp_pathname ? '' : ' missing');
+
+  focusOnMap(String(ev.id));
+
+  // strip highlight
+  document.querySelectorAll('.dss-strip .b.active').forEach(b => b.classList.remove('active'));
+  const sb = document.querySelector(`.dss-strip .b[data-id="${ev.id}"]`);
+  if (sb) sb.classList.add('active');
+
+  // highlight active table row
+  document.querySelectorAll('tr.active-row').forEach(r => r.classList.remove('active-row'));
+  const r = document.querySelector(`tr[data-id="${ev.id}"]`);
+  if (r) r.classList.add('active-row');
+}
+
+const expectedHours = __EXPECTED_HOURS__;
+
+function stepPlay() {
+  scrubTo((playIdx + 1) % byDate.length);
+}
+
+function startPlay() {
+  if (playTimer) return;
+  const ms = parseInt(speedSel.value, 10) || 200;
+  playBtn.textContent = '⏸ Pause';
+  playBtn.classList.add('pause');
+  activeDot.classList.add('playing');
+  playTimer = setInterval(stepPlay, ms);
+}
+
+function stopPlay() {
+  if (!playTimer) return;
+  clearInterval(playTimer);
+  playTimer = null;
+  playBtn.textContent = '▶ Play';
+  playBtn.classList.remove('pause');
+  activeDot.classList.remove('playing');
+}
+
+playBtn.addEventListener('click', () => playTimer ? stopPlay() : startPlay());
+seek.addEventListener('input', e => { stopPlay(); scrubTo(parseInt(e.target.value, 10)); });
+speedSel.addEventListener('change', () => { if (playTimer) { stopPlay(); startPlay(); } });
+
+if (byDate.length) scrubTo(0);
+
+// ─── Events table ────────────────────────────────────────────────────────
+const tbody = document.getElementById('events-body');
+const shown = document.getElementById('shown');
+let sortKey = 'id', sortDir = 1, sortType = 'num';
+
+function row(ev) {
+  const sz = dssSize[ev.id] != null ? dssSize[ev.id] : null;
+  const szKi = sz != null ? Math.round(sz / 1024) : '';
+  const isOutlier = outliers.has(String(ev.id));
+  const tu = thumbUrl(ev);
+  return {
+    ev, isOutlier, szBytes: sz,
+    html: `<tr class="${isOutlier ? 'outlier' : ''}" data-id="${ev.id}">
+      <td class="num">${ev.id}</td>
+      <td>${ev.storm_start || ''}</td>
+      <td>${ev.season || ''}</td>
+      <td class="num">${ev.mean != null ? ev.mean.toFixed(2) : ''}</td>
+      <td class="num">${ev.min != null ? ev.min.toFixed(2) : ''}</td>
+      <td class="num">${ev.max != null ? ev.max.toFixed(2) : ''}</td>
+      <td class="num">${ev.max_lat != null ? ev.max_lat.toFixed(3) : ''}</td>
+      <td class="num">${ev.max_lon != null ? ev.max_lon.toFixed(3) : ''}</td>
+      <td class="num">${szKi}</td>
+      <td><img class="thumb" src="${tu}" alt="storm ${ev.id}" loading="lazy"
+               onclick="event.stopPropagation(); showModal('${tu}', 'Storm ${ev.id} — ${ev.storm_start}')"></td>
+    </tr>`
+  };
+}
+const allRows = events.map(row);
+
+function applySortIndicator() {
+  document.querySelectorAll('th[data-key]').forEach(th => {
+    th.classList.remove('asc', 'desc');
+    if (th.dataset.key === sortKey) th.classList.add(sortDir > 0 ? 'asc' : 'desc');
+  });
+}
+
+function render(filterText) {
+  const f = (filterText || '').toLowerCase();
+  let rows = allRows;
+  if (f) rows = rows.filter(r =>
+    String(r.ev.id).includes(f)
+    || (r.ev.storm_start || '').toLowerCase().includes(f)
+    || (r.ev.season || '').toLowerCase().includes(f)
+  );
+  rows = rows.slice().sort((a, b) => {
+    let av = sortKey === 'dss_size' ? a.szBytes : a.ev[sortKey];
+    let bv = sortKey === 'dss_size' ? b.szBytes : b.ev[sortKey];
+    if (sortType === 'num') {
+      av = av == null ? -Infinity : +av;
+      bv = bv == null ? -Infinity : +bv;
+    } else {
+      av = av || '';
+      bv = bv || '';
+    }
+    if (av < bv) return -1 * sortDir;
+    if (av > bv) return 1 * sortDir;
+    return 0;
+  });
+  tbody.innerHTML = rows.map(r => r.html).join('');
+  shown.textContent = rows.length;
+  applySortIndicator();
+}
+
+document.querySelectorAll('th[data-key]').forEach(th => {
+  th.addEventListener('click', () => {
+    const k = th.dataset.key;
+    if (sortKey === k) sortDir *= -1;
+    else { sortKey = k; sortDir = 1; sortType = th.dataset.type || 'str'; }
+    render(document.getElementById('filter').value);
+  });
+});
+document.getElementById('filter').addEventListener('input', e => render(e.target.value));
+
+tbody.addEventListener('click', e => {
+  const tr = e.target.closest('tr[data-id]');
+  if (!tr) return;
+  const i = byDate.findIndex(ev => String(ev.id) === tr.dataset.id);
+  if (i >= 0) { stopPlay(); scrubTo(i); }
+});
+
+render();
+
+// ─── Gallery click handlers ──────────────────────────────────────────────
+document.getElementById('gallery').addEventListener('click', e => {
+  const c = e.target.closest('.card[data-id]');
+  if (!c) return;
+  const i = byDate.findIndex(ev => String(ev.id) === c.dataset.id);
+  if (i >= 0) { stopPlay(); scrubTo(i); window.scrollTo({top: 0, behavior: 'smooth'}); }
+});
+
+// ─── DSS strip interactivity ─────────────────────────────────────────────
+const dssStrip = document.querySelector('.dss-strip');
+const dssTip = document.createElement('div');
+dssTip.className = 'dss-tip';
+document.body.appendChild(dssTip);
+if (dssStrip) {
+  const eventById = {};
+  for (const ev of events) eventById[String(ev.id)] = ev;
+  dssStrip.addEventListener('mouseover', e => {
+    const b = e.target.closest('.b[data-id]');
+    if (!b) return;
+    const ev = eventById[b.dataset.id];
+    if (!ev) return;
+    const sz = dssSize[ev.id];
+    const kib = sz != null ? Math.round(sz / 1024) : '—';
+    dssTip.innerHTML = `<b>Item ${ev.id}</b> · ${ev.storm_start || ''}` +
+      `<br>${kib} KiB · mean ${ev.mean != null ? ev.mean.toFixed(2) : '—'} in` +
+      (ev.is_outlier ? '<br><b style="color:#fca5a5">⚠ outlier</b>' : '');
+    dssTip.style.display = 'block';
+  });
+  dssStrip.addEventListener('mousemove', e => {
+    dssTip.style.left = (e.clientX + 12) + 'px';
+    dssTip.style.top = (e.clientY + 12) + 'px';
+  });
+  dssStrip.addEventListener('mouseout', () => { dssTip.style.display = 'none'; });
+  dssStrip.addEventListener('click', e => {
+    const b = e.target.closest('.b[data-id]');
+    if (!b) return;
+    const i = byDate.findIndex(ev => String(ev.id) === b.dataset.id);
+    if (i >= 0) { stopPlay(); scrubTo(i); }
+  });
+}
+
+// ─── Modal ───────────────────────────────────────────────────────────────
+function showModal(src, caption) {
+  document.getElementById('modal-img').src = src;
+  document.getElementById('modal-caption').textContent = caption;
+  document.getElementById('modal').style.display = 'block';
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.getElementById('modal').style.display = 'none';
+    stopPlay();
+  }
+  if (e.key === ' ' && e.target === document.body) {
+    e.preventDefault();
+    playTimer ? stopPlay() : startPlay();
+  }
+  if (e.key === 'ArrowRight') { stopPlay(); scrubTo((playIdx + 1) % byDate.length); }
+  if (e.key === 'ArrowLeft') { stopPlay(); scrubTo((playIdx - 1 + byDate.length) % byDate.length); }
+});
+
+// ─── SVG map (rendered client-side from geometry + events) ───────────────────
+function r1(v) { return Math.round(v * 10) / 10; }
+
+function projector(bbox, width, padPct = 0.06) {
+  let [lonMin, latMin, lonMax, latMax] = bbox;
+  const padLon = (lonMax - lonMin) * padPct || 0.05;
+  const padLat = (latMax - latMin) * padPct || 0.05;
+  lonMin -= padLon; lonMax += padLon; latMin -= padLat; latMax += padLat;
+  const centerLat = (latMin + latMax) / 2, k = Math.cos(centerLat * Math.PI / 180);
+  const lonSpan = (lonMax - lonMin) * k || 1e-6, latSpan = (latMax - latMin) || 1e-6;
+  const height = Math.max(1, Math.round(width * (latSpan / lonSpan)));
+  const project = (lon, lat) => [(lon - lonMin) * k / lonSpan * width, (latMax - lat) / latSpan * height];
+  return { project, w: width, h: height };
+}
+
+function ringToD(ring, project) {
+  const pts = [];
+  for (const c of ring) {
+    if (!(Array.isArray(c) && c.length >= 2)) continue;
+    const [x, y] = project(+c[0], +c[1]);
+    pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+  }
+  return pts.length ? 'M' + pts.join('L') + 'Z' : '';
+}
+
+function geomToPathD(geom, project) {
+  if (!geom) return '';
+  const coords = geom.coordinates;
+  if (geom.type === 'Polygon') return (coords || []).map(r => ringToD(r, project)).join(' ');
+  if (geom.type === 'MultiPolygon')
+    return (coords || []).map(poly => poly.map(r => ringToD(r, project)).join(' ')).join(' ');
+  return '';
+}
+
+function walkCoords(obj, out) {
+  if (Array.isArray(obj)) {
+    if (obj.length >= 2 && typeof obj[0] === 'number' && typeof obj[1] === 'number')
+      out.push([+obj[0], +obj[1]]);
+    else for (const el of obj) walkCoords(el, out);
+  } else if (obj && typeof obj === 'object') {
+    for (const v of Object.values(obj)) walkCoords(v, out);
+  }
+}
+
+function colorForPrecip(val, vmin, vmax) {
+  const t = vmax <= vmin ? 0.5 : Math.max(0, Math.min(1, (val - vmin) / (vmax - vmin)));
+  const stops = [[0, [68, 1, 84]], [0.25, [59, 82, 139]], [0.5, [33, 145, 140]], [0.75, [94, 201, 98]], [1, [253, 231, 37]]];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [t0, c0] = stops[i], [t1, c1] = stops[i + 1];
+    if (t <= t1) {
+      const f = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+      const r = Math.trunc(c0[0] + (c1[0] - c0[0]) * f);
+      const g = Math.trunc(c0[1] + (c1[1] - c0[1]) * f);
+      const b = Math.trunc(c0[2] + (c1[2] - c0[2]) * f);
+      return '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
+    }
+  }
+  return '#fde725';
+}
+
+function buildMap(containerId) {
+  const el = document.getElementById(containerId);
+  const pts = [];
+  for (const g of [watershedGeom, transpositionGeom, transpositionValidGeom])
+    if (g) walkCoords(g.coordinates, pts);
+  for (const ev of events)
+    if (ev.max_lon != null && ev.max_lat != null) pts.push([+ev.max_lon, +ev.max_lat]);
+  if (!pts.length) { if (el) el.innerHTML = "<div class='map-empty'>No geometry available.</div>"; return {}; }
+
+  const lons = pts.map(p => p[0]), lats = pts.map(p => p[1]);
+  const bbox = [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
+  const { project, w, h } = projector(bbox, 900);
+
+  const parts = [
+    `<svg class="map-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="storm map">`,
+    '<defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0f172a"/><stop offset="100%" stop-color="#1e293b"/></linearGradient><filter id="glow"><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>',
+    `<rect width="${w}" height="${h}" fill="url(#bg)"/>`,
+  ];
+  const [lonMin, latMin, lonMax, latMax] = bbox;
+  const span = Math.max(lonMax - lonMin, latMax - latMin);
+  const step = span < 2 ? 0.25 : (span < 5 ? 0.5 : 1.0);
+  for (let gLat = Math.floor(latMin / step) * step; gLat <= latMax; gLat += step) {
+    const [x0, y0] = project(lonMin, gLat), [x1, y1] = project(lonMax, gLat);
+    parts.push(`<line x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}" stroke="#334155" stroke-width="0.5" opacity="0.5"/>`);
+  }
+  for (let gLon = Math.floor(lonMin / step) * step; gLon <= lonMax; gLon += step) {
+    const [x0, y0] = project(gLon, latMin), [x1, y1] = project(gLon, latMax);
+    parts.push(`<line x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}" stroke="#334155" stroke-width="0.5" opacity="0.5"/>`);
+  }
+  let d = geomToPathD(transpositionGeom, project);
+  if (d) parts.push(`<path d="${d}" fill="#ea580c" fill-opacity="0.07" stroke="#ea580c" stroke-width="2" stroke-dasharray="6 4"/>`);
+  d = geomToPathD(transpositionValidGeom, project);
+  if (d) parts.push(`<path d="${d}" fill="#16a34a" fill-opacity="0.10" stroke="#22c55e" stroke-width="1"/>`);
+  d = geomToPathD(watershedGeom, project);
+  if (d) parts.push(`<path d="${d}" fill="#2563eb" fill-opacity="0.22" stroke="#60a5fa" stroke-width="2"/>`);
+
+  const means = events.filter(ev => typeof ev.mean === 'number').map(ev => ev.mean);
+  const vmin = means.length ? Math.min(...means) : 0.0, vmax = means.length ? Math.max(...means) : 1.0;
+  const positions = {}, colors = {}, bboxes = {};
+  parts.push('<g class="dots">');
+  for (const ev of events) {
+    if (ev.max_lon == null || ev.max_lat == null) continue;
+    const mean = typeof ev.mean === 'number' ? ev.mean : vmin;
+    const [x, y] = project(+ev.max_lon, +ev.max_lat);
+    const r = 3.0 + 5.0 * (vmax > vmin ? (mean - vmin) / (vmax - vmin) : 0.5);
+    const color = colorForPrecip(mean, vmin, vmax), eid = String(ev.id);
+    positions[eid] = [r1(x), r1(y)]; colors[eid] = color;
+    const ebb = ev.bbox;
+    if (Array.isArray(ebb) && ebb.length === 4) {
+      const [x0, y0] = project(ebb[0], ebb[3]), [x1, y1] = project(ebb[2], ebb[1]);
+      bboxes[eid] = [r1(Math.min(x0, x1)), r1(Math.min(y0, y1)), r1(Math.abs(x1 - x0)), r1(Math.abs(y1 - y0))];
+    }
+    parts.push(`<circle class="dot" data-id="${esc(eid)}" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r.toFixed(1)}" fill="${color}" fill-opacity="0.78" stroke="#0b1220" stroke-width="0.6"/>`);
+  }
+  parts.push('</g>');
+  parts.push('<rect id="active-bbox" x="0" y="0" width="0" height="0" fill="#facc15" fill-opacity="0.08" stroke="#facc15" stroke-width="1.5" stroke-dasharray="4 3" style="display:none" pointer-events="none"/>');
+  parts.push('<circle id="active-dot" cx="0" cy="0" r="0" fill="none" stroke="#facc15" stroke-width="2.5" filter="url(#glow)" style="display:none"/>');
+  const legendW = 180, legendH = 10, lx = 18, ly = h - 30;
+  parts.push(`<g class="legend" transform="translate(${lx},${ly})"><defs><linearGradient id="ramp" x1="0" x2="1"><stop offset="0%" stop-color="#440154"/><stop offset="25%" stop-color="#3b528b"/><stop offset="50%" stop-color="#21918c"/><stop offset="75%" stop-color="#5ec962"/><stop offset="100%" stop-color="#fde725"/></linearGradient></defs><rect width="${legendW}" height="${legendH}" fill="url(#ramp)" rx="2"/><text x="0" y="-4" fill="#cbd5e1" font-size="10">mean precip (in)</text><text x="0" y="${legendH + 12}" fill="#cbd5e1" font-size="10">${vmin.toFixed(1)}</text><text x="${legendW}" y="${legendH + 12}" fill="#cbd5e1" font-size="10" text-anchor="end">${vmax.toFixed(1)}</text></g>`);
+  parts.push('</svg>');
+  if (el) el.innerHTML = parts.join('');
+  return { positions, colors, bboxes, viewbox: [w, h], vmin, vmax };
+}
+
+// ─── Summary charts (rendered client-side from `events`) ─────────────────────
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+const SEASON_COLORS = {
+  Spring: '#22c55e', Summer: '#f59e0b', Fall: '#dc2626',
+  Autumn: '#dc2626', Winter: '#3b82f6',
+};
+
+function renderSeasonDonut() {
+  const counts = {};
+  for (const ev of events) {
+    const s = ev.season || 'Unknown';
+    counts[s] = (counts[s] || 0) + 1;
+  }
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
+  const order = ['Winter', 'Spring', 'Summer', 'Fall', 'Autumn', 'Unknown'];
+  const items = order.filter(s => s in counts).map(s => [s, counts[s]])
+    .concat(Object.entries(counts).filter(([s]) => !order.includes(s)));
+
+  const cx = 90, cy = 90, rOuter = 75, rInner = 48, mid = (rOuter + rInner) / 2;
+  const sw = rOuter - rInner, circ = 2 * Math.PI * mid;
+  const parts = ['<svg viewBox="0 0 180 180" style="width:100%;max-width:180px;display:block;margin:auto">'];
+  parts.push(`<circle cx="${cx}" cy="${cy}" r="${mid.toFixed(1)}" fill="none" stroke="#f1f5f9" stroke-width="${sw}"/>`);
+  let angle = -Math.PI / 2;
+  for (const [s, n] of items) {
+    const frac = n / total, color = SEASON_COLORS[s] || '#94a3b8';
+    const segLen = circ * frac, rot = (angle + Math.PI / 2) * 180 / Math.PI;
+    parts.push(`<circle cx="${cx}" cy="${cy}" r="${mid.toFixed(1)}" fill="none" stroke="${color}" stroke-width="${sw}" stroke-dasharray="${segLen.toFixed(2)} ${(circ - segLen).toFixed(2)}" transform="rotate(${rot.toFixed(2)} ${cx} ${cy})"/>`);
+    angle += 2 * Math.PI * frac;
+  }
+  parts.push(`<text x="${cx}" y="${cy - 4}" text-anchor="middle" font-size="22" font-weight="700" fill="#0f172a">${total}</text><text x="${cx}" y="${cy + 14}" text-anchor="middle" font-size="10" fill="#64748b" letter-spacing="1">EVENTS</text></svg>`);
+  document.getElementById('season-donut').innerHTML = parts.join('');
+
+  document.getElementById('season-legend').innerHTML = items.map(([s, n]) => {
+    const color = SEASON_COLORS[s] || '#94a3b8', pct = (100 * n / total).toFixed(0);
+    return `<div class="row"><div class="left"><span class="sw" style="background:${color}"></span><span>${esc(s)}</span></div><span class="ct">${n} (${pct}%)</span></div>`;
+  }).join('');
+}
+
+function renderMonthBars() {
+  const counts = new Array(12).fill(0);
+  for (const ev of events) {
+    const ts = ev.storm_start || '';
+    if (ts.length >= 7 && /^\d\d$/.test(ts.slice(5, 7))) counts[+ts.slice(5, 7) - 1]++;
+  }
+  const peak = Math.max(...counts) || 1;
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  document.getElementById('month-bars').innerHTML = counts.map((c, i) =>
+    `<div class="bar" style="height:${Math.round(95 * c / peak)}px" title="${months[i]}: ${c} events"><span class="ct">${c || ''}</span></div>`).join('');
+  document.getElementById('month-labels').innerHTML = months.map(m => `<div>${m}</div>`).join('');
+}
+
+function renderYearBars() {
+  const counts = {};
+  for (const ev of events) {
+    const ts = ev.storm_start || '';
+    if (ts.length >= 4 && /^\d{4}$/.test(ts.slice(0, 4))) {
+      const y = +ts.slice(0, 4);
+      counts[y] = (counts[y] || 0) + 1;
+    }
+  }
+  const years = Object.keys(counts).map(Number);
+  if (!years.length) return;
+  const ymin = Math.min(...years), ymax = Math.max(...years);
+  const peak = Math.max(...Object.values(counts)) || 1;
+  const bars = [];
+  for (let y = ymin; y <= ymax; y++) {
+    const c = counts[y] || 0, h = Math.round(56 * c / peak);
+    bars.push(`<div class="bar" style="height:${h}px" title="${y}: ${c} events"><span>${y % 5 === 0 ? y : ''}</span></div>`);
+  }
+  document.getElementById('year-bars').innerHTML = bars.join('');
+}
+
+function renderGallery() {
+  const ranked = events.filter(ev => typeof ev.mean === 'number')
+    .sort((a, b) => b.mean - a.mean).slice(0, 12);
+  document.getElementById('gallery').innerHTML = ranked.map((ev, i) => {
+    const eid = esc(String(ev.id)), date = (ev.storm_start || '').slice(0, 10);
+    return `<div class="card" data-id="${eid}"><div class="thumb"><img src="${esc(eventsPrefix)}/${eid}/${eid}.thumbnail.png" alt="storm ${eid}" loading="lazy"></div><div class="body"><div class="rank">#${i + 1} · Item ${eid}</div><div class="precip">${ev.mean.toFixed(2)} in</div><div class="date">${esc(date)} · ${esc(ev.season || '')}</div></div></div>`;
+  }).join('');
+}
+
+function renderDssStrip() {
+  const width = 1320, height = 130;
+  const ranked = [...events].sort((a, b) =>
+    (a.storm_start || '') < (b.storm_start || '') ? -1
+    : (a.storm_start || '') > (b.storm_start || '') ? 1 : 0);
+  const wrap = document.getElementById('dss-strip-wrap');
+  if (!ranked.length || !median) { wrap.innerHTML = '<div class="dss-empty">No DSS data.</div>'; return; }
+
+  const maxSz = Math.max(0, ...ranked.map(ev => dssSize[String(ev.id)] || 0)) || 1;
+  const n = ranked.length;
+  const padL = 40, padR = 20, padB = 26;
+  const plotW = width - padL - padR, plotH = height - padB;
+  const bw = Math.max(1.5, plotW / n - 0.5), step = plotW / n;
+
+  const parts = [`<svg class="dss-strip" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">`];
+  for (const [level, label, color] of [[median, 'median', '#94a3b8'], [Math.floor(median / 2), '50%', '#fca5a5']]) {
+    const y = plotH - (level / maxSz) * plotH;
+    parts.push(`<line x1="${padL}" y1="${y.toFixed(1)}" x2="${padL + plotW}" y2="${y.toFixed(1)}" stroke="${color}" stroke-width="0.8" stroke-dasharray="3 3"/><text x="${padL + plotW + 4}" y="${(y + 3).toFixed(1)}" fill="${color}" font-size="10">${label}</text>`);
+  }
+  for (const frac of [0.25, 0.5, 0.75, 1.0]) {
+    const y = plotH - frac * plotH, kib = Math.trunc((maxSz * frac) / 1024);
+    parts.push(`<text x="${padL - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end" fill="#94a3b8" font-size="10">${kib}</text>`);
+  }
+  parts.push(`<text x="6" y="${(plotH / 2).toFixed(1)}" fill="#94a3b8" font-size="10" transform="rotate(-90 12 ${(plotH / 2).toFixed(1)})">DSS size (KiB)</text>`);
+
+  ranked.forEach((ev, i) => {
+    const eid = String(ev.id), sz = dssSize[eid] || 0;
+    if (!sz) return;
+    const h = (sz / maxSz) * plotH, x = padL + i * step;
+    const color = ev.is_outlier ? '#dc2626' : sz < median * 0.8 ? '#f59e0b' : '#2563eb';
+    parts.push(`<rect class="b" data-id="${esc(eid)}" x="${x.toFixed(1)}" y="${(plotH - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${color}" fill-opacity="0.78"/>`);
+  });
+
+  const yearsSeen = [];
+  ranked.forEach((ev, i) => {
+    const ts = ev.storm_start || '';
+    if (ts.length >= 4 && /^\d{4}$/.test(ts.slice(0, 4))) {
+      const y = +ts.slice(0, 4);
+      if (!yearsSeen.length || y >= yearsSeen[yearsSeen.length - 1][0] + 5)
+        yearsSeen.push([y, padL + i * step + bw / 2]);
+    }
+  });
+  for (const [y, xpos] of yearsSeen)
+    parts.push(`<text x="${xpos.toFixed(1)}" y="${(height - 8).toFixed(1)}" text-anchor="middle" fill="#64748b" font-size="10">${y}</text>`);
+
+  parts.push('</svg>');
+  parts.push('<div class="dss-strip-legend"><span><span class="sw" style="background:#2563eb"></span>healthy (≥80% median)</span><span><span class="sw" style="background:#f59e0b"></span>small (50–80%)</span><span><span class="sw" style="background:#dc2626"></span>outlier (&lt;50%)</span><span>sorted chronologically · 1 bar per storm</span></div>');
+  wrap.innerHTML = parts.join('');
+}
+
+renderSeasonDonut();
+renderMonthBars();
+renderYearBars();
+renderGallery();
+renderDssStrip();
+</script>
+</body>
+</html>

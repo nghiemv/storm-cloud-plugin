@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>storm-cloud-plugin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<h1>storm-cloud-plugin</h1>
+
+<h2>Local run</h2>
+<div class="row">
+  <div class="left">
+    <code>compute/local/sample/payload.json</code>
+    <div class="meta">MinIO dev stack via <code>./run.py</code></div>
+  </div>
+  <button onclick="launchLocal(this)">Run</button>
+</div>
+
+<h2>HEC S3 payloads <span id="hec-count" class="meta"></span>
+  <button class="secondary" style="float:right;font-size:.7rem;padding:.15rem .55rem"
+          onclick="renderPayloads()">Refresh</button>
+</h2>
+<div id="payloads"><span class="muted">Loading…</span></div>
+
+<h2>Recent runs <span id="runs-count" class="meta"></span></h2>
+<div id="runs"><span class="muted">Loading…</span></div>
+
+<div id="toast" class="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
