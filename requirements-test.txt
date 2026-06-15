@@ -7,3 +7,4 @@ pytest
 pyproj
 numpy
 scipy
+boto3
