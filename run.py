@@ -66,6 +66,62 @@ def sh_quiet(args, env=None):
     )
 
 
+def _running_container_for(name: str) -> str | None:
+    """Return the id of a live plugin container for run ``name``, else None.
+
+    Matches the ``storm-cloud-run=<name>`` label set on every ``docker run``
+    below. Used to refuse a duplicate launch into the same output dir.
+    """
+    r = subprocess.run(
+        ["docker", "ps", "-q", "--filter", f"label=storm-cloud-run={name}"],
+        capture_output=True,
+        text=True,
+    )
+    ids = (r.stdout or "").split()
+    return ids[0] if ids else None
+
+
+def _stdout_is(path: Path) -> bool:
+    """True when our stdout already points at ``path`` (same dev+inode).
+
+    app.py launches ``run.py`` with stdout redirected to ``launch.log``; the
+    CLI leaves stdout on the terminal. The tee in ``_docker_run_logged`` uses
+    this to avoid writing every line twice when stdout already *is* the log.
+    """
+    try:
+        return os.path.samestat(os.fstat(sys.stdout.fileno()), os.stat(path))
+    except (OSError, ValueError):
+        return False
+
+
+def _docker_run_logged(args, run_dir: Path) -> int:
+    """Run ``args``, streaming combined output to ``run_dir/launch.log``.
+
+    launch.log is what the web UI tails for a run's Details/Audit views, so it
+    must be populated regardless of who started the run. app.py redirects our
+    stdout into launch.log already; the CLI does not — so we always write the
+    child's output to the log file ourselves, and additionally mirror it to our
+    own stdout unless that stdout already *is* the log file (avoids duplicates).
+    Returns the child's exit code.
+    """
+    log_path = run_dir / "launch.log"
+    mirror = not _stdout_is(log_path)
+    with open(log_path, "ab", buffering=0) as logf:
+        proc = subprocess.Popen(
+            args,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            logf.write(raw)
+            if mirror:
+                sys.stdout.buffer.write(raw)
+                sys.stdout.flush()
+        return proc.wait()
+
+
 # ─── local (MinIO dev stack) ─────────────────────────────────────────────────
 
 
@@ -258,6 +314,20 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
     name = _safe_subdir(name or uuid)
     run_dir = COMPUTE / "outputs" / name
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Refuse to stack a second container on the same output dir. Two runs
+    # sharing compute/outputs/<name>/ clobber each other's progress.json,
+    # container.id, and launch.log, and double-write the S3 catalog — the
+    # failure mode that orphaned a run on 2026-06-15. Stop the live one first.
+    existing = _running_container_for(name)
+    if existing:
+        print(
+            f"Error: a run for '{name}' is already active "
+            f"(container {existing[:12]}).\n"
+            f"Stop it first:  docker stop {existing[:12]}\n"
+            f"Refusing to launch a duplicate into compute/outputs/{name}/.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     # ``docker run --cidfile`` refuses to write to an existing path, so wipe
     # any stale id from a prior run before relaunching.
     cidfile = run_dir / "container.id"
@@ -333,7 +403,7 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
     # reflects the cgroup when one is set). Default: 80% of host MemTotal,
     # min 4 GiB. Override with CC_MEMORY_GB.
     memory_flags = _docker_memory_flags()
-    sh(
+    rc = _docker_run_logged(
         [
             "docker",
             "run",
@@ -364,8 +434,11 @@ def _run_hec_job(uuid: str, name: str | None = None) -> None:
                 for arg in ("-e", f"{k}={os.environ[k]}")
             ],
             IMAGE,
-        ]
+        ],
+        run_dir,
     )
+    if rc != 0:
+        sys.exit(rc)
 
 
 def cmd_hec(args: list[str]) -> None:

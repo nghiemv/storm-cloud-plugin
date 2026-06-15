@@ -103,6 +103,18 @@ def run_actions(pm: PluginManager, payload: Any) -> None:
 
     def handle_signal(signum: int, frame: Any) -> None:
         nonlocal interrupted
+        if interrupted:
+            # Second signal: the operator (or orchestrator escalating SIGTERM →
+            # SIGKILL) wants out *now*, not after the current action. The first
+            # signal only takes effect between actions, so a stop during the
+            # multi-hour process-storms step would otherwise be deferred until
+            # that step finished. Restore the default disposition and re-raise
+            # so the process terminates immediately with correct signal
+            # semantics. On-disk state is left intact for an idempotent resume.
+            log.warning("Received signal %d again — exiting immediately", signum)
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
         log.warning("Received signal %d, will shut down after current action", signum)
         interrupted = True
 
