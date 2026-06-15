@@ -432,6 +432,61 @@ def _open_aorc_resilient(years_needed, bounds, transposition_geom):
             )
 
 
+def _cumsum_snapshots(
+    chunk_provider: Callable[[int, int], np.ndarray],
+    T: int,
+    shape_yx: tuple[int, int],
+    toi_sorted: list[int],
+    chunk_hours: int,
+) -> tuple[dict[int, np.ndarray], int]:
+    """Streaming cumulative-sum snapshots — the numerical core of the scan.
+
+    Streams the precip cube in ``chunk_hours`` slabs via ``chunk_provider``
+    (``(start, stop) -> ndarray[stop-start, Y, X]``), maintains a running
+    cumulative sum, and snapshots it at each time-of-interest in
+    ``toi_sorted`` (which must start with 0). ``snapshots[t]`` is the sum of
+    precip hours ``0..t-1``; a window sum is then ``snapshots[b] -
+    snapshots[a]`` for ``a < b``. This is exactly stormhub's per-date window
+    sum, computed once per year instead of re-summing each window — the
+    "bit-identical" claim parity-tested in test_cumsum_scan.py.
+
+    Returns ``(snapshots, bytes_streamed)``. NaNs are treated as 0 (matching
+    the per-date path's masking) and accumulation is in float64.
+    """
+    Y, X = shape_yx
+    running = np.zeros((Y, X), dtype=np.float64)
+    snapshots: dict[int, np.ndarray] = {0: running.copy()}
+    bytes_streamed = 0
+    next_toi_idx = 1  # toi_sorted[0] == 0, already snapshotted
+
+    for chunk_start in range(0, T, chunk_hours):
+        chunk_end = min(chunk_start + chunk_hours, T)
+        chunk = chunk_provider(chunk_start, chunk_end)
+        bytes_streamed += chunk.nbytes
+
+        chunk_filled = np.where(np.isfinite(chunk), chunk, 0.0).astype(np.float64)
+        chunk_cum = np.cumsum(chunk_filled, axis=0)
+        del chunk, chunk_filled
+
+        # Snapshot any time-of-interest that falls in (chunk_start, chunk_end].
+        # cumsum[t] = running (sum before chunk) + chunk_cum[t - chunk_start - 1].
+        while next_toi_idx < len(toi_sorted):
+            t_idx = toi_sorted[next_toi_idx]
+            if t_idx <= chunk_start:
+                next_toi_idx += 1
+                continue
+            if t_idx > chunk_end:
+                break
+            local = t_idx - chunk_start - 1
+            snapshots[t_idx] = running + chunk_cum[local]
+            next_toi_idx += 1
+
+        running = running + chunk_cum[-1]
+        del chunk_cum
+
+    return snapshots, bytes_streamed
+
+
 def _process_one_year(
     year: int,
     dates_in_year: list,
@@ -535,39 +590,17 @@ def _process_one_year(
     )
 
     # Stream the precip cube in chunk_hours slabs, maintain a running
-    # cumulative sum, snapshot at each time-of-interest.
-    running = np.zeros((Y, X), dtype=np.float64)
-    snapshots: dict[int, np.ndarray] = {0: running.copy()}
+    # cumulative sum, snapshot at each time-of-interest. The numerical core
+    # is extracted into _cumsum_snapshots (parity-tested); here we just feed
+    # it zarr slabs via a chunk provider.
     t_stream = time.monotonic()
-    bytes_streamed = 0
-    next_toi_idx = 1  # toi_sorted[0] == 0, already snapshotted
 
-    for chunk_start in range(0, T, chunk_hours):
-        chunk_end = min(chunk_start + chunk_hours, T)
-        chunk = (
-            precip_da.isel(time=slice(chunk_start, chunk_end)).compute().values
-        )  # (chunk_hours, Y, X) float32
-        bytes_streamed += chunk.nbytes
+    def _provider(cs: int, ce: int) -> np.ndarray:
+        return precip_da.isel(time=slice(cs, ce)).compute().values
 
-        chunk_filled = np.where(np.isfinite(chunk), chunk, 0.0).astype(np.float64)
-        chunk_cum = np.cumsum(chunk_filled, axis=0)
-        del chunk, chunk_filled
-
-        # Snapshot any time-of-interest that falls in (chunk_start, chunk_end].
-        # cumsum[t] = sum precip[0..t-1] = running (sum before chunk) + chunk_cum[t - chunk_start - 1].
-        while next_toi_idx < len(toi_sorted):
-            t_idx = toi_sorted[next_toi_idx]
-            if t_idx <= chunk_start:
-                next_toi_idx += 1
-                continue
-            if t_idx > chunk_end:
-                break
-            local = t_idx - chunk_start - 1
-            snapshots[t_idx] = running + chunk_cum[local]
-            next_toi_idx += 1
-
-        running = running + chunk_cum[-1]
-        del chunk_cum
+    snapshots, bytes_streamed = _cumsum_snapshots(
+        _provider, T, (Y, X), toi_sorted, chunk_hours
+    )
 
     wlog.info(
         "[cumsum-scan] year=%d stream done %.1fs (%.1f GB read, %d snapshots)",
@@ -625,7 +658,7 @@ def _process_one_year(
     except (ImportError, OSError):
         pass  # platform without resource module — fine, not load-bearing
 
-    del snapshots, running, transpose_obj
+    del snapshots, transpose_obj
     gc.collect()
     return year, lines, completed, skipped
 
