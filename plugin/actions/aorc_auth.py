@@ -63,9 +63,7 @@ def install() -> None:
         )
         bounds = shape(transposition_region.geometry).bounds
         subset = ds.sel(
-            time=slice(
-                start_time, start_time + _dt.timedelta(hours=storm_duration)
-            ),
+            time=slice(start_time, start_time + _dt.timedelta(hours=storm_duration)),
             longitude=slice(bounds[0], bounds[2]),
             latitude=slice(bounds[1], bounds[3]),
         )
@@ -84,6 +82,7 @@ def install() -> None:
     # storm_catalog.py imports the symbol by name, not module attribute,
     # so we have to patch its local reference too.
     import stormhub.met.storm_catalog as _sc_mod
+
     if getattr(_sc_mod, "valid_spaces_item", None) is _original:
         _sc_mod.valid_spaces_item = patched
 
@@ -94,6 +93,7 @@ def restore() -> None:
         return
     import stormhub.met.aorc.aorc as _aorc_mod
     import stormhub.met.storm_catalog as _sc_mod
+
     _aorc_mod.valid_spaces_item = _original
     if getattr(_sc_mod, "valid_spaces_item", None) is not _original:
         _sc_mod.valid_spaces_item = _original

@@ -47,8 +47,16 @@ def _patched_multi_processor(*args, **kwargs):
     output_csv = kwargs.get("output_csv") or args[3]
     event_dates = kwargs.get("event_dates") or args[4]
     num_workers = kwargs.get("num_workers") or (args[5] if len(args) > 5 else None)
-    use_threads = kwargs.get("use_threads", False) if "use_threads" in kwargs else (args[6] if len(args) > 6 else False)
-    with_tb = kwargs.get("with_tb", False) if "with_tb" in kwargs else (args[7] if len(args) > 7 else False)
+    use_threads = (
+        kwargs.get("use_threads", False)
+        if "use_threads" in kwargs
+        else (args[6] if len(args) > 6 else False)
+    )
+    with_tb = (
+        kwargs.get("with_tb", False)
+        if "with_tb" in kwargs
+        else (args[7] if len(args) > 7 else False)
+    )
 
     executor_class = ThreadPoolExecutor if use_threads else ProcessPoolExecutor
 
@@ -67,7 +75,9 @@ def _patched_multi_processor(*args, **kwargs):
     with executor_class(**executor_kwargs) as executor:
         for i in range(0, len(event_dates), batch_size):
             batch = event_dates[i : i + batch_size]
-            futures = [executor.submit(func, catalog, date, storm_duration) for date in batch]
+            futures = [
+                executor.submit(func, catalog, date, storm_duration) for date in batch
+            ]
             with open(output_csv, "a", encoding="utf-8") as f:
                 for future in as_completed(futures):
                     count -= 1
@@ -75,7 +85,9 @@ def _patched_multi_processor(*args, **kwargs):
                         r = future.result()
                         f.write(storm_search_results_to_csv_line(r))
                         f.flush()
-                        logging.info("%s processed (%d remaining)", r["storm_date"], count)
+                        logging.info(
+                            "%s processed (%d remaining)", r["storm_date"], count
+                        )
                         del r
                     except Exception as e:
                         if with_tb:
@@ -96,7 +108,9 @@ def install() -> None:
         return
     _original_multi_processor = sc_mod.multi_processor
     sc_mod.multi_processor = _patched_multi_processor
-    log.info("Patched multi_processor: batch_size = num_workers (full thread parallelism)")
+    log.info(
+        "Patched multi_processor: batch_size = num_workers (full thread parallelism)"
+    )
 
 
 def restore() -> None:

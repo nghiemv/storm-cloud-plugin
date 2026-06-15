@@ -138,9 +138,7 @@ def install() -> None:
         return  # already installed
     _original_max_transpose = Transpose.max_transpose
     Transpose.max_transpose = vectorized_max_transpose
-    log.info(
-        "Vectorized Transpose.max_transpose installed (scipy.signal.fftconvolve)"
-    )
+    log.info("Vectorized Transpose.max_transpose installed (scipy.signal.fftconvolve)")
 
 
 def restore() -> None:

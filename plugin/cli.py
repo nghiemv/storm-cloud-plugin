@@ -124,18 +124,14 @@ def _cmd_list_payloads() -> int:
 
     def fetch_catalog_prefix(name: str) -> dict | None:
         try:
-            obj = s3.get_object(
-                Bucket=bucket, Key=f"{name}/compute-manifest.json"
-            )
+            obj = s3.get_object(Bucket=bucket, Key=f"{name}/compute-manifest.json")
             mtime = obj.get("LastModified")
             manifest = json.loads(obj["Body"].read())
         except Exception:
             return None
         inputs = manifest.get("inputs") or {}
         attrs = (
-            inputs.get("payload_attributes") or {}
-            if isinstance(inputs, dict)
-            else {}
+            inputs.get("payload_attributes") or {} if isinstance(inputs, dict) else {}
         )
         catalog_id = attrs.get("catalog_id") or name
         if catalog_id in already_listed:
@@ -190,11 +186,7 @@ def _cmd_promote_catalog(catalog_key: str) -> int:
         return 1
     manifest = json.loads(obj["Body"].read())
     inputs = manifest.get("inputs") or {}
-    attrs = (
-        inputs.get("payload_attributes") or {}
-        if isinstance(inputs, dict)
-        else {}
-    )
+    attrs = inputs.get("payload_attributes") or {} if isinstance(inputs, dict) else {}
     catalog_id = attrs.get("catalog_id")
     if not catalog_id:
         print(f"error: {catalog_key} has no catalog_id in attributes", file=sys.stderr)
@@ -313,9 +305,7 @@ def _cmd_mirror(argv: list[str]) -> int:
         anon=False,
         key=os.environ["MIRROR_AWS_ACCESS_KEY_ID"],
         secret=os.environ["MIRROR_AWS_SECRET_ACCESS_KEY"],
-        endpoint_url=os.environ.get(
-            "MIRROR_AWS_ENDPOINT", "https://s3.hecdev.net"
-        ),
+        endpoint_url=os.environ.get("MIRROR_AWS_ENDPOINT", "https://s3.hecdev.net"),
     )
     existing_by_year: dict[int, dict[str, int]] = {}
     for year in years:
@@ -474,7 +464,10 @@ def _mirror_one_year(
         # by a single lock; errors fail the year fast.
         log.info(
             "[%d] copying via decoupled pipeline (%d GET + %d PUT threads, queue=%d)",
-            year, GET_THREADS, PUT_THREADS, QUEUE_DEPTH,
+            year,
+            GET_THREADS,
+            PUT_THREADS,
+            QUEUE_DEPTH,
         )
         get_q: Queue = Queue()
         pipe_q: Queue = Queue(maxsize=QUEUE_DEPTH)
@@ -504,8 +497,11 @@ def _mirror_one_year(
                             if state["done"] % 5000 == 0:
                                 log.info(
                                     "[%d] %d/%d (uploaded %d, skipped %d)",
-                                    year, state["done"], total,
-                                    state["copied"], state["skipped"],
+                                    year,
+                                    state["done"],
+                                    total,
+                                    state["copied"],
+                                    state["skipped"],
                                 )
                         continue
                     data = src_fs.cat(src_key)
@@ -529,15 +525,22 @@ def _mirror_one_year(
                         if state["done"] % 5000 == 0:
                             log.info(
                                 "[%d] %d/%d (uploaded %d, skipped %d)",
-                                year, state["done"], total,
-                                state["copied"], state["skipped"],
+                                year,
+                                state["done"],
+                                total,
+                                state["copied"],
+                                state["skipped"],
                             )
                 except Exception as e:
                     with state_lock:
                         state["errors"].append((rel, e))
 
-        get_ts = [threading.Thread(target=get_worker, daemon=True) for _ in range(GET_THREADS)]
-        put_ts = [threading.Thread(target=put_worker, daemon=True) for _ in range(PUT_THREADS)]
+        get_ts = [
+            threading.Thread(target=get_worker, daemon=True) for _ in range(GET_THREADS)
+        ]
+        put_ts = [
+            threading.Thread(target=put_worker, daemon=True) for _ in range(PUT_THREADS)
+        ]
         for t in get_ts + put_ts:
             t.start()
         # Wait for GETs to finish before signaling PUTs to drain.
@@ -556,7 +559,9 @@ def _mirror_one_year(
             )
         log.info(
             "[%d] copy phase: %d uploaded, %d skipped",
-            year, state["copied"], state["skipped"],
+            year,
+            state["copied"],
+            state["skipped"],
         )
 
         log.info("[%d] consolidating metadata", year)

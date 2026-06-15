@@ -64,7 +64,9 @@ def _try_reload(
     if collection is not None:
         log.info("Reloaded existing collection %s from disk", collection_id)
     else:
-        log.info("Reloaded catalog %s — collection missing, will rebuild it", catalog_id)
+        log.info(
+            "Reloaded catalog %s — collection missing, will rebuild it", catalog_id
+        )
     return catalog, collection
 
 
