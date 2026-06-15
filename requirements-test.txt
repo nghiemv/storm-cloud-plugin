@@ -1,0 +1,9 @@
+# Host-runnable test deps for `python -m pytest plugin/tests/` (CI + local).
+# The full plugin runtime (xarray, dask, zarr, stormhub, hec-dss, boto3) lives
+# in the Docker image; only these light deps are needed for the host unit tests
+# (pure kernels, parsing, progress/status logic). Tests that need image-only
+# deps must run inside the image instead.
+pytest
+pyproj
+numpy
+scipy
