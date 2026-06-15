@@ -43,10 +43,11 @@ def test_empty_attribute_falls_through_to_cpu_cap(no_cgroup, fake_cpu_count):
     assert workers.resolve_num_workers({"num_workers": ""}) == 6
 
 
-def test_auto_sizes_from_cgroup(monkeypatch):
+def test_auto_sizes_from_cgroup(monkeypatch, fake_cpu_count):
     monkeypatch.setattr(workers, "_cgroup_mem_limit_mb", lambda: 15000)
-    # 15000 // 3072 == 4 — with thread caps in the image, workers fit
-    # memory only, independent of visible CPU count.
+    # 15000 // 3072 == 4. Pin cpu_count (fake_cpu_count → 8, cpu_cap = 6) so
+    # this exercises the memory cap deterministically; without it a low-core
+    # CI runner's cpu_cap (max(1, cores-2)) would mask the result as 2.
     assert workers.resolve_num_workers({}) == 4
 
 

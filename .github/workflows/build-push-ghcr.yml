@@ -35,12 +35,38 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest pyproj
+      - run: pip install -r requirements-test.txt
       - run: python -m pytest plugin/tests/ -v
+
+  smoke:
+    name: Web app boot smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # app.py / run.py are stdlib-only — import + boot need no deps. Catches
+      # syntax/import/route regressions the unit tests can't (they import
+      # functions, never start the server).
+      - run: python -c "import app, run"
+      - name: boot web app and curl /
+        run: |
+          python run.py web --port 8765 &
+          for i in $(seq 1 40); do
+            curl -fsS -o /dev/null "http://127.0.0.1:8765/" && exit 0
+            sleep 0.25
+          done
+          echo "web app did not serve / within timeout" >&2
+          exit 1
 
   build:
     name: Build per-arch
-    needs: [lint, test]
+    # PRs get fast feedback from lint/test/smoke; the image build (which needs
+    # the stormhub submodule and only pushes on release) runs on push-to-main
+    # and release, not on every PR.
+    if: github.event_name != 'pull_request'
+    needs: [lint, test, smoke]
     strategy:
       fail-fast: false
       matrix:
