@@ -17,7 +17,7 @@ import pytest
 
 import app
 import run
-from app import status
+from app import discovery, status
 
 
 # ─── status state machine ────────────────────────────────────────────────────
@@ -140,11 +140,11 @@ def test_cumsum_year_regex_tolerates_log_prefix():
 
 
 def test_parse_mc_size_units():
-    assert app._parse_mc_size("434B") == 434
-    assert app._parse_mc_size("123KiB") == 123 * 1024
-    assert app._parse_mc_size("1.5MiB") == int(1.5 * 1024**2)
-    assert app._parse_mc_size("2GiB") == 2 * 1024**3
-    assert app._parse_mc_size("garbage") == -1
+    assert discovery._parse_mc_size("434B") == 434
+    assert discovery._parse_mc_size("123KiB") == 123 * 1024
+    assert discovery._parse_mc_size("1.5MiB") == int(1.5 * 1024**2)
+    assert discovery._parse_mc_size("2GiB") == 2 * 1024**3
+    assert discovery._parse_mc_size("garbage") == -1
 
 
 def test_fmt_dur_buckets():

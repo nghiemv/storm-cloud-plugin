@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 
 import app
+from app import discovery
 
 CID = "testcat"
 _EVENTS = [(1, -95.0, 41.5), (2, -94.5, 41.8)]
@@ -103,8 +104,15 @@ def _build_audit_fixture(base):
     return CID
 
 
+def _patch_outputs(monkeypatch, tmp):
+    """OUTPUTS is imported into several app submodules; patch every binding
+    the audit path reads so the fixture dir is used everywhere."""
+    for mod in (app, discovery):
+        monkeypatch.setattr(mod, "OUTPUTS", tmp)
+
+
 def test_render_audit_html_full_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(app, "OUTPUTS", tmp_path)
+    _patch_outputs(monkeypatch, tmp_path)
     name = _build_audit_fixture(tmp_path)
     body, status = app._render_audit_html(name)
     assert status == 200, body[:800]
@@ -115,7 +123,7 @@ def test_render_audit_html_full_path(tmp_path, monkeypatch):
 
 
 def test_render_audit_html_missing_is_friendly(tmp_path, monkeypatch):
-    monkeypatch.setattr(app, "OUTPUTS", tmp_path)
+    _patch_outputs(monkeypatch, tmp_path)
     body, status = app._render_audit_html("never-downloaded")
     assert status == 200
     assert "No audit artifacts" in body
@@ -123,7 +131,7 @@ def test_render_audit_html_missing_is_friendly(tmp_path, monkeypatch):
 
 def test_audit_dict_shape(tmp_path, monkeypatch):
     """_audit builds the dict _build_report consumes — pin its core keys."""
-    monkeypatch.setattr(app, "OUTPUTS", tmp_path)
+    _patch_outputs(monkeypatch, tmp_path)
     name = _build_audit_fixture(tmp_path)
     a = app._audit(name)
     assert a["catalog_id"] == CID

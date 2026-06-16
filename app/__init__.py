@@ -56,6 +56,13 @@ from app.core import (
     write_launch_json as write_launch_json,
 )
 from app.launch import _launch_hec, _launch_local, _rerun, _stop
+from app.discovery import (
+    _known_runs,
+    _catalog_id_for,
+    _has_run_output,
+    _has_audit,
+    _parse_listing,
+)
 
 
 def _mc_available() -> bool:
@@ -118,33 +125,6 @@ def _mc_ls_lines(src: str) -> list[str]:
 
 
 # ─── known runs (mined from compute/outputs/) ────────────────────────────────
-
-
-def _known_runs() -> list[str]:
-    """Subdirs of compute/outputs/ that have a launch.json (= a real run)."""
-    if not OUTPUTS.is_dir():
-        return []
-    out = []
-    for sub in sorted(OUTPUTS.iterdir()):
-        if (sub / "launch.json").is_file():
-            out.append(sub.name)
-    return out
-
-
-def _catalog_id_for(run_name: str) -> str:
-    """Read catalog_id from compute/outputs/<run>/launch.json. Falls back to the
-    run name when the launch record lacks it (older runs stored only the UUID).
-    """
-    lj = OUTPUTS / run_name / "launch.json"
-    if lj.is_file():
-        try:
-            data = json.loads(lj.read_text())
-            cid = (data.get("payload_attrs") or {}).get("catalog_id")
-            if cid:
-                return cid
-        except (OSError, json.JSONDecodeError):
-            pass
-    return run_name
 
 
 # ─── download ─────────────────────────────────────────────────────────────────
@@ -226,49 +206,6 @@ def _resolve_events_prefix(cid: str) -> str:
 
 
 # ─── audit checks ─────────────────────────────────────────────────────────────
-
-
-def _parse_mc_size(token: str) -> int:
-    """Convert mc's human-readable size token (e.g. '1.4MiB', '123KiB', '434B')
-    to a byte count. Returns -1 on parse failure.
-    """
-    # Longest suffix first so 'MiB' wins over 'B' (every "iB" form also
-    # endswith('B')); GiB before MiB before KiB before bare B.
-    units = (("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024), ("B", 1))
-    for suffix, mul in units:
-        if token.endswith(suffix):
-            try:
-                return int(float(token[: -len(suffix)]) * mul)
-            except ValueError:
-                return -1
-    return -1
-
-
-def _parse_listing(audit_dir: Path) -> list[dict]:
-    """Parse compute/outputs/<run>/audit/data-listing.txt → list of
-    {name, size_bytes, size_token}.
-    """
-    out: list[dict] = []
-    text = (audit_dir / "data-listing.txt").read_text(errors="replace")
-    for line in text.splitlines():
-        toks = line.split()
-        if not toks:
-            continue
-        # mc ls format: "[DATE TIME] SIZE STORAGE NAME"
-        # Locate the size token by walking from the right past the name + STANDARD.
-        # Easier: name is the last token; size_token is 2 tokens before that.
-        name = toks[-1]
-        size_token = toks[-3] if len(toks) >= 3 else ""
-        if "." not in name:
-            continue
-        out.append(
-            {
-                "name": name,
-                "size_token": size_token,
-                "size_bytes": _parse_mc_size(size_token),
-            }
-        )
-    return out
 
 
 def _audit(run_name: str) -> dict:
@@ -1392,19 +1329,6 @@ _HIST_TTL_S = 10.0  # cache historical scan; the dashboard polls every 2s
 _hist_cache: dict = {"at": 0.0, "data": None}
 
 
-def _has_run_output(run_dir: Path) -> bool:
-    """A run dir without launch/progress markers might still be a completed
-    run from a CLI invocation. Recognize it by the presence of any file or
-    subdir — stormhub leaves ``config.json``, catalog dirs, DSS files, etc.
-    """
-    try:
-        for _ in run_dir.iterdir():
-            return True
-    except OSError:
-        pass
-    return False
-
-
 def _list_runs() -> list[dict]:
     if not OUTPUTS.is_dir():
         return []
@@ -1507,10 +1431,6 @@ def _list_payloads() -> dict:
 
 
 # ─── audit integration (download + render reports inline) ───────────────────
-
-
-def _has_audit(name: str) -> bool:
-    return (OUTPUTS / name / "audit").is_dir()
 
 
 def _audit_nav_runs() -> list[dict]:
