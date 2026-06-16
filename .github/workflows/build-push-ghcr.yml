@@ -60,13 +60,25 @@ jobs:
           echo "web app did not serve / within timeout" >&2
           exit 1
 
+  js-check:
+    name: Client JS syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Zero-dependency syntax check (node --check) of static/app.js and the
+      # report.html inline script — no npm/eslint toolchain.
+      - run: python3 scripts/check_static_js.py
+
   build:
     name: Build per-arch
-    # PRs get fast feedback from lint/test/smoke; the image build (which needs
+    # PRs get fast feedback from lint/test/smoke/js-check; the image build (needs
     # the stormhub submodule and only pushes on release) runs on push-to-main
     # and release, not on every PR.
     if: github.event_name != 'pull_request'
-    needs: [lint, test, smoke]
+    needs: [lint, test, smoke, js-check]
     strategy:
       fail-fast: false
       matrix:
