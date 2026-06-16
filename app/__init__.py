@@ -486,8 +486,16 @@ def _audit(run_name: str) -> dict:
             if not s or not e:
                 continue
             try:
-                ds = datetime.fromisoformat(s.replace("Z", "+00:00"))
-                de = datetime.fromisoformat(e.replace("Z", "+00:00"))
+                # storm_start_date (from the events geojson) is naive
+                # ("%Y-%m-%dT%H") while the STAC end_datetime is tz-aware
+                # ("…Z"). Normalize both to naive so the subtraction can't
+                # raise "can't subtract offset-naive and offset-aware".
+                ds = datetime.fromisoformat(s.replace("Z", "+00:00")).replace(
+                    tzinfo=None
+                )
+                de = datetime.fromisoformat(e.replace("Z", "+00:00")).replace(
+                    tzinfo=None
+                )
             except ValueError:
                 continue
             hours = (de - ds).total_seconds() / 3600.0
