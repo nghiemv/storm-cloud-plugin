@@ -15,6 +15,7 @@ from plugin.lib import (
     check_failure_ratio,
     dss_filename,
     parse_storm_datetime,
+    storm_rank,
 )
 from plugin.progress import Progress
 
@@ -94,7 +95,11 @@ def convert_to_dss(ctx: RunContext) -> None:
             failed.append(item.id)
             continue
 
-        out_name = dss_filename(storm_start, idx, storm_duration)
+        # Name by the storm's true catalog rank (por_rank, encoded as item.id),
+        # NOT the enumeration position: get_all_items() is not rank-sorted, so
+        # idx would mislabel every file (e.g. por_rank 441 named r003).
+        rank = storm_rank(item, idx)
+        out_name = dss_filename(storm_start, rank, storm_duration)
         out_path = dss_dir / out_name
 
         # Idempotency: skip if DSS file already exists

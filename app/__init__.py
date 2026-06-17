@@ -317,8 +317,10 @@ def _audit_summary(name: str) -> dict:
     n_anomalies = (
         len(a.get("outlier_dss") or [])
         + len(a.get("grid_without_dss") or [])
+        + len(a.get("dss_without_grid") or [])
         + len(a.get("out_of_box") or [])
         + len(a.get("duration_mismatches") or [])
+        + len(a.get("bbox_out_of_domain") or [])
     )
     summary = {
         "name": name,

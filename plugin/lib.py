@@ -202,6 +202,20 @@ def parse_storm_datetime(item: Any) -> datetime | None:
     return dt
 
 
+def storm_rank(item: Any, fallback: int) -> int:
+    """Return a storm item's catalog rank (por_rank).
+
+    ``storm_search`` encodes por_rank as the item id (``item_id = f"{por_rank}"``),
+    so the rank is ``int(item.id)``. Fall back to ``fallback`` (e.g. the
+    enumeration position) only when the id is not a plain rank integer — e.g.
+    the ``%Y-%m-%dT%H`` datetime id used when a storm is searched without a rank.
+    """
+    try:
+        return int(item.id)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def dss_filename(storm_start: datetime, rank: int, storm_duration: int) -> str:
     """Filename for storm ``rank`` (1-indexed) starting at ``storm_start``."""
     date_str = storm_start.strftime("%Y%m%d")

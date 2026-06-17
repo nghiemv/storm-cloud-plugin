@@ -594,7 +594,11 @@ def _audit(run_name: str) -> dict:
 
     # DSS listing
     dss = _parse_listing(audit_dir)
-    median_bytes = sorted(d["size_bytes"] for d in dss)[len(dss) // 2] if dss else 0
+    # Ignore unparseable sizes (_parse_mc_size returns -1): a negative entry
+    # sorts to the front and can drag the median (and the outlier threshold
+    # derived from it) negative, silently disabling outlier detection.
+    _sizes = sorted(d["size_bytes"] for d in dss if d["size_bytes"] > 0)
+    median_bytes = _sizes[len(_sizes) // 2] if _sizes else 0
     # Outlier = much smaller than median; thresholds tuned per typical sizes.
     # Median is ~1.4 MiB (72hr), ~1.7 MiB (48hr), ~3.8 MiB (120hr). Anything
     # < 50% of median is suspicious (the empirically-broken 123KiB files come

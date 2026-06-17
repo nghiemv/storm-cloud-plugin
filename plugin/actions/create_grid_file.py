@@ -25,6 +25,7 @@ from plugin.lib import (
     dss_filename,
     earliest_dss_paths,
     parse_storm_datetime,
+    storm_rank,
 )
 from plugin.progress import Progress
 
@@ -164,7 +165,12 @@ def _build_entry(
         failed.append(item.id)
         return
 
-    fname = dss_filename(storm_start, idx, storm_duration)
+    # Must match convert_to_dss: name by the storm's true rank (item.id =
+    # por_rank), not the enumeration position. Otherwise this looks up
+    # r{idx}.dss while the real file is r{por_rank}.dss → every mismatch is
+    # dropped from the grid (or silently mis-paired).
+    rank = storm_rank(item, idx)
+    fname = dss_filename(storm_start, rank, storm_duration)
     dss_path = dss_dir / fname
 
     if not dss_path.exists():
