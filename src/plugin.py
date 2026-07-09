@@ -20,6 +20,8 @@ from typing import Any
 from cc.plugin_manager import PluginManager
 from stormhub.logger import initialize_logger
 
+from aorc_source import configure_aorc_source
+
 from actions.download_inputs import download_inputs
 from actions.process_storms import process_storms
 from actions.convert_to_dss import convert_to_dss
@@ -256,6 +258,9 @@ def main() -> None:
     pm = PluginManager()
     payload = pm.get_payload()
     validate_payload(payload)
+    # Resolve the AORC source (NOAA default or a configured mirror) into the
+    # AORC_S3_* env contract before any action reads AORC data.
+    configure_aorc_source(payload.attributes)
     run_actions(pm, payload)
 
 
